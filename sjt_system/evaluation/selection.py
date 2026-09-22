@@ -1114,7 +1114,7 @@ def _psychometric_defer_entry(
     statistics: Mapping[str, Any],
     completed_rounds: int,
 ) -> dict[str, Any]:
-    """Create a blocking defer entry after the fixed repair policy threshold."""
+    """Create an automatic same-cell replenishment entry after the repair limit."""
 
     entry = _psychometric_repair_entry(
         item=item,
@@ -1132,7 +1132,7 @@ def _psychometric_defer_entry(
                 "decision": "defer",
                 "summary": (
                     f"已完成 {completed_rounds} 轮返修仍未达标，"
-                    "自动进入 defer 确认队列。"
+                    "自动进入同一蓝图槽位补题队列。"
                 ),
                 "observed_discrepancies": [],
                 "candidate_diagnoses": [],
@@ -1757,96 +1757,6 @@ def _evaluate_latest_repair_candidate(
     return None, history
 
 
-def build_direct_psychometric_repair_queue(state: PSJTState) -> dict[str, Any]:
-    """Route every non-retained item directly to psychometric repair.
-
-    The autonomous workflow no longer uses blueprint-gap selection or an
-    incremental candidate pool.  Metrics still determine which items need
-    attention, while every non-retained item is sent to diagnosis.
-    """
-
-    items = [
-        deepcopy(dict(item))
-        for item in state.get("item_pool") or []
-        if isinstance(item, Mapping) and item.get("item_id")
-    ]
-    statistics = state.get("item_statistics") or {}
-    rounds = dict(state.get("psychometric_repair_rounds") or {})
-    revise: list[dict[str, Any]] = []
-    deferred: list[dict[str, Any]] = []
-    retained = 0
-    for item in items:
-        item_id = str(item["item_id"])
-        stat = statistics.get(item_id) or {}
-        quality = stat.get("quality_evaluation") or {}
-        recommendation = quality.get("recommendation")
-        if recommendation == "retain":
-            retained += 1
-            continue
-        completed_rounds = int(rounds.get(item_id, 0))
-        if completed_rounds >= PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS:
-            deferred.append(
-                _psychometric_defer_entry(
-                    item=item,
-                    statistics=stat,
-                    completed_rounds=completed_rounds,
-                )
-            )
-            continue
-        revise.append(
-            _psychometric_repair_entry(
-                item=item,
-                statistics=stat,
-                revision_round=completed_rounds + 1,
-            )
-        )
-    queued = [*deferred, *revise]
-    return {
-        "state_update": {
-            "psychometric_repair_defer_after_rounds": PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS,
-            "selected_items": items if not queued else [],
-            "reserve_items": [],
-            "items_to_revise": [
-                entry
-                for entry in queued
-                if entry.get("action") in {"defer", "revise_item"}
-            ],
-            "items_to_regenerate": [
-                entry for entry in queued if entry.get("action") == "regenerate_item"
-            ],
-            "items_deferred_for_revision": [],
-            "selection_results": {
-                "status": (
-                    "repair_confirmation_required"
-                    if deferred
-                    else "repair_required"
-                    if revise
-                    else "ready_for_assembly"
-                ),
-                "direct_repair": True,
-                "retained_count": retained,
-                "repair_count": len(revise),
-                "defer_count": len(deferred),
-                "selected_count": len(items) if not queued else 0,
-                "reserve_count": 0,
-            },
-            "selection_reasons": {
-                str(entry["item_id"]): (
-                    "已完成三轮返修仍未达标，自动进入 defer 确认队列"
-                    if entry.get("action") == "defer"
-                    else "未达到题项质量条件，直接进入心理测量返修"
-                )
-                for entry in queued
-            },
-            "item_pool": items,
-        },
-        "summary": (
-            f"心理测量返修诊断：保留 {retained} 题，"
-            f"直接返修 {len(revise)} 题，自动 defer {len(deferred)} 题。"
-        ),
-    }
-
-
 def run_item_selection(state: PSJTState) -> dict[str, Any]:
     """Classify items, return repairable items, then optimize passed items."""
 
@@ -1945,12 +1855,6 @@ def run_item_selection(state: PSJTState) -> dict[str, Any]:
                 continue
             if recommendation == "remove":
                 recommendation = "revise"
-            if recommendation == "remove":
-                # Keep the original ID available for a repair attempt.
-                reasons[item_id] += (
-                    "；足量样本且硬失败证据成立，不进入正式题或备用题"
-                )
-                continue
             completed_rounds = int(repair_rounds.get(item_id, 0))
             next_round = completed_rounds + 1
             if completed_rounds >= PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS:
@@ -1962,7 +1866,7 @@ def run_item_selection(state: PSJTState) -> dict[str, Any]:
                     )
                 )
                 reasons[item_id] += (
-                    "；已完成三轮心理测量返修仍未达标，自动进入 defer 确认队列"
+                    "；已完成三轮心理测量返修仍未达标，自动进入同一蓝图槽位补题队列"
                 )
                 continue
             entry = _psychometric_repair_entry(
@@ -2038,7 +1942,7 @@ def run_item_selection(state: PSJTState) -> dict[str, Any]:
         for entry in revision_entries:
             reasons[entry["item_id"]] += (
                 (
-                    "；已完成三轮返修仍未达标，自动进入 defer 确认队列"
+                    "；已完成三轮返修仍未达标，自动进入同一蓝图槽位补题队列"
                     if entry.get("action") == "defer"
                     else (
                         f"；该蓝图单元存在保留题缺口，进入第 "

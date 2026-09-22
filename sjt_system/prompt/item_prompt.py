@@ -109,7 +109,8 @@ target_gradient_plan, state.current_item_specification,
 state.current_blueprint_cell, state.current_facet_profile, repair_source,
 atomic_repair_advice, normal_constraints, blocking_findings, option_evidence,
 option_score_comparisons,
-validation_feedback, and previous_invalid_candidate.
+validation_feedback, previous_invalid_candidate, local_retest_feedback, and
+local_retest_round.
 
 The psychometric packet contains only semantic evidence and the option_id,
 observation_id, and constraint_id references needed for local validation. It
@@ -152,6 +153,12 @@ keep the target facet's score-ordered behavior gradient increasing, keep all
 four behavioral levels and the scoring key unchanged, and do not edit any
 other option. The target-group mean gradient must remain increasing when the
 item is re-tested.
+
+If local_retest_feedback is present, it is feedback from the immediately
+previous candidate-only virtual administration. Use it to repair the same
+atomic scope while preserving the fixed skeleton. It is not a reason to change
+the target facet, scoring key, or edit scope, and it is not a whole-form
+psychometric result.
 
 When atomic_edit.target_field=scenario, rewrite the scenario only. When it is
 response_options, rewrite every named option and no others. Do not change any

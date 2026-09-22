@@ -44,6 +44,10 @@ def create_behavior_evidence_agent() -> Any:
         BehaviorEvidenceAgentOutput,
         model_id=model_id,
         temperature=temperature,
+        # The prompt carries its own explicit output contract with a complete
+        # example record, so the verbose machine-generated JSON Schema is not
+        # appended here.
+        include_json_schema=False,
     )
 
 

@@ -31,7 +31,6 @@ from sjt_system.evaluation.respondents import (
     generate_matched_condition_respondent_refs,
     normalize_matched_conditions,
     MATCHED_CONDITION_IDS,
-    score_virtual_sample_is_current,
     matched_condition_sample_is_current,
 )
 from sjt_system.evaluation.round_results import (
@@ -312,7 +311,8 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
             )
             + "固定三个顶层臂：target、same_domain、cross_domain；每个非目标臂可配置多个facet group。"
             "每个facet group独立生成一组匹配条件并共享同一正态分数向量，只在提示中提供当前group facet。"
-            "每组人数相同，每名被试对每题只回答一次；VTS在同域/跨域臂内取最大带符号rho，主迭代不再调用Neo-FFI。"
+            "每组人数相同，主施测中每名被试对每题只回答一次；target组额外完成一次整卷重测以估计虚拟作答稳定性。"
+            "VTS在同域/跨域臂内取最大带符号rho；target被试同步完成目标facet对应的10题IPIP-NEO参照问卷。"
         ),
     }
 
@@ -437,12 +437,16 @@ def post_virtual_response_decision_node(state: PSJTState) -> dict:
     payload = {
         "type": "post_virtual_response_decision",
         "summary": (
-            "本轮虚拟作答与条件VTS分析已完成。请先核对未通过题目和正式题监测警告。"
+            "本轮虚拟作答、条件VTS分析与临时组卷基线已完成。"
+            "请先核对整卷指标、未通过题目和正式题监测警告。"
         ),
         "virtual_response_summary": summary,
         "round_result": round_result,
         "failing_items": failing_items,
         "monitoring_warnings": monitoring_warnings,
+        "psychometric_iteration_history": deepcopy(
+            state.get("psychometric_iteration_history") or []
+        ),
         "condition_score_diagnostics": deepcopy(
             round_result["condition_score_diagnostics"]
         ),
@@ -550,7 +554,13 @@ def _dequeue_psychometric_item(state: Mapping[str, Any], item_id: str) -> dict[s
 
 
 def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
-    """Confirm all validated repair tasks, while retaining defer choices."""
+    """Apply a psychometric repair or automatically replenish an exhausted item.
+
+    A defer diagnosis is not permission to invent a text patch.  It is handled
+    as an automatic same-cell replenishment transaction: discard the current
+    candidate, generate a new candidate under the same blueprint cell, and
+    send it through the normal review and measurement loop.
+    """
 
     pending = state.get("psychometric_repair_confirmation")
     if not isinstance(pending, Mapping) or pending.get("status") != "pending":
@@ -593,7 +603,6 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
             },
             "execution_history": history,
         }
-    batch_defer_mode = bool(state.get("psychometric_defer_batch_eliminate"))
     payload = {
         "type": "psychometric_repair_confirmation",
         "item_id": pending.get("item_id"),
@@ -650,7 +659,6 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
         "forced_vts_gradient_repairs": build_psychometric_agent_input(evidence).get(
             "forced_vts_gradient_repairs"
         ) or [],
-        "defer_batch_mode": batch_defer_mode,
         "default_defer_decision": "eliminate_replenish",
         "available_decisions": (
             ["approve", "stop"]
@@ -659,15 +667,17 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
                 "manual_edit",
                 "pending_sme",
                 "eliminate_replenish",
-                "eliminate_replenish_future_defer",
                 "stop",
             ]
         ),
         "instruction": (
             "repair：确认后按原子任务自动返修；defer：人工修改、保留待SME审核、"
-            "淘汰补题，或开启批量模式将本题及此后defer题目按淘汰补题处理。"
+            "淘汰补题或暂停保存。每道 defer 题必须单独处置。"
         ),
     }
+
+    automatic_replenish = advice.get("decision") == "defer"
+
     def _has_replacement_capacity() -> bool:
         lineage = state.get("item_lineage") or {}
         root_id = str(
@@ -686,28 +696,56 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
         )
 
     edited_item = None
-    batch_mode_requested = False
-    automatic_batch_decision = False
-    if batch_defer_mode and _has_replacement_capacity():
+    if automatic_replenish:
         decision = "eliminate_replenish"
-        automatic_batch_decision = True
-    else:
-        if batch_defer_mode:
-            payload = {
-                **payload,
-                "defer_batch_mode_blocked": True,
-                "available_decisions": ["pending_sme", "stop"],
-                "validation_error": (
-                    "批量 defer 模式遇到蓝图槽位补题次数上限；"
-                    "请保留待 SME 审核或暂停保存。"
-                ),
+        raw = {"decision": decision, "approval_source": "automatic"}
+        if not _has_replacement_capacity():
+            item_id = str(pending.get("item_id") or item.get("item_id") or "")
+            message = (
+                f"题目 {item_id} 的 defer 诊断已自动转为补题，"
+                f"已完成 {pending.get('completed_repair_rounds', 0)} 轮返修，"
+                "且同一蓝图槽位已达到自动补题上限；"
+                "系统无法在不降低质量门槛的前提下完成该槽位。"
+            )
+            return {
+                "status": "failed",
+                "errors": [
+                    *(state.get("errors") or []),
+                    {
+                        "action": "automatic_replenishment_exhausted",
+                        "item_id": item_id,
+                        "message": message,
+                    },
+                ],
+                "execution_history": [
+                    *state.get("execution_history", []),
+                    {
+                        "event_id": (
+                            f'{state.get("run_id", "unknown")}:'
+                            f'{state.get("step_count", 0)}:'
+                            "psychometric_repair_confirmation:failed"
+                        ),
+                        "run_id": state.get("run_id"),
+                        "step": state.get("step_count", 0),
+                        "node": "psychometric_repair_confirmation",
+                        "action": "automatic_replenishment_exhausted",
+                        "event_type": "failed",
+                        "recorded_at": utc_timestamp(),
+                        "reason": message,
+                        "approval_source": "automatic_after_defer",
+                    },
+                ],
             }
+    else:
         while True:
             raw = interrupt(payload)
             decision = raw.get("decision") if isinstance(raw, Mapping) else None
             available = set(payload["available_decisions"])
             if decision not in available:
-                payload = {**payload, "validation_error": "请选择当前诊断允许的处置方式"}
+                payload = {
+                    **payload,
+                    "validation_error": "请选择当前诊断允许的处置方式",
+                }
                 continue
             if decision == "manual_edit":
                 try:
@@ -715,9 +753,6 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
                 except ValueError as exc:
                     payload = {**payload, "validation_error": str(exc)}
                     continue
-            if decision == "eliminate_replenish_future_defer":
-                batch_mode_requested = True
-                decision = "eliminate_replenish"
             if decision == "eliminate_replenish" and not _has_replacement_capacity():
                 payload = {
                     **payload,
@@ -744,15 +779,13 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
             "event_type": "completed",
             "recorded_at": utc_timestamp(),
             "reason": (
-                "批量 defer 模式自动按淘汰补题处理当前题目"
-                if automatic_batch_decision
-                else (
-                    "用户确认当前题并开启后续 defer 自动淘汰补题"
-                    if batch_mode_requested
-                    else "用户确认当前单题心理测量返修建议"
-                )
+                "defer 诊断不执行不充分证据下的原题修改，系统自动启动同槽位补题"
+                if automatic_replenish
+                else "用户确认当前单题心理测量返修建议"
             ),
-            "approval_source": "system_default" if automatic_batch_decision else "user",
+            "approval_source": (
+                "automatic_after_defer" if automatic_replenish else "user"
+            ),
         },
     ]
     if decision == "approve":
@@ -777,10 +810,9 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
             "item_id": item_id,
             "revision_round": pending.get("revision_round"),
             "diagnosis_fingerprint": pending.get("diagnosis_fingerprint"),
-            "defer_batch_mode_enabled": bool(
-                batch_defer_mode or batch_mode_requested
+            "approval_source": (
+                "automatic_after_defer" if automatic_replenish else "user"
             ),
-            "approval_source": "system_default" if automatic_batch_decision else "user",
         },
     ]
     if decision == "manual_edit":
@@ -846,16 +878,29 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
 
     lineage = deepcopy(state.get("item_lineage") or {})
     root_id = str((lineage.get(item_id) or {}).get("root_item_id") or item_id)
-    replacement_number = 1 + sum(
+    lineage_number = 1 + sum(
         1 for value in lineage.values()
         if isinstance(value, Mapping)
         and value.get("root_item_id") == root_id
         and isinstance(value.get("replacement_number"), int)
     )
-    replacement_id = f"{root_id}-R{replacement_number}"
     existing_ids = {
         str(row.get("item_id")) for row in state.get("item_pool") or [] if isinstance(row, Mapping)
     } | {str(row.get("specification_id")) for row in state.get("item_specifications") or [] if isinstance(row, Mapping)}
+    # 补题号同时考虑已存在的 R-n 补题 ID（checkpoint 恢复后 item_pool/规格
+    # 可能已含上次生成的补题而 lineage 未同步），取更大值 +1，避免重复。
+    prefix = f"{root_id}-R"
+    existing_number = max(
+        (
+            int(repl_id[len(prefix):])
+            for repl_id in existing_ids
+            if repl_id.startswith(prefix)
+            and repl_id[len(prefix):].isdigit()
+        ),
+        default=0,
+    )
+    replacement_number = max(lineage_number, existing_number + 1)
+    replacement_id = f"{root_id}-R{replacement_number}"
     if replacement_id in existing_ids:
         raise ValueError(f"补题ID已存在：{replacement_id}")
     cell_id = str(item.get("blueprint_cell_id") or "")
@@ -868,15 +913,24 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
             break
     else:
         raise ValueError("淘汰补题找不到原蓝图单元")
-    blueprint.setdefault("slots", []).append(
-        {"specification_id": replacement_id, "blueprint_cell_id": cell_id}
-    )
     source_spec = next(
         (deepcopy(dict(row)) for row in state.get("item_specifications") or [] if isinstance(row, Mapping) and row.get("specification_id") == item_id),
         None,
     )
     if source_spec is None:
         raise ValueError("淘汰补题找不到原题目规格")
+    blueprint.setdefault("slots", []).append(
+        {
+            "specification_id": replacement_id,
+            "blueprint_cell_id": cell_id,
+            "candidate_reference": {
+                "mechanism_id": source_spec.get("mechanism_id")
+                or replacement_cell.get("mechanism_id"),
+                "situation_id": source_spec.get("situation_id")
+                or replacement_cell.get("situation_id"),
+            },
+        }
+    )
     source_skeleton = (state.get("item_skeletons") or {}).get(item_id)
     source_skeleton_review = (state.get("skeleton_reviews") or {}).get(item_id)
     if not isinstance(source_skeleton, Mapping):
@@ -901,7 +955,17 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
         "current_item_specification": None,
         "item_pool": [deepcopy(row) for row in state.get("item_pool") or [] if isinstance(row, Mapping) and str(row.get("item_id")) != item_id],
         "removed_items": [*deepcopy(state.get("removed_items") or []), deepcopy(dict(item))],
-        "rejected_items": [*deepcopy(state.get("rejected_items") or []), {"item": deepcopy(dict(item)), "reason": "user_eliminated_for_replenishment"}],
+        "rejected_items": [
+            *deepcopy(state.get("rejected_items") or []),
+            {
+                "item": deepcopy(dict(item)),
+                "reason": (
+                    "automatic_replenishment_after_defer"
+                    if automatic_replenish
+                    else "user_eliminated_for_replenishment"
+                ),
+            },
+        ],
         "item_final_dispositions": dispositions,
         "item_lineage": lineage,
         "blueprint": blueprint,
@@ -912,9 +976,6 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
         "selection_results": None,
         "selected_items": [],
         "psychometric_repair_history": common_history,
-        "psychometric_defer_batch_eliminate": bool(
-            batch_defer_mode or batch_mode_requested
-        ),
         "execution_history": history,
     }
     if not batch_has_remaining:
@@ -933,6 +994,186 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
         if isinstance(previous_response_ref, str) and previous_response_ref:
             update["previous_virtual_response_data_ref"] = previous_response_ref
     return update
+
+
+def plateau_gap_decision_node(state: PSJTState) -> dict:
+    """Plateau close-out reached a blueprint gap: ask the user how to fill it.
+
+    Eligible candidates are content-reviewed items that are not pending SME or
+    eliminated. The user may pick a candidate as-is (provisional fill) or
+    manually rewrite one, then the next selection pass consumes the fill and
+    proceeds to assembly as a developmental version.
+    """
+
+    pending = state.get("plateau_gap_decision")
+    if not isinstance(pending, Mapping) or pending.get("status") != "pending":
+        raise ValueError("当前没有待处置的平台期蓝图缺口清单")
+    gap_cells = [
+        dict(cell)
+        for cell in pending.get("gap_cells") or []
+        if isinstance(cell, Mapping)
+    ]
+    dispositions = state.get("item_final_dispositions") or {}
+
+    def _eligible(item_id: str) -> bool:
+        dis = dispositions.get(item_id)
+        return not (
+            isinstance(dis, Mapping)
+            and dis.get("status") in {"pending_sme_review", "eliminated"}
+        )
+
+    frozen_index = {
+        str(item.get("item_id")): item
+        for item in state.get("frozen_item_bank") or []
+        if isinstance(item, Mapping) and item.get("item_id")
+    }
+    payload: dict[str, Any] = {
+        "type": "plateau_gap_decision",
+        "summary": (
+            "整卷质量已到平台期，但仍有蓝图单元没有可正式入卷的题目。"
+            "请对每个缺口单元处理：直接点选一道候选（开发版补位），"
+            "或手动修改一道候选后再收卷。待SME/已淘汰的候选不可选。"
+        ),
+        "gap_cells": gap_cells,
+        "available_modes": ["pick", "manual", "stop"],
+    }
+    while True:
+        raw = interrupt(payload)
+        if not isinstance(raw, Mapping) or raw.get("decision") not in {
+            "resolve",
+            "stop",
+        }:
+            payload = {
+                **payload,
+                "validation_error": "请提交 resolve 或 stop",
+            }
+            continue
+        if raw.get("decision") == "stop":
+            break
+        resolutions = raw.get("resolutions")
+        if not isinstance(resolutions, list) or not resolutions:
+            payload = {
+                **payload,
+                "validation_error": "请为每个缺口单元选择候选，或选择停止",
+            }
+            continue
+        fills: dict[str, Any] = {}
+        errors: list[str] = []
+        for res in resolutions:
+            if not isinstance(res, Mapping):
+                errors.append("决议格式无效")
+                break
+            cell_id = str(res.get("cell_id") or "")
+            cell = next(
+                (
+                    row
+                    for row in gap_cells
+                    if str(row.get("blueprint_cell_id")) == cell_id
+                ),
+                None,
+            )
+            if cell is None:
+                errors.append(f"未知缺口单元 {cell_id}")
+                break
+            if cell_id in fills:
+                errors.append(f"单元 {cell_id} 重复处置")
+                break
+            item_id = str(res.get("item_id") or "")
+            sme_override = bool(res.get("sme_override"))
+            candidate = next(
+                (
+                    row
+                    for row in cell.get("candidates") or []
+                    if str(row.get("item_id")) == item_id
+                ),
+                None,
+            )
+            allowed = bool(
+                candidate is not None
+                and (
+                    candidate.get("eligible")
+                    or (candidate.get("force_allowed") and sme_override)
+                )
+            )
+            if not allowed:
+                errors.append(f"单元 {cell_id} 的候选 {item_id} 不可选")
+                break
+            base_item = frozen_index.get(item_id)
+            if base_item is None:
+                errors.append(f"找不到候选题目 {item_id}")
+                break
+            mode = str(res.get("mode") or "pick")
+            if mode == "manual":
+                try:
+                    edited_item = _manual_psychometric_item(
+                        base_item,
+                        res.get("manual_item"),
+                    )
+                except ValueError as exc:
+                    errors.append(str(exc))
+                    break
+                fills[cell_id] = {
+                    "item_id": item_id,
+                    "mode": "manual",
+                    "sme_override": sme_override,
+                    "edited_item": edited_item,
+                }
+            elif mode == "pick":
+                fills[cell_id] = {
+                    "item_id": item_id,
+                    "mode": "pick",
+                    "sme_override": sme_override,
+                }
+            else:
+                errors.append(f"单元 {cell_id} 的模式无效")
+                break
+        if not errors:
+            unresolved = [
+                str(cell.get("blueprint_cell_id"))
+                for cell in gap_cells
+                if str(cell.get("blueprint_cell_id")) not in fills
+            ]
+            if unresolved:
+                errors.append("以下单元尚未处置：" + "、".join(unresolved))
+        if errors:
+            payload = {
+                **payload,
+                "validation_error": "；".join(errors),
+            }
+            continue
+        break
+
+    history = [
+        *state.get("execution_history", []),
+        {
+            "event_id": (
+                f'{state.get("run_id", "unknown")}:'
+                f'{state.get("step_count", 0)}:plateau_gap_decision:completed'
+            ),
+            "run_id": state.get("run_id"),
+            "step": state.get("step_count", 0),
+            "node": "plateau_gap_decision",
+            "action": (
+                "stop" if raw.get("decision") == "stop" else "resolve_gap"
+            ),
+            "event_type": "completed",
+            "recorded_at": utc_timestamp(),
+            "reason": (
+                "用户选择暂停保存"
+                if raw.get("decision") == "stop"
+                else "用户已处置全部平台期缺口单元"
+            ),
+            "approval_source": "user",
+        },
+    ]
+    if raw.get("decision") == "stop":
+        return {"status": "stopped", "execution_history": history}
+    return {
+        "plateau_gap_fills": fills,
+        "plateau_gap_decision": None,
+        "selection_results": None,
+        "execution_history": history,
+    }
 
 
 def automatic_approval_node(state: PSJTState) -> dict:

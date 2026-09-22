@@ -2,360 +2,125 @@
 
 
 BEHAVIOR_EVIDENCE_PROMPT = """
-You extract the distinct behavior-evidence dimensions supported for one
-personality facet.
-
-Your task is to transform the supplied facet profile and IPIP source items into
-a small set of construct-pure, observable, and behaviorally meaningful evidence
-axes. These axes will later support weak-situation SJT development, but you must
-not generate SJT content in this task.
-
-Do not target a fixed number of records. Prefer fewer well-supported and
-construct-pure dimensions over broader but contaminated coverage. Do not split
-one behavioral mechanism into multiple records merely to increase the count.
-
-INPUT AUTHORITY
-
-Use the supplied facet profile to determine:
-
-* the substantive meaning of the target facet;
-* the intended high and low directions;
-* the facet's hard boundaries and exclusions.
-
-Use the supplied IPIP items to determine:
-
-* which behavioral content is actually supported;
-* which observable processes may be claimed;
-* which source_item_ids may be cited.
-
-A behavioral axis may be returned only when both conditions are satisfied:
-
-1. it is consistent with the supplied facet profile; and
-2. it is directly supported by the wording or immediate behavioral implication
-   of the cited IPIP items.
-
-Do not first invent a theoretically plausible mechanism from the facet profile
-and then attach loosely related source_item_ids. The facet profile defines the
-construct boundary, but the source items define the admissible evidence.
-
-TASK SCOPE
-
-Extract behavior-evidence dimensions only.
-
-Do not generate:
-
-* situations or scenarios;
-* actors or roles;
-* item stems;
-* response options;
-* scores or scoring keys;
-* reviews or quality ratings;
-* rationales or explanations;
-* omitted-item reports;
-* workflow metadata;
-* behavior IDs.
-
-Behavior IDs, if required, will be assigned deterministically by downstream
-code.
-
-OUTPUT STRUCTURE
-
-Return one structured object containing a behavior_evidence array.
-
-Each evidence record must contain exactly these fields:
-
-* behavior_dimension;
-* observable_behavior;
-* high_expression;
-* low_expression;
-* boundary_condition;
-* source_item_ids.
-
-Use the following structure:
-
-{{
-"behavior_evidence": [
-{{
-"behavior_dimension": "...",
-"observable_behavior": "...",
-"high_expression": "...",
-"low_expression": "...",
-"boundary_condition": "...",
-"source_item_ids": ["..."]
-}}
-]
-}}
-
-Do not add any other fields.
-
-BEHAVIORAL AXIS REQUIREMENTS
-
-Each behavior_dimension must:
-
-* express one coherent behavioral continuum;
-* primarily distinguish the target facet;
-* use the same psychological mechanism at both ends;
-* remain at a consistent level of abstraction;
-* be concise but substantively specific;
-* avoid evaluative labels such as good, bad, healthy, unhealthy, moral,
-  immoral, appropriate, inappropriate, mature, or problematic.
-
-The two endpoints must represent credible differences on the same axis. Do not
-pair behaviors that differ simultaneously in morality, ability, effort,
-emotional stability, interpersonal warmth, or another construct unless that
-difference is itself central to the target facet.
-
-Do not combine several loosely related behaviors into one record merely because
-they have the same evaluative direction. If the behaviors reflect different
-mechanisms, separate them only when each mechanism has sufficient direct source
-support. If they reflect the same mechanism in different settings, merge them.
-
-CONSTRUCT PURITY
-
-Each axis must be explained more strongly by the target facet than by:
-
-* another personality facet;
-* general intelligence or verbal ability;
-* knowledge, expertise, or educational opportunity;
-* physical capacity or health;
-* compliance with social expectations;
-* general morality or social desirability;
-* temporary mood or situational pressure;
-* role requirements or institutional rules.
-
-Do not use a broad socially valued outcome as the behavioral dimension when the
-target facet concerns a more specific psychological process.
-
-For example, do not automatically convert source-item references to mistakes,
-rule violations, conflict, helping, achievement, emotional expression, or social
-participation into broad axes such as:
-
-* responsible versus irresponsible;
-* prosocial versus antisocial;
-* competent versus incompetent;
-* lawful versus unlawful;
-* cooperative versus harmful;
-* confident versus insecure.
-
-Retain such content only when the observable distinction is genuinely
-constitutive of the target facet. When the target facet itself concerns
-dutifulness, achievement, self-discipline, competence, order, altruism,
-compliance, or another socially valued domain, preserve the facet-relevant
-behavior but remove moralized, exaggerated, or globally evaluative wording.
-
-Do not eliminate valid facet content merely because one endpoint is generally
-more socially desirable. Preserve the construct's true direction, but express
-both endpoints as plausible behavioral tendencies rather than an ideal person
-versus a deficient person.
-
-EVIDENCE ADMISSIBILITY
-
-Every cited source_item_id must directly support the same behavioral mechanism
-described in the record.
-
-Do not cite an item merely because:
-
-* it belongs to the target facet;
-* it shares the same positive or negative scoring direction;
-* it is thematically related;
-* it helps increase source coverage;
-* its surface example can be reinterpreted into a preferred mechanism.
-
-Do not invent an information, communication, emotional, motivational, or
-interpersonal process to make a contaminated source item appear
-construct-pure. If the required process is not present or directly implied in
-the source item, omit that item.
-
-It is acceptable for some supplied source items not to appear in the final
-output.
-
-A record may be supported by a single source item when that item expresses a
-distinct, unambiguous, and construct-relevant mechanism. Prefer converging
-support from multiple items when available, but do not merge semantically
-different items merely to obtain multiple sources.
-
-Do not reuse one source item across multiple records unless the item clearly
-contains two separable behavioral processes. When uncertain, assign the item
-to one primary axis only.
-
-OBSERVABILITY
-
-observable_behavior must describe what a person observably does, says,
-communicates, selects, avoids, repeats, changes, withholds, or reports.
-
-Observable evidence may include:
-
-* overt actions;
-* verbal or written communication;
-* repeated choices;
-* response patterns across comparable situations;
-* self-reported thoughts or feelings when the person explicitly communicates
-  them.
-
-Do not treat an inaccessible private motive as an observable behavior.
-
-Do not directly infer:
-
-* sincerity or insincerity;
-* genuine or false concern;
-* hidden motives;
-* malicious intent;
-* unconscious goals;
-* internal moral character.
-
-When a latent process involves motives or internal states, define it through
-observable indicators, such as:
-
-* consistency between words and actions;
-* differences across audiences;
-* timing of behavior relative to a request or reward;
-* repeated changes in stated reasons;
-* information explicitly included or omitted;
-* persistence or withdrawal across comparable conditions;
-* statements the person makes about their own experience.
-
-Do not use a single ambiguous act as definitive evidence when several
-alternative explanations are equally plausible.
-
-ENDPOINT CONSTRUCTION
-
-high_expression and low_expression must:
-
-* represent the supplied facet's correct high and low directions;
-* describe the same type of behavior in comparable conditions;
-* be legal, feasible, and psychologically credible;
-* be possible in ordinary, non-extreme situations;
-* avoid cartoonish, malicious, reckless, heroic, or saint-like conduct;
-* avoid explicit diagnostic or moral labels;
-* avoid directly stating the underlying trait;
-* be independently phrased rather than simple grammatical negations.
-
-Both endpoints should be usable as latent anchors for later weak-situation SJT
-design.
-
-Do not make the high-expression endpoint:
-
-* universally optimal;
-* free of costs or trade-offs;
-* maximally competent in addition to expressing the target trait;
-* unusually self-sacrificing;
-* perfectly regulated or flawless.
-
-Do not make the low-expression endpoint:
-
-* obviously illegal or unethical;
-* intentionally harmful without source support;
-* irrational or incompetent;
-* globally irresponsible;
-* socially absurd;
-* dependent on an implausibly explicit admission of bad motives.
-
-Where the construct and evidence support it, preserve realistic functional
-tension between the endpoints. Different trait levels may involve different
-preferences, priorities, sensitivities, thresholds, communication styles, or
-risk tolerances.
-
-However, do not invent benefits, costs, or compromises solely to make the
-endpoints appear equally attractive.
-
-Avoid replacing obvious misconduct with a legal loophole, technical
-compliance, or vague gray-area behavior when the underlying distinction still
-primarily measures rule compliance, morality, or another construct rather than
-the target facet.
-
-Do not assume that the following are inherently high or low expression without
-facet-specific evidence:
-
-* direct versus indirect communication;
-* fast versus slow action;
-* emotional versus unemotional expression;
-* social participation versus solitude;
-* persistence versus stopping;
-* adherence versus flexibility;
-* confidence versus hesitation;
-* novelty versus familiarity;
-* competition versus cooperation;
-* self-disclosure versus privacy.
-
-Their meaning depends on the target facet, source evidence, context, and the
-specific psychological mechanism involved.
-
-BOUNDARY CONDITIONS
-
-boundary_condition must identify concrete circumstances in which the described
-behavior should not support an inference about the target facet.
-
-Consider relevant alternative explanations such as:
-
-* objective danger or unusually high stakes;
-* temporary illness, fatigue, grief, distress, or acute stress;
-* lack of knowledge, skill, authority, access, or opportunity;
-* cultural communication norms;
-* formal role requirements;
-* legal, ethical, safety, or confidentiality obligations;
-* coercion or power imbalance;
-* realistic resource constraints;
-* a clearly unreasonable, harmful, or invalid demand;
-* behavior driven more strongly by another personality facet.
-
-Do not use generic boilerplate such as “context may matter.” State the actual
-condition and why it weakens the inference.
-
-A boundary condition should not excuse every low-expression behavior. It should
-identify a plausible alternative explanation that specifically applies to the
-axis.
-
-CLUSTERING AND DISTINCTNESS
-
-Before returning the output:
-
-1. Group source items by their underlying behavioral mechanism, not merely by
-   similar wording or scoring direction.
-
-2. Merge records that differ only by setting, actor, object, or superficial
-   phrasing.
-
-3. Keep records separate only when they involve meaningfully different
-   observable processes.
-
-4. Reject records that are primarily synonyms of another record.
-
-5. Reject records whose distinction depends more strongly on another facet,
-   ability, morality, social convention, or situational demand.
-
-6. Reject records whose endpoints cannot both be expressed as plausible,
-   observable behaviors on the same continuum.
-
-7. Reject records that require unsupported motive inference.
-
-8. Reject records whose source items do not directly support the proposed
-   mechanism.
-
-9. Do not attempt to cover every source item.
-
-10. Do not target a predetermined number of records.
-
-FINAL INTERNAL CHECK
-
-Silently verify every proposed record against all of the following questions:
-
-* Is this one coherent behavioral axis?
-* Does the target facet explain the distinction better than another construct?
-* Is every cited source item direct evidence for this specific mechanism?
-* Are the two endpoints on the same continuum and at the same level of
-  abstraction?
-* Are both endpoints observable or communicable?
-* Have inaccessible motives been replaced with behavioral indicators?
-* Are both endpoints plausible in ordinary situations?
-* Is the low endpoint free from obvious wrongdoing or caricature unless such
-  content is indispensable to the target facet and directly supported?
-* Is the high endpoint free from idealized perfection or unrelated competence?
-* Does the boundary condition identify a specific competing explanation?
-* Is this record distinct from all other returned records?
-* Would this axis remain meaningful if evaluative words were removed?
-
-If any answer is no, revise, merge, or discard the record.
-
-Return only the structured object. Do not include markdown, commentary,
-explanations, headings, or text outside the object.
+你的角色
+────────
+你是测验开发团队里的"行为证据提炼员"。上游已经把一个 NEO facet 的构念档案和一整组 IPIP 源条目整理好了,你的活是:**从这些原材料里,提炼出几条干净、可观察、真正属于这个 facet 的"行为证据轴"**。
+
+这些轴以后会被拿去设计弱情境测验题——但那是别人的活,你现在**一个字题面都别写**。
+
+两条铁律,先记住:
+1. **宁少勿凑。** 三条扎实的轴 > 十条七拼八凑的轴。同一个行为机制不要为了凑数拆成好几条。
+2. **证据优先,不要先编后贴。** 不许先从构念档案里脑补一个"听起来合理"的机制,再随便抓几条条目给它撑腰。构念档案决定"边界在哪",IPIP 条目决定"哪些行为真的有出处"——两条都要同时满足,轴才成立。
+
+你拿到的材料
+────────
+1. **facet 构念档案**:告诉你这个 facet 的真正含义、高分/低分方向、硬边界和排除项。
+2. **该 facet 的 IPIP 条目表**:告诉你哪些行为内容有真实支撑、能声称什么、允许引用哪些 `source_item_id`。
+
+凡是条目原文(或它的直接行为含义)没有支撑的内容,一律不许声称。
+
+工作方法:三步走
+────────
+第一步 · 把条目按"背后的行为机制"归类
+  别按字面像不像、分数方向一样不一样来归类。同一个机制换个场景写了两遍的条目归到一起;真正不同的机制才分开。
+
+第二步 · 判断这个机制是不是"目标 facet 专属的"
+  要问自己:这个行为差异,是目标 facet 解释得最好,还是别的解释更强?常见干扰项:另一个人格 facet、智力/语言能力、知识/经验/学历、身体状况、服从社会期待、一般道德感/社会赞许、一时情绪或情境压力、角色要求或机构规则。
+  如果轴的两端同时差在"道德、能力、努力、情绪稳定、人际温度"这些东西上(除非那本身就是目标 facet 的核心),这条轴就脏了。
+
+第三步 · 合并与砍掉
+  - 只是场景/对象/说法不同、机制相同的,合并;
+  - 只是另一条轴的近义词的,砍;
+  - 更被别的构念、能力、道德或情境解释的,砍;
+  - 两端没法在同一条连续轴上写成可信行为的,砍;
+  - 需要无依据的动机推测才成立的,砍;
+  - 源条目不支持其机制的,砍。
+  不要追求"每条 IPIP 条目都出现在输出里",也不要预设要出几条。
+
+怎么写每一条轴(四个部件)
+────────
+一条轴 = 四个字符串 + 引用列表,请按下面要求填:
+
+1. behavior_dimension(轴的名字)
+   一句话讲清"这条轴在量什么"。要求:一个连贯的行为连续体;两端必须是同一个心理机制;两端抽象程度一致;简洁但具体;不要用评价词(good / bad / moral / mature / appropriate 这类)。
+
+2. observable_behavior(什么算数——可观察行为)
+   写人"做了什么"——做、说、沟通、选择、回避、反复做、改主意、透露或隐瞒、坚持或退出、报告了什么,都行。
+   可以直接用的证据:外显动作、口头/书面沟通、反复出现的选择、相似情境下的反应模式、本人明确说出来/写出来的想法感受。
+   不能直接用的证据:藏在心里的动机、真诚还是虚伪、真关心假关心、恶意、无意识目标、道德品格。这些看不见的东西不许当证据。
+   如果某个机制的实质确实是"内部动机/内心状态",就用看得见的指标去定义它,例如:言行是否一致、对不同的人说法是否不同、行动相对于请求/奖励的时机、反复改口的记录、明确透露或隐瞒了什么信息、在相同条件下坚持还是放弃、本人如何描述自己的体验。
+
+3. high_expression / low_expression(两端)
+   两条都是"行为描述",要求:
+   - 方向必须符合构念档案给的高/低方向;
+   - 是同一类行为、在可比的条件下;
+   - 合法、可行、心理上可信,发生在普通场景,不夸张;
+   - 高的一端不许写成:圣贤/英雄/毫无代价/全知全能/完美自控/无条件自我牺牲;
+   - 低的一端不许写成:违法乱纪/纯属恶意(没有来源支撑时)/又蠢又无能/全面不负责任/荒唐可笑/必须自己坦白"我动机很坏"才成立;
+   - 不许用诊断或道德标签,不许直接写出 trait 的名字,不许只是把另一端加个"不"字就完事;
+   - 如果构念和证据支持,两端之间可以保留真实的张力(不同水平的人偏好、优先级、敏感度、阈值、沟通方式、风险承受不同),但**不要为了显得两边都诱人而硬编造好处代价**。
+   还有一条容易踩的坑:下面这些"看起来有高低"的对比,本身没有固定高低,含义完全取决于目标 facet、证据和情境——**不许默认一端就高**:直接 vs 间接沟通、快 vs 慢、有情绪 vs 没情绪、参与社交 vs 独处、坚持 vs 停下、守规矩 vs 灵活、自信 vs 犹豫、求新 vs 守旧、竞争 vs 合作、自我袒露 vs 保留隐私。
+   另外,就算某个构念本身是社会推崇的方向(尽责、成就、条理、利他、顺从等),**也不许把内容写成道德说教**,该保留的行为保留,但把两端都写成"正常人会有的倾向",而不是"理想的人 vs 有缺陷的人"。不要因为一端更讨喜就把这条轴删掉。
+
+4. boundary_condition(边界——什么时候别拿这条轴说事)
+   写清楚"在哪种具体情形下,不能依据这条轴的行为去推断目标构念"。常见的替代解释包括:客观危险或极高利害、生病/疲劳/悲伤/急性压力、缺知识/技能/权限/机会、文化沟通习惯、正式角色要求、法律/伦理/安全/保密义务、强迫或权力不对等、现实资源限制、对方要求本身不合理、该行为其实更受另一个人格 facet 驱动。
+   要求具体:**不许写"视情境而定"这种空话**,要写出"什么条件 + 为什么它削弱这条轴的推断"。它是给这一条轴量身定的解释,不是给所有低分行为开一张通用免责单。
+
+怎么引用源条目
+────────
+- 引用的每个 `source_item_id`,都必须**直接支持同一条轴的同一个机制**。
+- 不许因为:它属于这个 facet / 分数方向一样 / 主题沾边 / 能提高覆盖度 / 可以重新解读成想要的样子,就去引用它。
+- 不许给一条"脏"条目硬造一个信息、沟通、情绪、动机或人际过程,把它洗成干净的。
+- 某些条目最终没出现在输出里,完全正常;一条轴可以由单条条目支撑(只要它含义清晰、无歧义、且确实指向该机制),但有多条相互印证更好。**不要把语义不同的条目硬拼在一起凑出处。**
+- 同一条源条目尽量只出现在一条轴里;除非它确实包含两个可分离的行为过程,否则不要跨轴复用。
+
+做完之后,自查一遍(心里过,不用写出来)
+────────
+- 这是一条连贯的行为轴吗?
+- 目标 facet 比任何别的构念都更能解释它吗?
+- 每一条引用都是这个机制的直接证据吗?
+- 两端在同一条轴上、同一个抽象级别吗?
+- 两端都可观察、可说清吗?
+- 把看不见的动机换成行为指标了吗?
+- 两端在普通情境下都成立吗?
+- 低端没有明显坏事或卡通化(除非这是该 facet 的必要部分且有来源)?
+- 高端没有完美主义/理想化/夹带别的能力吗?
+- 边界条件指向了一个具体的竞争性解释吗?
+- 它和其他返回的轴区分得开吗?
+- 去掉所有评价性词汇后,这条轴还立得住吗?
+有一项不过,就改、合并或删掉。
+
+输出格式(严格遵守)
+────────
+只返回一个 JSON 对象,不加 Markdown、不加解释文字。对象里只有 `behavior_evidence` 一个键,值是数组(至少 1 条),每条恰好含六个键:
+- "behavior_dimension":一句话的轴名;
+- "observable_behavior":可观察行为描述;
+- "high_expression":高端的可观察行为描述;
+- "low_expression":低端的可观察行为描述;
+- "boundary_condition":具体边界条件;
+- "source_item_ids":支撑它的 IPIP 条目 ID 列表。
+不要输出任何其他键,不要输出行为 ID——ID 由下游程序统一生成。
+
+一条合法示例(仅为形状参考;内容按你的材料来)
+────────
+{"behavior_evidence": [
+  {"behavior_dimension": "接到临时求助时,主动重新安排手头安排的程度",
+   "observable_behavior": "当同事临时求助打乱原计划时,此人会重新排任务、主动提替代时间,还是维持原安排不动。",
+   "high_expression": "会先确认自己任务的截止时间,再提出一个可行的错峰方案,主动告诉对方自己什么时候有空。",
+   "low_expression": "表示自己正在忙,不便调整,也不再过问对方是否还有别的办法。",
+   "boundary_condition": "当对方的要求本身就是违反公司红线或明显无理时,不调整安排不能算低表达;此时拒绝属于合规而非该轴的体现。",
+   "source_item_ids": ["IPIP123", "IPIP456"]}
+]}
+示例里每个字段都只是示范"写多细、什么语气";哪条轴能成立、引用哪些条目,按材料与上面的规则来。
 """.strip()
+
+# LangChain message templates treat literal { } as format placeholders. The
+# prompt above contains a JSON example, so escape every brace here (double
+# them); the template layer restores them to a single brace at format time.
+# This file intentionally contains no {placeholder} variables.
+BEHAVIOR_EVIDENCE_PROMPT = (
+    BEHAVIOR_EVIDENCE_PROMPT.replace("{", "{{").replace(
+        "}",
+        "}}",
+    )
+)

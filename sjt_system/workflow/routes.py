@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from sjt_system.authoring.items import next_step_after_review
-from sjt_system.evaluation.respondents import score_virtual_sample_is_current
+from sjt_system.evaluation.respondents import matched_condition_sample_is_current
 from sjt_system.state import PSJTState
 from sjt_system.workflow.constants import (
     DETERMINISTIC_AUTO_APPROVAL_ACTIONS,
@@ -19,6 +19,11 @@ def route_after_router(state: PSJTState) -> str:
         return "end"
     if (
         state.get("route")
+        and state["route"]["next_action"] == "plateau_gap_decision"
+    ):
+        return "plateau_gap_decision"
+    if (
+        state.get("route")
         and state["route"]["next_action"] == "confirm_psychometric_repair"
     ):
         return "confirm_psychometric_repair"
@@ -26,7 +31,7 @@ def route_after_router(state: PSJTState) -> str:
         state["route"]
         and state["route"]["next_action"] == "simulate_responses"
         and (
-            not score_virtual_sample_is_current(
+            not matched_condition_sample_is_current(
                 state.get("virtual_sample_config"),
                 state.get("virtual_respondents"),
             )
@@ -45,6 +50,8 @@ def route_after_router(state: PSJTState) -> str:
 def route_after_execute(state: PSJTState) -> str:
     if state.get("skeleton_slot_failure_pending"):
         return "router"
+    if state.get("pending_action") == "psychometric_repair_batch":
+        return "automatic_approval"
     if state.get("review_process_status") == "exhausted":
         return "accept_latest"
     if state.get("current_item_repair_failure"):
@@ -107,6 +114,8 @@ def route_after_commit(state: PSJTState) -> str:
         # Every analysis round must show its failures and locked-item monitoring
         # before the next diagnosis is allowed to start.
         return "post_simulation_review"
+    if action == "psychometric_repair_batch":
+        return "router"
 
     if action in {"generate_item", "revise_item", "regenerate_item"}:
         return "review"
@@ -122,6 +131,10 @@ def route_after_post_simulation_review(state: PSJTState) -> str:
 
 
 def route_after_psychometric_repair_confirmation(state: PSJTState) -> str:
+    return "end" if state.get("status") == "stopped" else "router"
+
+
+def route_after_plateau_gap_decision(state: PSJTState) -> str:
     return "end" if state.get("status") == "stopped" else "router"
 
 

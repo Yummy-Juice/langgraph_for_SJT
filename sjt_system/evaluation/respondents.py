@@ -8,6 +8,7 @@ from functools import lru_cache
 from hashlib import sha256
 import json
 import math
+import os
 from pathlib import Path
 import random
 from statistics import NormalDist
@@ -33,9 +34,10 @@ SUPPORTED_PERSONA_MODES = (PERSONA_MODE_SCORE_PROFILE,)
 DEFAULT_PERSONA_MODES = SUPPORTED_PERSONA_MODES
 SCORE_PROFILE_GENERATOR_VERSION = "tiered-symmetric-quantile-v3"
 SCORE_PROFILE_PROMPT_VERSION = "score-tier-sjt-v3"
-MATCHED_CONDITION_GENERATOR_VERSION = "matched-normal-shared-sequence-v2"
+MATCHED_CONDITION_GENERATOR_VERSION = "matched-normal-shared-sequence-v3"
 MATCHED_CONDITION_PROMPT_VERSION = "matched-facet-grouped-score-v2"
-MATCHED_CONDITION_SCHEMA_VERSION = 6
+MATCHED_CONDITION_SCHEMA_VERSION = 7
+DEFAULT_TARGET_FORM_ADMINISTRATION_COUNT = 2
 MATCHED_CONDITION_IDS = ("target", "same_domain", "cross_domain")
 MATCHED_CONDITION_ROLES = {
     "target": "target",
@@ -1043,7 +1045,7 @@ def build_matched_condition_sample_config(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     max_retries: int = DEFAULT_MAX_RETRIES,
 ) -> dict[str, Any]:
-    """Build schema v6 configuration for three fixed arms with facet groups."""
+    """Build the matched-facet configuration with one target-form retest."""
 
     if not 1 <= int(max_concurrency) <= MAX_ALLOWED_CONCURRENCY:
         raise ValueError(f"max_concurrency 必须是1到{MAX_ALLOWED_CONCURRENCY}之间的整数")
@@ -1088,13 +1090,28 @@ def build_matched_condition_sample_config(
         "generator_version": MATCHED_CONDITION_GENERATOR_VERSION,
         "prompt_version": MATCHED_CONDITION_PROMPT_VERSION,
         "generation_diagnostics": deepcopy(dict(generation_diagnostics)),
-        "neo_ffi_in_main_iteration": False,
+        # Pin the virtual-respondent model in the run configuration.  This
+        # lets the main CLI use a separate model from the authoring agents and
+        # keeps resumed runs reproducible even if .env changes later.
+        "model_id": (
+            os.getenv("VIRTUAL_RESPONDENT_MODEL_ID")
+            or os.getenv("MODEL_ID")
+            or "deepseek-v4-flash"
+        ),
+        "ipip_neo_reference_enabled": True,
+        "ipip_neo_in_main_iteration": False,
         "response_count_per_respondent_item": 1,
+        # The primary administration remains the sole authority for item-level
+        # screening.  One additional target-only administration supplies the
+        # whole-form virtual test-retest stability estimate.
+        "target_form_administration_count": (
+            DEFAULT_TARGET_FORM_ADMINISTRATION_COUNT
+        ),
     }
 
 
 def matched_condition_sample_is_current(config: object, respondents: object) -> bool:
-    """Validate schema v6 and exact one-to-one matching across facet groups."""
+    """Validate the active matched-facet and target-retest contract."""
 
     if not isinstance(config, Mapping) or not isinstance(respondents, list):
         return False
@@ -1105,6 +1122,9 @@ def matched_condition_sample_is_current(config: object, respondents: object) -> 
         or config.get("persona_modes") != [PERSONA_MODE_SCORE_PROFILE]
         or config.get("generator_version") != MATCHED_CONDITION_GENERATOR_VERSION
         or config.get("prompt_version") != MATCHED_CONDITION_PROMPT_VERSION
+        or config.get("response_count_per_respondent_item") != 1
+        or config.get("target_form_administration_count")
+        != DEFAULT_TARGET_FORM_ADMINISTRATION_COUNT
         or config.get("sample_size") != len(respondents)
         or config.get("sample_size_per_condition") is None
     ):

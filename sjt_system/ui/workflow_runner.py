@@ -11,6 +11,7 @@ from langgraph.types import Command
 
 from sjt_system.runtime.checkpoint import save_run_checkpoint
 from sjt_system.runtime.progress import progress_callback
+from sjt_system.runtime.telemetry import run_context as telemetry_run_context
 
 
 UpdateCallback = Callable[[str, dict[str, Any], dict[str, Any]], None]
@@ -81,6 +82,27 @@ async def run_until_pause(
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("工作流状态缺少有效 run_id")
 
+    with telemetry_run_context(run_id):
+        return await _run_until_pause_impl(
+            workflow=workflow,
+            graph_input=graph_input,
+            state=state,
+            checkpoint_root=checkpoint_root,
+            on_update=on_update,
+            on_progress=on_progress,
+        )
+
+
+async def _run_until_pause_impl(
+    workflow: Any,
+    graph_input: dict[str, Any] | Command,
+    state: Mapping[str, Any],
+    *,
+    checkpoint_root: Path | None,
+    on_update: UpdateCallback | None,
+    on_progress: ProgressCallback | None,
+) -> WorkflowTurn:
+    """Advance a compiled graph until it completes or requests user input."""
     updates: list[dict[str, Any]] = []
     runtime_events: list[dict[str, Any]] = []
 

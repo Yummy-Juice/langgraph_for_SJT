@@ -29,6 +29,7 @@ _BULK_DIFF_FIELDS = {
     "item_pattern_profiles",
     "psychometric_repair_history",
     "psychometric_selection_history",
+    "psychometric_iteration_history",
     "virtual_respondents",
 }
 _IDENTITY_FIELDS = (

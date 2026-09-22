@@ -121,19 +121,20 @@ async def execute_node(state: PSJTState) -> dict:
                 raise ValueError(
                     format_blueprint_errors_for_user(blueprint_errors)
                 )
-        validate_item_agent_update(
-            effective_action,
-            proposed_update,
-            target_item_id=route.get("target_item_id"),
-            target_blueprint_cell_id=route.get("target_blueprint_cell_id"),
-            specification=state.get("test_specification"),
-            blueprint_cell=state.get("current_blueprint_cell"),
-            item_specification=(
-                proposed_update.get("current_item_specification")
-                or state.get("current_item_specification")
-            ),
-            previous_item=state.get("current_item"),
-        )
+        if effective_action != "psychometric_repair_batch":
+            validate_item_agent_update(
+                effective_action,
+                proposed_update,
+                target_item_id=route.get("target_item_id"),
+                target_blueprint_cell_id=route.get("target_blueprint_cell_id"),
+                specification=state.get("test_specification"),
+                blueprint_cell=state.get("current_blueprint_cell"),
+                item_specification=(
+                    proposed_update.get("current_item_specification")
+                    or state.get("current_item_specification")
+                ),
+                previous_item=state.get("current_item"),
+            )
         is_requirement_action = effective_action == "clarify_requirements"
         pending_interaction = (
             build_requirement_interaction(result)
@@ -162,6 +163,7 @@ async def execute_node(state: PSJTState) -> dict:
             {**proposed_update, **requirement_status_update},
         )
         repair_attempt_count = result.get("repair_attempt_count", 0)
+        semantic_retry_count = result.get("semantic_retry_count", 0)
         if is_requirement_action:
             specification = proposed_update["test_specification"]
             readiness = (
@@ -186,6 +188,11 @@ async def execute_node(state: PSJTState) -> dict:
                 f"结构输出自动修复 {repair_attempt_count} 次后通过校验"
             )
             summary = f"{summary}（{repair_note}）" if summary else repair_note
+        if semantic_retry_count:
+            retry_note = (
+                f"蓝图语义校验自动重试 {semantic_retry_count} 次后通过校验"
+            )
+            summary = f"{summary}（{retry_note}）" if summary else retry_note
         return {
             "step_count": state["step_count"] + 1,
             "pending_action": effective_action,
@@ -212,9 +219,22 @@ async def execute_node(state: PSJTState) -> dict:
                     "recorded_at": utc_timestamp(),
                     "duration_ms": round((perf_counter() - started_at) * 1000),
                     "reason": (
-                        f"结构输出自动修复 {repair_attempt_count} 次"
-                        if repair_attempt_count
-                        else "Agent 输出首次通过结构校验"
+                        "；".join(
+                            note for note in (
+                                (
+                                    f"结构输出自动修复 {repair_attempt_count} 次"
+                                    if repair_attempt_count
+                                    else ""
+                                ),
+                                (
+                                    f"蓝图语义校验自动重试 {semantic_retry_count} 次"
+                                    if semantic_retry_count
+                                    else ""
+                                ),
+                            )
+                            if note
+                        )
+                        or "Agent 输出首次通过结构校验"
                     ),
                     "state_changes": state_changes,
                 },

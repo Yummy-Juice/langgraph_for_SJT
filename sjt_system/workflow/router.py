@@ -13,6 +13,7 @@ from sjt_system.authoring.bank import (
 )
 from sjt_system.authoring.blueprint import select_next_blueprint_cell
 from sjt_system.authoring.context import select_item_specification
+from sjt_system.authoring.generation_plan import GENERATION_BLUEPRINT_VERSION
 from sjt_system.delivery.lifecycle import (
     evaluate_completion,
     psychometric_results_are_current,
@@ -26,11 +27,11 @@ def _fixed_blueprint_gap_failure(
     *,
     reason: str,
 ) -> dict[str, Any]:
-    """Stop instead of letting any model or recovery path invent new IDs."""
+    """Stop only when a valid automatic same-cell replenishment is impossible."""
 
     message = (
-        f"{reason}。固定蓝图中的题号已经耗尽；系统不会在运行中创建补题题号。"
-        "请在原题号内继续重写，或返回蓝图阶段重新确认完整细目表。"
+        f"{reason}。系统已达到同槽位自动补题上限，不能降低单题质量门槛"
+        "或把未通过题目伪装成合格题。"
     )
     return {
         "status": "failed",
@@ -57,6 +58,190 @@ def _fixed_blueprint_gap_failure(
             },
         ],
     }
+
+
+def _prepare_automatic_blueprint_gap_replenishment(
+    state: Mapping[str, Any],
+    retention_gaps: list[Mapping[str, Any]],
+) -> dict[str, Any] | None:
+    """Create one fresh generation slot for the first uncovered blueprint cell.
+
+    The initial blueprint keeps its fixed semantic cell definitions.  When all
+    initial candidate slots for a cell have been consumed without leaving a
+    usable item, the workflow may append a bounded same-cell generation slot.
+    The normal generation, content review, virtual administration, and item
+    psychometric loop then handle that new slot.  This helper only prepares
+    routing state; it does not admit the item or lower any threshold.
+    """
+
+    if not retention_gaps:
+        return None
+    blueprint = deepcopy(state.get("blueprint") or {})
+    cells = blueprint.get("cells") or []
+    gap = next(
+        (
+            row
+            for row in retention_gaps
+            if isinstance(row, Mapping) and row.get("blueprint_cell_id")
+        ),
+        None,
+    )
+    if gap is None:
+        return None
+    cell_id = str(gap["blueprint_cell_id"])
+    cell = next(
+        (
+            deepcopy(dict(row))
+            for row in cells
+            if isinstance(row, Mapping) and str(row.get("cell_id")) == cell_id
+        ),
+        None,
+    )
+    if cell is None:
+        return None
+
+    existing_ids = {
+        str(row.get("specification_id"))
+        for row in state.get("item_specifications") or []
+        if isinstance(row, Mapping) and row.get("specification_id")
+    }
+    existing_ids.update(
+        str(row.get("item_id"))
+        for row in state.get("item_pool") or []
+        if isinstance(row, Mapping) and row.get("item_id")
+    )
+    existing_ids.update(
+        str(row.get("item_id"))
+        for row in state.get("removed_items") or []
+        if isinstance(row, Mapping) and row.get("item_id")
+    )
+    prefix = f"{cell_id}-gap-"
+    gap_number = max(
+        (
+            int(identifier[len(prefix):])
+            for identifier in existing_ids
+            if identifier.startswith(prefix)
+            and identifier[len(prefix):].isdigit()
+        ),
+        default=0,
+    ) + 1
+    max_replacements = int(state.get("max_item_replacement_attempts") or 2)
+    if gap_number > max_replacements:
+        return None
+    specification_id = f"{prefix}{gap_number}"
+    if specification_id in existing_ids:
+        return None
+
+    candidate_reference = None
+    for slot in blueprint.get("slots") or []:
+        if (
+            isinstance(slot, Mapping)
+            and str(slot.get("blueprint_cell_id")) == cell_id
+            and isinstance(slot.get("candidate_reference"), Mapping)
+        ):
+            candidate_reference = deepcopy(dict(slot["candidate_reference"]))
+            break
+    if candidate_reference is None:
+        candidate_reference = {
+            "mechanism_id": cell.get("mechanism_id"),
+            "situation_id": cell.get("situation_id"),
+        }
+    if not candidate_reference.get("mechanism_id") or not candidate_reference.get(
+        "situation_id"
+    ):
+        return None
+
+    blueprint.setdefault("slots", []).append(
+        {
+            "specification_id": specification_id,
+            "blueprint_cell_id": cell_id,
+            "candidate_reference": candidate_reference,
+        }
+    )
+    for blueprint_cell in blueprint.get("cells") or []:
+        if isinstance(blueprint_cell, dict) and str(blueprint_cell.get("cell_id")) == cell_id:
+            blueprint_cell["planned_generation_count"] = int(
+                blueprint_cell.get("planned_generation_count") or 0
+            ) + 1
+            cell = deepcopy(blueprint_cell)
+            break
+
+    source_specification = next(
+        (
+            deepcopy(dict(row))
+            for row in state.get("item_specifications") or []
+            if isinstance(row, Mapping)
+            and str(row.get("blueprint_cell_id")) == cell_id
+        ),
+        None,
+    )
+    new_specification = source_specification or {
+        "blueprint_cell_id": cell_id,
+        "target_dimension_id": cell.get("facet_id"),
+    }
+    new_specification.update(
+        {
+            "specification_id": specification_id,
+            "blueprint_cell_id": cell_id,
+            "target_dimension_id": cell.get("facet_id")
+            or new_specification.get("target_dimension_id"),
+            "replacement_for_blueprint_gap": True,
+        }
+    )
+    progress = deepcopy(state.get("blueprint_progress") or {})
+    cell_progress = progress.setdefault(
+        cell_id,
+        {"generated": 0, "passed": 0, "rejected": 0, "missing": 0},
+    )
+    cell_progress["missing"] = int(cell_progress.get("missing") or 0) + 1
+    lineage = deepcopy(state.get("item_lineage") or {})
+    lineage[specification_id] = {
+        "root_item_id": specification_id,
+        "status": "blueprint_gap_replenishment",
+        "replacement_number": gap_number,
+    }
+
+    previous_response_ref = state.get("virtual_response_data_ref")
+    update: dict[str, Any] = {
+        "blueprint": blueprint,
+        "blueprint_progress": progress,
+        "current_blueprint_cell": cell,
+        "current_item": None,
+        "current_item_specification": new_specification,
+        "current_item_review": None,
+        "current_item_repair_attempted": False,
+        "current_item_repair_failure": None,
+        "current_item_revision_count": 0,
+        "current_item_rewrite_count": 0,
+        "current_item_replacement_count": 0,
+        "item_specifications": [
+            *deepcopy(state.get("item_specifications") or []),
+            new_specification,
+        ],
+        "item_lineage": lineage,
+        "selection_results": None,
+        "selected_items": [],
+        "reserve_items": [],
+        "blueprint_coverage": None,
+        "assembled_test": None,
+        "test_review_result": None,
+        "final_test": None,
+        "item_database_ref": None,
+        "technical_report": None,
+        "virtual_respondent_report": None,
+        "virtual_response_data_ref": None,
+        "virtual_response_summary": None,
+        "virtual_response_item_bank_id": None,
+        "virtual_response_item_bank_version": None,
+        "item_statistics": {},
+        "psychometric_round_result": None,
+        "test_statistics": None,
+        "psychometric_repair_confirmation": None,
+        "active_psychometric_repair": None,
+    }
+    if isinstance(previous_response_ref, str) and previous_response_ref:
+        update["previous_virtual_response_data_ref"] = previous_response_ref
+    return update
 
 
 def _next_psychometric_repair(
@@ -97,6 +282,25 @@ def _psychometric_confirmation_is_approved(state: Mapping[str, Any]) -> bool:
         isinstance(confirmation, Mapping)
         and confirmation.get("decision") == "approve"
     )
+
+
+def _has_batchable_psychometric_repairs(state: Mapping[str, Any]) -> bool:
+    """Whether the diagnosed queue can be handed to parallel item workers."""
+
+    for entry in [
+        *(state.get("items_to_regenerate") or []),
+        *(state.get("items_to_revise") or []),
+    ]:
+        if not isinstance(entry, Mapping):
+            continue
+        advice = entry.get("atomic_repair_advice")
+        if (
+            isinstance(advice, Mapping)
+            and advice.get("decision") == "repair"
+            and advice.get("repair_tasks")
+        ):
+            return True
+    return False
 
 
 def _stage_psychometric_repair(
@@ -206,7 +410,10 @@ def _stage_psychometric_repair(
 
 def _blueprint_review_allows_item_generation(state: Mapping[str, Any]) -> bool:
     blueprint = state.get("blueprint")
-    return isinstance(blueprint, Mapping) and blueprint.get("version") == 7
+    return (
+        isinstance(blueprint, Mapping)
+        and blueprint.get("version") == GENERATION_BLUEPRINT_VERSION
+    )
 
 
 async def router_node(state: PSJTState) -> dict:
@@ -305,6 +512,7 @@ async def router_node(state: PSJTState) -> dict:
         else None
     )
     selected_cell = None
+    gap_replenishment_update: dict[str, Any] = {}
     if isinstance(blueprint, dict):
         selected_cell = pending_replacement_cell or select_next_blueprint_cell(
             blueprint,
@@ -370,8 +578,16 @@ async def router_node(state: PSJTState) -> dict:
             # Psychometric repairs are always atomic patches. Even legacy
             # queue entries marked regenerate_item must use the scoped repair
             # agent so the fixed slot and diagnosis scope are preserved.
-            "next_action": "revise_item",
-            "reason": "用户已确认当前单题诊断，进入原子修改",
+            "next_action": (
+                "psychometric_repair_batch"
+                if _has_batchable_psychometric_repairs(state)
+                else "revise_item"
+            ),
+            "reason": (
+                "当前批次诊断已确认，启动并发单题修改—复测闭环"
+                if _has_batchable_psychometric_repairs(state)
+                else "用户已确认当前单题诊断，进入原子修改"
+            ),
             "target_item_id": pending_psychometric_repair["item_id"],
             "target_blueprint_cell_id": pending_psychometric_repair.get(
                 "blueprint_cell_id"
@@ -431,6 +647,25 @@ async def router_node(state: PSJTState) -> dict:
             "target_item_id": None,
             "target_blueprint_cell_id": None,
         }
+    elif selection_status == "awaiting_sme_review" and retention_gaps:
+        replenishment = _prepare_automatic_blueprint_gap_replenishment(
+            state,
+            retention_gaps,
+        )
+        if replenishment is None:
+            return _fixed_blueprint_gap_failure(
+                state,
+                reason="待SME题造成蓝图缺口，且自动补题次数已耗尽",
+            )
+        raw_decision = {
+            "next_action": "generate_item",
+            "reason": "待SME题造成蓝图缺口，自动生成同槽位候选题",
+            "target_item_id": None,
+            "target_blueprint_cell_id": replenishment[
+                "current_blueprint_cell"
+            ]["cell_id"],
+        }
+        gap_replenishment_update = replenishment
     elif selection_status == "awaiting_sme_review":
         return {
             "status": "stopped",
@@ -457,14 +692,93 @@ async def router_node(state: PSJTState) -> dict:
                 },
             ],
         }
+    elif selection_status == "awaiting_plateau_gap" and retention_gaps:
+        replenishment = _prepare_automatic_blueprint_gap_replenishment(
+            state,
+            retention_gaps,
+        )
+        if replenishment is None:
+            return _fixed_blueprint_gap_failure(
+                state,
+                reason="平台期蓝图缺口，且自动补题次数已耗尽",
+            )
+        raw_decision = {
+            "next_action": "generate_item",
+            "reason": "平台期发现蓝图缺口，自动生成同槽位候选题",
+            "target_item_id": None,
+            "target_blueprint_cell_id": replenishment[
+                "current_blueprint_cell"
+            ]["cell_id"],
+        }
+        gap_replenishment_update = replenishment
+    elif selection_status == "awaiting_plateau_gap":
+        pending = state.get("plateau_gap_decision")
+        if (
+            isinstance(pending, Mapping)
+            and pending.get("status") == "pending"
+        ):
+            raw_decision = {
+                "next_action": "plateau_gap_decision",
+                "reason": (
+                    "平台期收卷存在蓝图缺口，等待用户处置缺口单元"
+                    "（点选补位或手动修改）"
+                ),
+                "target_item_id": None,
+                "target_blueprint_cell_id": None,
+            }
+        else:
+            return {
+                "status": "stopped",
+                "route": {
+                    "next_action": "finish",
+                    "reason": "平台期收卷存在蓝图缺口，等待人工处置",
+                    "target_item_id": None,
+                    "target_blueprint_cell_id": None,
+                },
+                "execution_history": [
+                    *state.get("execution_history", []),
+                    {
+                        "event_id": (
+                            f'{state.get("run_id", "unknown")}:'
+                            f'{state.get("step_count", 0)}:awaiting_plateau_gap'
+                        ),
+                        "run_id": state.get("run_id"),
+                        "step": state.get("step_count", 0),
+                        "node": "router",
+                        "action": "awaiting_plateau_gap",
+                        "event_type": "paused",
+                        "recorded_at": utc_timestamp(),
+                        "reason": (
+                            "平台期收卷完成，但蓝图仍有缺口，等待人工处置"
+                        ),
+                    },
+                ],
+            }
     elif (
         selection_status == "fixed_blueprint_gap"
         and bool(retention_gaps)
     ):
-        return _fixed_blueprint_gap_failure(
+        replenishment = _prepare_automatic_blueprint_gap_replenishment(
             state,
-            reason="题目筛选后仍存在蓝图保留量缺口",
+            retention_gaps,
         )
+        if replenishment is None:
+            return _fixed_blueprint_gap_failure(
+                state,
+                reason="题目筛选后仍存在蓝图保留量缺口，且自动补题次数已耗尽",
+            )
+        raw_decision = {
+            "next_action": "generate_item",
+            "reason": (
+                "检测到蓝图槽位缺口，自动追加同槽位题目；"
+                "新题将重新经过审题、施测和单题指标筛选"
+            ),
+            "target_item_id": None,
+            "target_blueprint_cell_id": replenishment[
+                "current_blueprint_cell"
+            ]["cell_id"],
+        }
+        gap_replenishment_update = replenishment
     elif (
         selection_status == "fixed_blueprint_gap"
         and not retention_gaps
@@ -512,10 +826,32 @@ async def router_node(state: PSJTState) -> dict:
             "target_item_id": None,
             "target_blueprint_cell_id": None,
         }
+    elif (
+        test_review_decision_before_route == "SUPPLEMENT"
+        and retention_gaps
+    ):
+        replenishment = _prepare_automatic_blueprint_gap_replenishment(
+            state,
+            retention_gaps,
+        )
+        if replenishment is None:
+            return _fixed_blueprint_gap_failure(
+                state,
+                reason="测验级审核发现阻断性蓝图缺口，且自动补题次数已耗尽",
+            )
+        raw_decision = {
+            "next_action": "generate_item",
+            "reason": "测验级审核发现蓝图缺口，自动生成同槽位候选题",
+            "target_item_id": None,
+            "target_blueprint_cell_id": replenishment[
+                "current_blueprint_cell"
+            ]["cell_id"],
+        }
+        gap_replenishment_update = replenishment
     elif test_review_decision_before_route == "SUPPLEMENT":
         return _fixed_blueprint_gap_failure(
             state,
-            reason="测验级审核发现阻断性蓝图缺口",
+            reason="测验级审核发现阻断性蓝图缺口，且没有可识别的补题槽位",
         )
     elif (
         test_review_decision_before_route == "PASS"
@@ -555,10 +891,26 @@ async def router_node(state: PSJTState) -> dict:
             "target_blueprint_cell_id": None,
         }
     elif retention_gaps:
-        return _fixed_blueprint_gap_failure(
+        replenishment = _prepare_automatic_blueprint_gap_replenishment(
             state,
-            reason="程序检查发现固定细目表仍有保留量硬缺口",
+            retention_gaps,
         )
+        if replenishment is None:
+            return _fixed_blueprint_gap_failure(
+                state,
+                reason="程序检查发现蓝图保留量硬缺口，且自动补题次数已耗尽",
+            )
+        raw_decision = {
+            "next_action": "generate_item",
+            "reason": (
+                "程序检查发现蓝图槽位缺口，自动追加同槽位候选题"
+            ),
+            "target_item_id": None,
+            "target_blueprint_cell_id": replenishment[
+                "current_blueprint_cell"
+            ]["cell_id"],
+        }
+        gap_replenishment_update = replenishment
     elif not responses_bound_to_current_bank:
         raw_decision = {
             "next_action": "simulate_responses",
@@ -584,7 +936,9 @@ async def router_node(state: PSJTState) -> dict:
             "target_blueprint_cell_id"
         ),
     }
-    route_update: dict[str, Any] = {}
+    route_update: dict[str, Any] = {
+        **gap_replenishment_update,
+    }
     if state.get("skeleton_slot_failure_pending"):
         route_update["skeleton_slot_failure_pending"] = False
     if (
@@ -615,18 +969,44 @@ async def router_node(state: PSJTState) -> dict:
         else:
             if selected_cell is None:
                 if retention_gaps:
-                    return _fixed_blueprint_gap_failure(
-                        state,
-                        reason="固定细目表全部槽位已尝试但保留量仍不足",
+                    replenishment = gap_replenishment_update or (
+                        _prepare_automatic_blueprint_gap_replenishment(
+                            state,
+                            retention_gaps,
+                        )
+                        or {}
                     )
+                    if not replenishment:
+                        return _fixed_blueprint_gap_failure(
+                            state,
+                            reason=(
+                                "固定细目表全部槽位已尝试但保留量仍不足，"
+                                "且自动补题次数已耗尽"
+                            ),
+                        )
+                    route_update.update(replenishment)
+                    decision["target_blueprint_cell_id"] = replenishment[
+                        "current_blueprint_cell"
+                    ]["cell_id"]
                 decision = {
-                    "next_action": "simulate_responses",
-                    "reason": "候选题已完成，冻结当前版本并进入虚拟施测",
+                    "next_action": "generate_item"
+                    if retention_gaps
+                    else "simulate_responses",
+                    "reason": (
+                        "自动补充蓝图缺口题目"
+                        if retention_gaps
+                        else "候选题已完成，冻结当前版本并进入虚拟施测"
+                    ),
                     "target_item_id": None,
-                    "target_blueprint_cell_id": None,
+                    "target_blueprint_cell_id": decision.get(
+                        "target_blueprint_cell_id"
+                    )
+                    if retention_gaps
+                    else None,
                 }
-                route_update["current_blueprint_cell"] = None
-                route_update["current_item_specification"] = None
+                if not retention_gaps:
+                    route_update["current_blueprint_cell"] = None
+                    route_update["current_item_specification"] = None
             else:
                 decision["target_item_id"] = None
                 decision["target_blueprint_cell_id"] = selected_cell["cell_id"]

@@ -1,0 +1,17 @@
+{
+  "target_facet": "extraversion_gregariousness",
+  "same_domain_facet": "extraversion_warmth",
+  "cross_domain_facet": "neuroticism_anxiety",
+  "target_population": "大学生",
+  "final_item_count": 16,
+  "sample_size": 100,
+  "seed": 7,
+  "max_concurrency": 5,
+  "max_repair_rounds": 3,
+  "plateau_patience": 2,
+  "plateau_min_delta": 0.01,
+  "stability_minimum": 0.8,
+  "model_id": "deepseek-flash-guan",
+  "virtual_respondent_model_id": "glm-5.3-flash",
+  "evaluation_model_id": "glm-5.3-flash"
+}

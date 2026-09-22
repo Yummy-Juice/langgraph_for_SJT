@@ -1,4 +1,5 @@
 import asyncio
+import json
 from typing import Any
 
 from httpx import TransportError
@@ -12,9 +13,13 @@ from sjt_system.agent.client import (
     get_model_request_timeout_seconds,
 )
 from sjt_system.runtime.progress import emit_progress
+from sjt_system.runtime.telemetry import job_context as telemetry_job_context
 
 
-MAX_LOCAL_JSON_REPAIR_ATTEMPTS = 3
+# One targeted correction after the initial response. Network retries are
+# counted separately by ``ainvoke_model_with_retry``. Keeping this bounded
+# prevents a persistent schema mismatch from becoming an open-ended token loop.
+MAX_LOCAL_JSON_REPAIR_ATTEMPTS = 1
 RETRYABLE_HTTP_STATUS_CODES = {408, 409, 425, 429}
 
 
@@ -72,10 +77,11 @@ async def ainvoke_model_with_retry(
     )
     for attempt in range(1, max_attempts + 1):
         try:
-            return await asyncio.wait_for(
-                agent.ainvoke(input_data),
-                timeout=timeout_seconds,
-            )
+            with telemetry_job_context(job_label, attempt=attempt):
+                return await asyncio.wait_for(
+                    agent.ainvoke(input_data),
+                    timeout=timeout_seconds,
+                )
         except TimeoutError as exc:
             if attempt >= max_attempts:
                 emit_progress(
@@ -157,6 +163,7 @@ async def ainvoke_model_with_schema_repair(
     last_feedback: str | None = None
     last_candidate: Any = None
     last_error_kind = "json_syntax"
+    previous_failure_signature: tuple[str, str] | None = None
     for repair_attempt in range(max_schema_repair_attempts + 1):
         try:
             return await ainvoke_model_with_retry(
@@ -183,6 +190,29 @@ async def ainvoke_model_with_schema_repair(
             last_feedback = feedback
             last_candidate = candidate
             last_error_kind = error_kind
+            try:
+                serialized_candidate = json.dumps(
+                    candidate,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    default=str,
+                )
+            except (TypeError, ValueError):
+                serialized_candidate = repr(candidate)
+            failure_signature = (error_kind, serialized_candidate)
+            if failure_signature == previous_failure_signature:
+                emit_progress(
+                    {
+                        "type": "output_repair_stalled",
+                        "retry_kind": error_kind,
+                        "job_label": job_label,
+                        "attempt": repair_attempt + 1,
+                        "max_attempts": max_schema_repair_attempts + 1,
+                        "reason": "模型连续返回相同的无效结构，停止继续抽样",
+                    }
+                )
+                break
+            previous_failure_signature = failure_signature
             if repair_attempt >= max_schema_repair_attempts:
                 break
             task_input = request_data.get("input_data")

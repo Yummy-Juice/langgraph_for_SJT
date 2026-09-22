@@ -1,5 +1,6 @@
 import json
 import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -8,6 +9,7 @@ from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
 from pydantic import TypeAdapter, ValidationError as PydanticValidationError
 from sjt_system.agent.json_parsing import parse_model_json_response
+from sjt_system.runtime.telemetry import HANDLER as TELEMETRY_HANDLER
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
@@ -70,6 +72,8 @@ def get_model(
         ),
         timeout=get_model_request_timeout_seconds(),
         max_retries=0,
+        # Observation-only telemetry: token usage and latency per model call.
+        callbacks=[TELEMETRY_HANDLER],
     )
 
 
@@ -96,6 +100,144 @@ class LocalJSONSchemaError(ValueError):
         super().__init__(message)
         self.candidate = candidate
         self.field_path = field_path
+
+
+_OUTPUT_ENVELOPE_KEYS = ("result", "output", "data", "response")
+_STATE_UPDATE_ALIAS_KEYS = ("update", "patch", "item_patch", "state")
+
+
+def _schema_node(
+    schema: Mapping[str, Any],
+    node: Any,
+) -> Mapping[str, Any]:
+    """Resolve one local JSON-Schema reference without following arbitrary URIs."""
+
+    if not isinstance(node, Mapping):
+        return {}
+    reference = node.get("$ref")
+    if not isinstance(reference, str) or not reference.startswith("#/"):
+        return node
+    current: Any = schema
+    for raw_part in reference[2:].split("/"):
+        part = raw_part.replace("~1", "/").replace("~0", "~")
+        if not isinstance(current, Mapping) or part not in current:
+            return {}
+        current = current[part]
+    return current if isinstance(current, Mapping) else {}
+
+
+def normalize_model_output_shape(value: Any, output_type: type) -> Any:
+    """Normalize common transport shapes before strict schema validation.
+
+    This adapter changes containers only. It never invents domain values,
+    rewrites item text, or relaxes downstream business validation. Supported
+    compatibility cases are deliberately narrow:
+
+    * a single conventional envelope such as ``result`` or ``output``;
+    * a known alias for ``state_update``;
+    * state-update fields returned directly at the top level.
+    """
+
+    model_dump = getattr(value, "model_dump", None)
+    if callable(model_dump):
+        value = model_dump()
+    if not isinstance(value, Mapping):
+        return value
+
+    schema = TypeAdapter(output_type).json_schema()
+    root_properties = schema.get("properties")
+    if not isinstance(root_properties, Mapping):
+        return dict(value)
+    root_keys = {str(key) for key in root_properties}
+    candidate = dict(value)
+    state_property = _schema_node(schema, root_properties.get("state_update"))
+    state_properties = state_property.get("properties")
+    state_keys = (
+        {str(key) for key in state_properties}
+        if isinstance(state_properties, Mapping)
+        else set()
+    )
+
+    # Some compatible endpoints wrap the requested object in one generic
+    # transport envelope. Preserve any valid root-level sibling (for example
+    # ``summary``) while unwrapping the nested object.
+    if not (root_keys & set(candidate)):
+        for envelope_key in _OUTPUT_ENVELOPE_KEYS:
+            nested = candidate.get(envelope_key)
+            if isinstance(nested, Mapping):
+                candidate = dict(nested)
+                break
+    else:
+        for envelope_key in _OUTPUT_ENVELOPE_KEYS:
+            nested = candidate.get(envelope_key)
+            if not isinstance(nested, Mapping):
+                continue
+            nested_keys = set(nested)
+            if not (nested_keys & (root_keys | state_keys)):
+                continue
+            merged = dict(nested)
+            for key in root_keys:
+                if key in candidate and key not in merged:
+                    merged[key] = candidate[key]
+            candidate = merged
+            break
+
+    if "state_update" not in root_keys or "state_update" in candidate:
+        return candidate
+
+    # Accept only known structural aliases. The aliased payload still has to
+    # satisfy the exact state_update schema below.
+    for alias in _STATE_UPDATE_ALIAS_KEYS:
+        nested = candidate.get(alias)
+        if isinstance(nested, Mapping):
+            candidate["state_update"] = dict(nested)
+            candidate.pop(alias, None)
+            return candidate
+
+    # Models frequently omit the state_update envelope while returning the
+    # correct patch fields. Move only schema-declared fields into the envelope;
+    # missing required fields remain missing and will be rejected normally.
+    direct_state_keys = [key for key in state_keys if key in candidate]
+    if direct_state_keys:
+        candidate["state_update"] = {
+            key: candidate.pop(key) for key in direct_state_keys
+        }
+    return candidate
+
+
+def _local_output_validator(output_type: type):
+    output_adapter = TypeAdapter(output_type)
+
+    def validate_local_output(value: Any) -> Any:
+        normalized = normalize_model_output_shape(value, output_type)
+        try:
+            validated = output_adapter.validate_python(normalized)
+        except PydanticValidationError as exc:
+            issues = exc.errors(include_url=False)
+            issue = issues[0]
+            field_path = "$"
+            for part in issue.get("loc", ()):
+                if isinstance(part, int):
+                    field_path += f"[{part}]"
+                else:
+                    field_path += f".{part}"
+            details: list[str] = []
+            for row in issues[:5]:
+                path = "$"
+                for part in row.get("loc", ()):
+                    path += f"[{part}]" if isinstance(part, int) else f".{part}"
+                details.append(f"{path}: {row.get('msg', 'invalid value')}")
+            raise LocalJSONSchemaError(
+                "本地 JSON Schema 校验失败：" + "；".join(details),
+                candidate=normalized,
+                field_path=field_path,
+            ) from exc
+        model_dump = getattr(validated, "model_dump", None)
+        if callable(model_dump):
+            return model_dump()
+        return validated
+
+    return validate_local_output
 
 
 def get_model_request_timeout_seconds() -> float:
@@ -185,39 +327,19 @@ def with_compatible_structured_output(
     """Wrap a model for structured output and return the selected method."""
 
     method = resolve_structured_output_method(model)
+    validate_local_output = _local_output_validator(output_type)
     if method == "plain_json":
-        output_adapter = TypeAdapter(output_type)
-
-        def validate_local_json(value: Any) -> Any:
-            try:
-                validated = output_adapter.validate_python(value)
-            except PydanticValidationError as exc:
-                issue = exc.errors(include_url=False)[0]
-                field_path = "$"
-                for part in issue.get("loc", ()):
-                    if isinstance(part, int):
-                        field_path += f"[{part}]"
-                    else:
-                        field_path += f".{part}"
-                raise LocalJSONSchemaError(
-                    "本地 JSON Schema 校验失败"
-                    f"（字段 {field_path}）：{issue.get('msg', str(exc))}",
-                    candidate=value,
-                    field_path=field_path,
-                ) from exc
-            model_dump = getattr(validated, "model_dump", None)
-            if callable(model_dump):
-                return model_dump()
-            return validated
-
         runnable = (
             model
             | RunnableLambda(parse_model_json_response)
-            | RunnableLambda(validate_local_json)
+            | RunnableLambda(validate_local_output)
         )
         return runnable, method
     runnable = model.with_structured_output(
         output_type,
         method=method,
     )
-    return runnable, method
+    # Native structured-output implementations vary in strictness across
+    # OpenAI-compatible providers. Revalidate and normalize their returned
+    # Python object so every provider reaches the workflow in one shape.
+    return runnable | RunnableLambda(validate_local_output), method

@@ -1,8 +1,7 @@
-"""信效度迭代轨迹报告生成器（离线、确定性、无外部依赖）。
+"""虚拟整卷传导指标迭代轨迹报告生成器（离线、确定性）。
 
-扫描 outputs/virtual_responses/*/bank-v*/psychometrics/ 的既有产物，
-把每个版本的 信度(Cronbach α)、聚合效度(SJT×目标Neo维度 Spearman ρ)、
-区分效度(目标ρ − 最大非目标ρ) 画成随迭代版本变化的曲线。
+读取运行检查点中的 psychometric_iteration_history，把每轮临时组卷的
+候选质量、历史最优质量、目标恢复R²和构念选择性画成迭代曲线。
 
 用法：
     python -X utf8 tools/iteration_trajectory.py
@@ -21,6 +20,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from sjt_system.evaluation.form_metrics import (  # noqa: E402
+    assess_form_plateau,
+    form_quality_summary,
+)
+
 OUT = ROOT / "outputs" / "iteration_trajectory.html"
 VR = ROOT / "outputs" / "virtual_responses"
 
@@ -30,34 +34,40 @@ def version_number(name: str) -> int:
 
 
 def load_run_rows(run_dir: Path) -> list[dict]:
+    checkpoint = ROOT / "outputs" / "run_checkpoints" / f"{run_dir.name}.json"
+    if not checkpoint.is_file():
+        return []
+    state = json.loads(checkpoint.read_text(encoding="utf-8")).get("state") or {}
+    history = state.get("psychometric_iteration_history") or []
+    plateau = assess_form_plateau(history)
+    trajectory = {
+        int(row.get("analysis_round") or 0): row
+        for row in plateau.get("trajectory") or []
+        if isinstance(row, dict)
+    }
     rows = []
-    for ver_dir in sorted(
-        glob.glob(str(run_dir / "bank-v*")), key=lambda p: version_number(os.path.basename(p))
-    ):
-        me_path = Path(ver_dir) / "psychometrics" / "measurement_evaluation.json"
-        if not me_path.exists():
+    for entry in history:
+        if not isinstance(entry, dict):
             continue
-        me = json.loads(me_path.read_text(encoding="utf-8"))
-        ss_path = Path(ver_dir) / "psychometrics" / "scale_statistics.json"
-        n = None
-        if ss_path.exists():
-            n = json.loads(ss_path.read_text(encoding="utf-8")).get("sample_size")
-        rec = me.get("reliability") or {}
-        conv = (me.get("validity") or {}).get("convergent") or {}
-        disc = (me.get("validity") or {}).get("discriminant") or {}
-        counts = me.get("item_recommendation_counts") or {}
+        metrics = entry.get("form_metrics") or {}
+        reliability = metrics.get("reliability") or {}
+        validity = metrics.get("validity") or {}
+        recovery = validity.get("target_recovery") or {}
+        quality = form_quality_summary(metrics)
+        quality_row = trajectory.get(int(entry.get("analysis_round") or 0)) or {}
         rows.append({
-            "version": version_number(os.path.basename(ver_dir)),
-            "n": n,
-            "alpha": rec.get("cronbach_alpha"),
-            "conv_rho": conv.get("rho"),
-            "disc_rho": disc.get("largest_non_target_rho"),
-            "margin": disc.get("target_margin"),
-            "retain": counts.get("retain"),
-            "revise": counts.get("revise"),
-            "remove": counts.get("remove"),
+            "version": int(entry.get("analysis_round") or 0),
+            "n": metrics.get("sample_size"),
+            "stability": reliability.get("virtual_test_retest_icc"),
+            "stability_passed": (quality.get("stability_gate") or {}).get("passed"),
+            "recovery": recovery.get("cross_validated_r2"),
+            "selectivity": quality.get("construct_selectivity"),
+            "candidate_quality": quality.get("candidate_form_quality"),
+            "best_quality": quality_row.get("best_so_far_form_quality"),
+            "tokens": int((entry.get("token_usage") or {}).get("total_tokens") or 0),
+            "duration_ms": int((entry.get("token_usage") or {}).get("duration_ms") or 0),
         })
-    return rows
+    return sorted(rows, key=lambda row: row["version"])
 
 
 def repair_events(run_id: str) -> int | None:
@@ -98,7 +108,8 @@ def line_chart(
         points.append((i, y))
     x_values = list(range(len(series)))
     pad = 0.10 * (hi - lo)
-    y_lo, y_hi = lo - pad, hi + pad
+    y_lo = max(0.0, lo - pad) if lo >= 0.0 else lo - pad
+    y_hi = hi + pad
     margin_l, margin_r, margin_t, margin_b = 56, 20, 28, 34
     plot_w = width - margin_l - margin_r
     plot_h = height - margin_t - margin_b
@@ -142,7 +153,7 @@ def line_chart(
     parts.append(f'<text x="{margin_l}" y="{margin_t - 10}" font-size="12.5" font-weight="700" '
                  f'fill="#22303f">{esc(title)}</text>')
     parts.append(f'<text x="{margin_l}" y="{height - 16}" font-size="10" fill="#64748b">'
-                 f'x = 题库版本（迭代）　y = {esc(y_label)}　点旁数字 = 样本量 n</text>')
+                  f'x = 心理测量分析轮次　y = {esc(y_label)}　点旁数字 = 样本量 n</text>')
     # 样本量标注
     for i, row in enumerate(series):
         y = num(row.get(key))
@@ -155,43 +166,62 @@ def line_chart(
 
 
 def run_card(run_id: str, rows: list[dict], events: int | None) -> str:
-    alphas = [num(r.get("alpha")) for r in rows if num(r.get("alpha")) is not None]
-    alphas = [a for a in alphas if -1 <= a <= 1]  # 过滤退化 α
-    convs = [num(r.get("conv_rho")) for r in rows if num(r.get("conv_rho")) is not None]
-    margins = [num(r.get("margin")) for r in rows if num(r.get("margin")) is not None]
-    if not alphas and not convs:
+    recoveries = [num(r.get("recovery")) for r in rows if num(r.get("recovery")) is not None]
+    selectivities = [num(r.get("selectivity")) for r in rows if num(r.get("selectivity")) is not None]
+    candidates = [num(r.get("candidate_quality")) for r in rows if num(r.get("candidate_quality")) is not None]
+    bests = [num(r.get("best_quality")) for r in rows if num(r.get("best_quality")) is not None]
+    if not recoveries and not selectivities and not candidates and not bests:
         return ""
-    all_vals = alphas + convs + margins
+    all_vals = recoveries + selectivities + candidates + bests
     lo, hi = min(all_vals), max(all_vals)
     lo = min(lo, 0.0)
     hi = max(hi, 1.0)
-    lo = -0.05 if lo < 0 else lo
+    cumulative_tokens = 0
+    cumulative_duration = 0
+    for row in rows:
+        cumulative_tokens += int(row.get("tokens") or 0)
+        cumulative_duration += int(row.get("duration_ms") or 0)
+        row["cumulative_tokens"] = cumulative_tokens
+        row["cumulative_duration_hours"] = cumulative_duration / 3_600_000
 
     events_note = ""
     if events is not None:
         events_note = f' · 心理测量修题事件 {events} 次'
 
+    def fmt(value) -> str:
+        numeric = num(value)
+        return "—" if numeric is None else f"{numeric:.3f}"
+
     table_rows = "".join(
         f'<tr><td class="num">v{r["version"]}</td><td class="num">{r["n"] if r["n"] else "—"}</td>'
-        f'<td class="num">{r["alpha"]:.3f}</td><td class="num">{r["conv_rho"]:.3f}</td>'
-        f'<td class="num">{r["margin"]:.3f}</td>'
-        f'<td class="num">{r["retain"]}/{r["revise"]}/{r["remove"]}</td></tr>'
+        f'<td class="num">{fmt(r["recovery"])}</td><td class="num">{fmt(r["selectivity"])}</td>'
+        f'<td class="num">{fmt(r["candidate_quality"])}</td><td class="num">{fmt(r["best_quality"])}</td>'
+        f'<td class="num">{fmt(r["stability"])}（{"通过" if r["stability_passed"] else "未通过"}）</td>'
+        f'<td class="num">{r["cumulative_tokens"]}</td>'
+        f'<td class="num">{r["cumulative_duration_hours"]:.2f}</td></tr>'
         for r in rows
     )
     return f"""
 <div class="card">
   <h3>run {esc(run_id[:8])} · {len(rows)} 个版本{events_note}</h3>
   <div class="charts">
-    {line_chart(rows, "alpha", "信度：Cronbach α", "α", lo, hi,
-                [(0.70, "可接受"), (0.80, "强")], color="#2563eb")}
-    {line_chart(rows, "conv_rho", "聚合效度：SJT总分 × 目标Neo维度 ρ", "ρ", lo, hi,
-                [(0.30, "0.30"), (0.40, "0.40")], color="#059669")}
-    {line_chart(rows, "margin", "区分效度：目标ρ − 最大非目标ρ", "margin", lo, hi,
-                [(0.0, "0")], color="#b45309")}
+    {line_chart(rows, "best_quality", "历史最优整卷质量（只升或持平）", "BFQ", lo, hi,
+                [(0.0, "0")], color="#6a1b9a")}
+    {line_chart(rows, "candidate_quality", "本轮候选整卷质量（允许波动）", "U", lo, hi,
+                [(0.0, "0")], color="#ef6c00")}
+    {line_chart(rows, "recovery", "原始诊断：目标恢复 R²", "R²", lo, hi,
+                [(0.0, "0")], color="#059669")}
+    {line_chart(rows, "selectivity", "原始诊断：构念选择性", "C", lo, hi,
+                [(0.0, "0")], color="#2563eb")}
+    {line_chart(rows, "cumulative_tokens", "累计 Token", "Token", 0.0,
+                max(1.0, float(cumulative_tokens)), [], color="#64748b")}
+    {line_chart(rows, "cumulative_duration_hours", "累计模型耗时", "小时", 0.0,
+                max(1.0, cumulative_duration / 3_600_000), [], color="#475569")}
   </div>
   <table>
-    <tr><th>版本</th><th class="num">n</th><th class="num">α</th><th class="num">聚合ρ</th>
-        <th class="num">区分margin</th><th class="num">建议(保留/修/删)</th></tr>
+    <tr><th>轮次</th><th class="num">n</th><th class="num">目标恢复R²</th><th class="num">构念选择性</th>
+        <th class="num">本轮候选质量</th><th class="num">历史最优质量</th><th class="num">ICC门槛</th>
+        <th class="num">累计Token</th><th class="num">累计耗时(h)</th></tr>
     {table_rows}
   </table>
 </div>"""
@@ -206,15 +236,12 @@ def main() -> None:
             runs.append((run_id, rows, repair_events(run_id)))
 
     # 汇总：首尾版本变化
-    deltas = {"alpha": [], "conv": [], "margin": []}
+    deltas = {"best_quality": [], "candidate_quality": [], "recovery": [], "selectivity": []}
     for _, rows, _ in runs:
         first, last = rows[0], rows[-1]
-        if num(first.get("alpha")) is not None and num(last.get("alpha")) is not None:
-            deltas["alpha"].append(num(last["alpha"]) - num(first["alpha"]))
-        if num(first.get("conv_rho")) is not None and num(last.get("conv_rho")) is not None:
-            deltas["conv"].append(num(last["conv_rho"]) - num(first["conv_rho"]))
-        if num(first.get("margin")) is not None and num(last.get("margin")) is not None:
-            deltas["margin"].append(num(last["margin"]) - num(first["margin"]))
+        for key in deltas:
+            if num(first.get(key)) is not None and num(last.get(key)) is not None:
+                deltas[key].append(num(last[key]) - num(first[key]))
 
     def stat(values):
         if not values:
@@ -228,7 +255,7 @@ def main() -> None:
     html_doc = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head><meta charset="utf-8">
-<title>信效度迭代轨迹报告</title>
+<title>虚拟整卷传导指标迭代轨迹报告</title>
 <style>
 body{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;background:#f6f8fb;color:#22303f;
   line-height:1.7;margin:0}}
@@ -254,17 +281,18 @@ td.num{{text-align:center}}
 footer{{margin-top:50px;color:#94a3b8;font-size:12px;border-top:1px solid #e2e8f0;padding-top:12px}}
 </style></head>
 <body><div class="wrap">
-<h1>信效度随迭代的轨迹</h1>
-<div class="sub">数据源：outputs/virtual_responses/*/bank-v*/psychometrics/（既有存档，全部为虚拟被试开发期证据）·
+<h1>虚拟整卷传导指标随迭代的轨迹</h1>
+<div class="sub">数据源：outputs/run_checkpoints/* 中的整卷迭代历史（全部为虚拟被试开发期证据）·
 生成器：tools/iteration_trajectory.py</div>
 
 <h2>一、跨 run 汇总：从首版本到末版本的变化</h2>
 <div class="card">
 <table class="summary">
 <tr><th>指标</th><th>首→末变化</th><th>含义</th></tr>
-<tr><td>Cronbach α（信度）</td><td class="num">{stat(deltas["alpha"])}</td><td>修题迭代整体上是否提升内部一致性</td></tr>
-<tr><td>聚合效度 ρ（SJT×目标Neo维度）</td><td class="num">{stat(deltas["conv"])}</td><td>题目整体是否更贴近目标构念</td></tr>
-<tr><td>区分效度 margin（目标ρ−最大非目标ρ）</td><td class="num">{stat(deltas["margin"])}</td><td>是否更"只测目标、不测别的"</td></tr>
+<tr><td>历史最优整卷质量</td><td class="num">{stat(deltas["best_quality"])}</td><td>系统截至当前保留的最佳完整卷质量，只升或持平</td></tr>
+<tr><td>本轮候选整卷质量</td><td class="num">{stat(deltas["candidate_quality"])}</td><td>本轮新组合的质量，允许上下波动</td></tr>
+<tr><td>目标恢复R²</td><td class="num">{stat(deltas["recovery"])}</td><td>整套作答模式能否在留出样本中恢复目标分数</td></tr>
+<tr><td>构念选择性</td><td class="num">{stat(deltas["selectivity"])}</td><td>目标信号占目标信号与最大非目标泄漏总量的比例</td></tr>
 </table>
 <p style="font-size:12.5px;color:#64748b">注意：不同 run 的样本量不同（30/50/100）、目标构念不同（compliance / gregariousness / self-discipline / openness_to_ideas 等），汇总只是趋势参考，不作统计推断。</p>
 </div>
@@ -276,16 +304,17 @@ footer{{margin-top:50px;color:#94a3b8;font-size:12px;border-top:1px solid #e2e8f
 <div class="caveat"><b>读图须知：</b>
 ① x 轴是<b>题库版本号</b>，不是严格的"修题轮次"——版本也会因重计分（评分键变更）而递增；与心理测量修题事件数对照使用。<br>
 ② 点旁标注样本量 n：同一 run 内 n 变化（如 30→100）时，前后不可直接比。<br>
-③ 虚拟被试证据只能用于<b>开发期决策</b>，不是正式效度证据；聚合效度还会被"同一人格提示生成 SJT 与 Neo-FFI"的共同方法方差抬高。<br>
-④ 部分早期版本 α 为负或 ρ 缺失，是 1–2 题的退化分量表所致，图已过滤。</div>
+③ 虚拟被试证据只能用于<b>开发期决策</b>，这些指标描述的是模型—提示词—题目系统的内部传导，不是真人信效度。<br>
+④ 虚拟重测ICC仅作为稳定性门槛，不作为递增优化目标。</div>
 <footer>生成：tools/iteration_trajectory.py · 无 LLM 参与 · 可直接重新运行以包含最新 run</footer>
 </div></body></html>"""
 
     OUT.write_text(html_doc, encoding="utf-8")
     print(f"[trajectory] {len(runs)} 个多版本 run 已写入 {OUT}")
-    print(f"[trajectory] alpha: {stat(deltas['alpha'])}")
-    print(f"[trajectory] conv:  {stat(deltas['conv'])}")
-    print(f"[trajectory] margin: {stat(deltas['margin'])}")
+    print(f"[trajectory] best quality: {stat(deltas['best_quality'])}")
+    print(f"[trajectory] candidate:    {stat(deltas['candidate_quality'])}")
+    print(f"[trajectory] recovery:     {stat(deltas['recovery'])}")
+    print(f"[trajectory] selectivity:  {stat(deltas['selectivity'])}")
 
 
 if __name__ == "__main__":

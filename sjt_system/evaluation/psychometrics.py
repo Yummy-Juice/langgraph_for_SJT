@@ -14,12 +14,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from sjt_system.authoring.construct_registry import (
-    resolve_neo_ffi_criterion,
-)
 from sjt_system.evaluation.respondents import (
     PERSONA_MODE_SCORE_PROFILE,
-    PERSONA_MODE_SUMMARY_PLUS_ITEMS,
     score_spec_is_target_related,
     MATCHED_CONDITION_IDS,
     MATCHED_CONDITION_SCHEMA_VERSION,
@@ -29,8 +25,8 @@ from sjt_system.state import PSJTState, create_initial_state
 from sjt_system.runtime.trace import utc_timestamp
 
 
-PSYCHOMETRIC_FORMULA_VERSION = "sjt-matched-facet-virtual-screening-v10"
-MEASUREMENT_EVALUATION_VERSION = "sjt-evaluation-v11"
+PSYCHOMETRIC_FORMULA_VERSION = "sjt-matched-facet-virtual-screening-v11"
+MEASUREMENT_EVALUATION_VERSION = "sjt-evaluation-v12"
 OPTION_CHOICE_DIAGNOSTICS_VERSION = "matched-condition-option-choice-v3"
 MINIMUM_OPTION_DIAGNOSTIC_GROUP_N = 10
 DIFFICULTY_LOWER_BOUND = 0.20
@@ -119,21 +115,6 @@ def _write_csv_atomic(path: Path, frame: pd.DataFrame) -> None:
     temporary_path.replace(path)
 
 
-def _write_jsonl_atomic(
-    path: Path,
-    records: Sequence[Mapping[str, Any]],
-) -> None:
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    temporary_path.write_text(
-        "".join(
-            json.dumps(dict(record), ensure_ascii=False) + "\n"
-            for record in records
-        ),
-        encoding="utf-8",
-    )
-    temporary_path.replace(path)
-
-
 def standardized_item_difficulty(
     scores: Sequence[float],
     theoretical_minimum: float,
@@ -212,136 +193,6 @@ def _spearman(
     }
 
 
-def _conditional_spearman(
-    left: Sequence[float],
-    right: Sequence[float],
-    tier_ids: Sequence[Any],
-) -> dict[str, Any]:
-    """Spearman association after residualizing average ranks on tier dummies."""
-
-    x = np.asarray(left, dtype=float)
-    y = np.asarray(right, dtype=float)
-    tiers = np.asarray(tier_ids, dtype=object)
-    if x.size != y.size or x.size != tiers.size:
-        raise ValueError("条件Spearman的变量与tier_id长度不一致")
-    valid = np.isfinite(x) & np.isfinite(y) & pd.notna(tiers)
-    x = x[valid]
-    y = y[valid]
-    tiers = tiers[valid].astype(str)
-    unique_tiers = sorted(set(tiers.tolist()))
-    base = {
-        "conditioning_variable": "tier_id",
-        "method": "rank_residualization",
-        "rank_method": "average",
-        "tier_count": len(unique_tiers),
-    }
-    if x.size < 3 or np.ptp(x) == 0 or np.ptp(y) == 0 or not unique_tiers:
-        return {"rho": None, "p_value": None, "n": int(x.size), **base}
-    if len(unique_tiers) == 1:
-        return {**_spearman(x, y), **base}
-
-    design = np.column_stack(
-        [
-            np.ones(x.size, dtype=float),
-            *(tiers == tier_id for tier_id in unique_tiers[1:]),
-        ]
-    ).astype(float)
-    ranked_x = stats.rankdata(x, method="average")
-    ranked_y = stats.rankdata(y, method="average")
-    residual_x = ranked_x - design @ np.linalg.lstsq(design, ranked_x, rcond=None)[0]
-    residual_y = ranked_y - design @ np.linalg.lstsq(design, ranked_y, rcond=None)[0]
-    if np.allclose(residual_x, 0.0, atol=1e-12) or np.allclose(
-        residual_y, 0.0, atol=1e-12
-    ):
-        return {"rho": None, "p_value": None, "n": int(x.size), **base}
-    result = stats.pearsonr(residual_x, residual_y)
-    return {
-        "rho": float(result.statistic),
-        "p_value": float(result.pvalue),
-        "n": int(x.size),
-        **base,
-    }
-
-
-def _conditional_score_band_assignments(
-    values: pd.Series,
-    tier_ids: pd.Series,
-) -> tuple[pd.Series, dict[str, Any]]:
-    """Split tier-controlled average-rank residuals into diagnostic tertiles."""
-
-    if not values.index.equals(tier_ids.index):
-        tier_ids = tier_ids.reindex(values.index)
-    numeric = pd.to_numeric(values, errors="coerce")
-    valid = numeric.notna() & tier_ids.notna()
-    x = numeric.loc[valid].to_numpy(dtype=float)
-    tiers = tier_ids.loc[valid].astype(str).to_numpy(dtype=object)
-    unique_tiers = sorted(set(tiers.tolist()))
-    assignments = pd.Series(index=values.index, dtype="object")
-    base = {
-        "conditioning_variable": "tier_id",
-        "method": "average_rank_residual_tertiles",
-        "rank_method": "average",
-        "tier_count": len(unique_tiers),
-        "minimum_group_n": MINIMUM_OPTION_DIAGNOSTIC_GROUP_N,
-        "filtering_authority": False,
-    }
-    if x.size < 3 or np.ptp(x) == 0 or not unique_tiers:
-        return assignments, {
-            **base,
-            "estimable": False,
-            "reason": "构念分数缺少可用于条件分组的方差",
-            "group_sizes": {"low": 0, "medium": 0, "high": 0},
-        }
-
-    ranked = stats.rankdata(x, method="average")
-    if len(unique_tiers) == 1:
-        residuals = ranked - float(np.mean(ranked))
-    else:
-        design = np.column_stack(
-            [
-                np.ones(x.size, dtype=float),
-                *(tiers == tier_id for tier_id in unique_tiers[1:]),
-            ]
-        ).astype(float)
-        residuals = ranked - design @ np.linalg.lstsq(
-            design, ranked, rcond=None
-        )[0]
-    if np.allclose(residuals, 0.0, atol=1e-12):
-        return assignments, {
-            **base,
-            "estimable": False,
-            "reason": "控制tier_id后的构念秩残差无方差",
-            "group_sizes": {"low": 0, "medium": 0, "high": 0},
-        }
-
-    residual_ranks = stats.rankdata(residuals, method="average")
-    percentiles = residual_ranks / float(x.size)
-    labels = np.where(
-        percentiles <= (1.0 / 3.0),
-        "low",
-        np.where(percentiles <= (2.0 / 3.0), "medium", "high"),
-    )
-    assignments.loc[valid] = labels
-    group_sizes = {
-        label: int(np.sum(labels == label))
-        for label in ("low", "medium", "high")
-    }
-    estimable = all(
-        group_sizes[label] >= MINIMUM_OPTION_DIAGNOSTIC_GROUP_N
-        for label in ("low", "medium", "high")
-    )
-    return assignments, {
-        **base,
-        "estimable": estimable,
-        "reason": (
-            None
-            if estimable
-            else "至少一个条件分组少于10人；频率仅展示，不得用于返修推断"
-        ),
-        "group_sizes": group_sizes,
-    }
-
-
 def _validate_analysis_identity(
     state: Mapping[str, Any],
     manifest: Mapping[str, Any],
@@ -382,71 +233,14 @@ def _resolve_response_paths(
     manifest = _read_json(manifest_path)
     _validate_analysis_identity(state, manifest)
     sjt_path = manifest_path.parent / "sjt_responses.jsonl"
-    neo_path = manifest_path.parent / "neo_ffi_responses.jsonl"
+    ipip_path = manifest_path.parent / "ipip_neo_responses.jsonl"
+    legacy_neo_path = manifest_path.parent / "neo_ffi_responses.jsonl"
     if not sjt_path.is_file():
         raise ValueError("虚拟作答目录缺少 SJT JSONL 文件")
-    if manifest.get("schema_version") not in {2, 3, MATCHED_CONDITION_SCHEMA_VERSION} and not neo_path.is_file():
+    if manifest.get("schema_version") not in {2, 3, MATCHED_CONDITION_SCHEMA_VERSION} and not legacy_neo_path.is_file():
         raise ValueError("旧版虚拟作答目录缺少 Neo-FFI JSONL 文件")
-    return manifest_path, sjt_path, neo_path, manifest
-
-
-def _resolve_analysis_criterion(
-    state: Mapping[str, Any],
-    response_manifest: Mapping[str, Any],
-) -> dict[str, str]:
-    profile = state.get("construct_profile")
-    if not isinstance(profile, Mapping):
-        blueprint = state.get("blueprint")
-        if isinstance(blueprint, Mapping):
-            candidate = blueprint.get("construct_profile_snapshot")
-            if isinstance(candidate, Mapping):
-                profile = candidate
-    manifest_domain = response_manifest.get("criterion_domain_id")
-    manifest_dimension = response_manifest.get(
-        "criterion_neo_ffi_dimension"
-    )
-    manifest_criterion: dict[str, str] | None = None
-    if manifest_domain is not None or manifest_dimension is not None:
-        if not isinstance(manifest_domain, str) or not isinstance(
-            manifest_dimension,
-            str,
-        ):
-            raise ValueError(
-                "response manifest 的 criterion domain/Neo dimension "
-                "必须同时存在"
-            )
-        manifest_criterion = resolve_neo_ffi_criterion(
-            construct_profile={"domain_id": manifest_domain}
-        )
-        if (
-            manifest_criterion["neo_ffi_dimension"]
-            != manifest_dimension
-        ):
-            raise ValueError(
-                "response manifest 的 criterion domain 与 Neo dimension "
-                "映射不一致"
-            )
-
-    state_criterion: dict[str, str] | None = None
-    if isinstance(profile, Mapping):
-        state_criterion = resolve_neo_ffi_criterion(
-            construct_profile=profile,
-        )
-    if (
-        manifest_criterion is not None
-        and state_criterion is not None
-        and manifest_criterion["domain_id"]
-        != state_criterion["domain_id"]
-    ):
-        raise ValueError(
-            "虚拟作答 manifest 的目标构念与当前 State 不一致"
-        )
-    criterion = state_criterion or manifest_criterion
-    if criterion is None:
-        raise ValueError(
-            "心理测量分析缺少目标构念到 Neo-FFI 的确定性映射"
-        )
-    return criterion
+    reference_path = ipip_path if ipip_path.is_file() else legacy_neo_path
+    return manifest_path, sjt_path, reference_path, manifest
 
 
 def _prepare_item_contract(
@@ -486,430 +280,6 @@ def _prepare_item_contract(
         item_order.append(item_id)
         items[item_id] = item
     return item_order, items
-
-
-def _score_sjt(
-    records: Sequence[Mapping[str, Any]],
-    *,
-    item_order: list[str],
-    items: Mapping[str, Mapping[str, Any]],
-    expected_respondent_count: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for record in records:
-        respondent_id = record.get("respondent_id")
-        item_id = record.get("item_id")
-        option_id = record.get("selected_option_id")
-        if not isinstance(respondent_id, str) or not respondent_id:
-            raise ValueError("SJT 作答包含无效 respondent_id")
-        if item_id not in items:
-            raise ValueError(f"SJT 作答引用未知题目：{item_id!r}")
-        key = (respondent_id, str(item_id))
-        if key in seen:
-            raise ValueError(f"SJT 作答包含重复记录：{key}")
-        seen.add(key)
-        item = items[str(item_id)]
-        expected_version = item.get("version")
-        if record.get("item_version") != expected_version:
-            raise ValueError(
-                f"题目 {item_id} 的作答版本与冻结题库不一致"
-            )
-        scoring_key = item["scoring_key"]
-        if option_id not in scoring_key:
-            raise ValueError(
-                f"题目 {item_id} 选择了 scoring_key 中不存在的选项"
-            )
-        rows.append(
-            {
-                "respondent_id": respondent_id,
-                "item_id": item_id,
-                "item_version": expected_version,
-                "dimension_id": item.get("target_dimension_id"),
-                "context_category": item.get("context_category"),
-                "selected_option_id": option_id,
-                "score": float(scoring_key[option_id]),
-            }
-        )
-
-    long_frame = pd.DataFrame(rows)
-    respondent_ids = sorted(long_frame["respondent_id"].unique())
-    if len(respondent_ids) != expected_respondent_count:
-        raise ValueError(
-            "SJT 实际被试数与 manifest 不一致："
-            f"{len(respondent_ids)} != {expected_respondent_count}"
-        )
-    expected_records = expected_respondent_count * len(item_order)
-    if len(long_frame) != expected_records:
-        raise ValueError(
-            f"SJT 作答不完整：应有 {expected_records} 条，"
-            f"实际 {len(long_frame)} 条"
-        )
-    wide = long_frame.pivot(
-        index="respondent_id",
-        columns="item_id",
-        values="score",
-    ).reindex(index=respondent_ids, columns=item_order)
-    if wide.isna().any().any():
-        raise ValueError("SJT 被试×题目矩阵存在缺失作答")
-    return long_frame, wide
-
-
-def _score_tiered_sjt(
-    records: Sequence[Mapping[str, Any]],
-    *,
-    item_order: list[str],
-    items: Mapping[str, Mapping[str, Any]],
-    expected_respondent_count: int,
-    expected_tier_ids: Sequence[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, pd.DataFrame]]:
-    """Score one response per respondent/item and split matrices by tier."""
-
-    tier_ids = [str(value) for value in expected_tier_ids]
-    if not tier_ids or len(set(tier_ids)) != len(tier_ids):
-        raise ValueError("作答 manifest 缺少有效分数档")
-    rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    respondent_tiers: dict[str, str] = {}
-    for record in records:
-        respondent_id = record.get("respondent_id")
-        item_id = record.get("item_id")
-        option_id = record.get("selected_option_id")
-        tier_id = record.get("tier_id")
-        if not isinstance(respondent_id, str) or not respondent_id:
-            raise ValueError("SJT 作答包含无效 respondent_id")
-        if item_id not in items:
-            raise ValueError(f"SJT 作答引用未知题目：{item_id!r}")
-        if tier_id not in tier_ids:
-            raise ValueError("SJT 作答缺少有效 tier_id")
-        if respondent_id in respondent_tiers and respondent_tiers[respondent_id] != tier_id:
-            raise ValueError("同一虚拟被试不能跨越多个分数档")
-        respondent_tiers[respondent_id] = str(tier_id)
-        key = (respondent_id, str(item_id))
-        if key in seen:
-            raise ValueError(f"SJT 作答包含重复记录：{key}")
-        seen.add(key)
-        item = items[str(item_id)]
-        expected_version = item.get("version")
-        if record.get("item_version") != expected_version:
-            raise ValueError(f"题目 {item_id} 的作答版本与冻结题库不一致")
-        scoring_key = item["scoring_key"]
-        if option_id not in scoring_key:
-            raise ValueError(f"题目 {item_id} 选择了 scoring_key 中不存在的选项")
-        rows.append(
-            {
-                "respondent_id": respondent_id,
-                "tier_id": str(tier_id),
-                "item_id": item_id,
-                "item_version": expected_version,
-                "dimension_id": item.get("target_dimension_id"),
-                "context_category": item.get("context_category"),
-                "raw_display_option_id": record.get("raw_display_option_id"),
-                "selected_option_id": option_id,
-                "score": float(scoring_key[option_id]),
-            }
-        )
-    long_frame = pd.DataFrame(rows)
-    if long_frame.empty:
-        raise ValueError("分档SJT作答为空")
-    respondent_ids = sorted(long_frame["respondent_id"].unique())
-    if len(respondent_ids) != expected_respondent_count:
-        raise ValueError("SJT 实际被试数与 manifest 不一致")
-    expected_records = expected_respondent_count * len(item_order)
-    if len(long_frame) != expected_records:
-        raise ValueError(
-            f"分档SJT作答不完整：应有 {expected_records} 条，实际 {len(long_frame)} 条"
-        )
-    wide = long_frame.pivot(
-        index="respondent_id", columns="item_id", values="score"
-    ).reindex(index=respondent_ids, columns=item_order)
-    if wide.isna().any().any():
-        raise ValueError("SJT 被试×题目矩阵存在缺失作答")
-    tier_wide: dict[str, pd.DataFrame] = {}
-    for tier_id in tier_ids:
-        ids = sorted(
-            long_frame.loc[long_frame["tier_id"] == tier_id, "respondent_id"].unique()
-        )
-        if not ids:
-            raise ValueError(f"分数档 {tier_id} 没有作答")
-        tier_wide[tier_id] = wide.loc[ids]
-    return long_frame, wide, tier_wide
-
-
-def _score_profile_frame(
-    payload: Mapping[str, Any],
-    *,
-    expected_respondents: Sequence[str],
-    score_specs: Sequence[Mapping[str, Any]],
-) -> pd.DataFrame:
-    profiles = payload.get("profiles")
-    if not isinstance(profiles, list) or not profiles:
-        raise ValueError("score_profiles.json 缺少 profiles")
-    dimension_ids = [str(spec["dimension_id"]) for spec in score_specs]
-    rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for profile in profiles:
-        if not isinstance(profile, Mapping):
-            raise ValueError("score_profiles.json 包含无效 profile")
-        respondent_id = profile.get("respondent_id")
-        values = profile.get("score_values")
-        if (
-            not isinstance(respondent_id, str)
-            or not respondent_id
-            or respondent_id in seen
-            or not isinstance(values, Mapping)
-            or set(values) != set(dimension_ids)
-        ):
-            raise ValueError("score_profiles.json 的被试或维度集合无效")
-        row = {"respondent_id": respondent_id}
-        for dimension_id in dimension_ids:
-            value = values[dimension_id]
-            if (
-                isinstance(value, bool)
-                or not isinstance(value, (int, float))
-                or not math.isfinite(float(value))
-            ):
-                raise ValueError(f"{respondent_id} 的 {dimension_id} 分数无效")
-            row[dimension_id] = float(value)
-        rows.append(row)
-        seen.add(respondent_id)
-    frame = pd.DataFrame(rows).set_index("respondent_id")
-    if sorted(frame.index) != sorted(expected_respondents):
-        raise ValueError("分数档案与SJT被试集合不一致")
-    return frame.reindex(index=list(expected_respondents), columns=dimension_ids)
-
-
-def _frame_item_metrics(
-    *,
-    item_order: Sequence[str],
-    items: Mapping[str, Mapping[str, Any]],
-    response_wide: pd.DataFrame,
-    score_frame: pd.DataFrame,
-    score_specs: Sequence[Mapping[str, Any]],
-    tier_ids: Sequence[Any] | None = None,
-) -> dict[str, dict[str, Any]]:
-    """Calculate CITC, target rho, and split VTS for one respondent frame."""
-
-    specs_by_id: dict[str, dict[str, Any]] = {
-        str(spec["dimension_id"]): dict(spec) for spec in score_specs
-    }
-    results: dict[str, dict[str, Any]] = {}
-    facet_columns: dict[str, list[str]] = {}
-    for item_id in item_order:
-        facet_columns.setdefault(str(items[item_id]["target_dimension_id"]), []).append(item_id)
-    for item_id in item_order:
-        item = items[item_id]
-        target_id = str(item["target_dimension_id"])
-        target_spec = specs_by_id.get(target_id)
-        if target_spec is None:
-            raise ValueError(f"题目 {item_id} 缺少目标分数 {target_id}")
-        same_facet_items = facet_columns[target_id]
-        rest_score = response_wide[same_facet_items].sum(axis=1) - response_wide[item_id]
-        citc = _pearson(response_wide[item_id], rest_score)
-        association = _conditional_spearman if tier_ids is not None else _spearman
-        target = (
-            association(score_frame[target_id], response_wide[item_id], tier_ids)
-            if tier_ids is not None
-            else association(score_frame[target_id], response_wide[item_id])
-        )
-        same_domain_rows: list[dict[str, Any]] = []
-        cross_domain_rows: list[dict[str, Any]] = []
-        for spec in score_specs:
-            dimension_id = str(spec["dimension_id"])
-            if spec.get("level") != "facet" or dimension_id == target_id:
-                continue
-            non_target_association = (
-                association(score_frame[dimension_id], response_wide[item_id], tier_ids)
-                if tier_ids is not None
-                else association(score_frame[dimension_id], response_wide[item_id])
-            )
-            row = {
-                "dimension_id": dimension_id,
-                "facet_name": spec.get("facet_name"),
-                "facet_name_en": spec.get("facet_name_en"),
-                "domain_id": spec.get("domain_id"),
-                "domain_name": spec.get("domain_name"),
-                "definition": spec.get("definition"),
-                "high_behavior": spec.get("high_behavior"),
-                "low_behavior": spec.get("low_behavior"),
-                **non_target_association,
-            }
-            if spec.get("domain_id") == target_spec.get("domain_id"):
-                same_domain_rows.append(row)
-            else:
-                cross_domain_rows.append(row)
-
-        def vts_group(rows: list[dict[str, Any]], threshold: float) -> dict[str, Any]:
-            estimable = [row for row in rows if row.get("rho") is not None]
-            largest = (
-                max(estimable, key=lambda row: float(row["rho"]))
-                if estimable else None
-            )
-            largest_rho = float(largest["rho"]) if largest else None
-            target_rho = target.get("rho")
-            margin = (
-                float(target_rho) - largest_rho
-                if target_rho is not None and largest_rho is not None else None
-            )
-            return {
-                "non_target_spearman": rows,
-                "max_non_target_rho": largest_rho,
-                "largest_non_target_dimension_id": (
-                    largest.get("dimension_id") if largest else None
-                ),
-                "largest_non_target_facet_name": (
-                    largest.get("facet_name") if largest else None
-                ),
-                "largest_non_target_domain_id": (
-                    largest.get("domain_id") if largest else None
-                ),
-                "largest_non_target_rho": largest.get("rho") if largest else None,
-                "largest_non_target_conditional_rho": (
-                    largest.get("rho") if largest and tier_ids is not None else None
-                ),
-                "specificity_margin": margin,
-                "margin_threshold": threshold,
-                "passes": margin is not None and margin >= threshold,
-                "largest_non_target_facet": deepcopy(largest) if largest else None,
-            }
-
-        target_rho = target.get("rho")
-        same_domain = vts_group(same_domain_rows, SAME_DOMAIN_VTS_THRESHOLD)
-        cross_domain = vts_group(cross_domain_rows, CROSS_DOMAIN_VTS_THRESHOLD)
-        citc_pass = citc.get("r") is not None and citc["r"] >= CITC_REVISION_THRESHOLD
-        target_rho_pass = (
-            target_rho is not None and target_rho >= TARGET_RHO_THRESHOLD
-        )
-        results[item_id] = {
-            "facet_citc": {
-                **citc,
-                "threshold": CITC_REVISION_THRESHOLD,
-                "passes": citc_pass,
-            },
-            "virtual_target_specificity": {
-                "target_dimension_id": target_id,
-                "target_spearman": target,
-                "conditional_target_spearman": target if tier_ids is not None else None,
-                "correlation_scope": (
-                    "aggregate_conditional_on_tier_id"
-                    if tier_ids is not None else "within_tier_diagnostic"
-                ),
-                "target_rho_threshold": TARGET_RHO_THRESHOLD,
-                "target_rho_pass": target_rho_pass,
-                "same_domain_non_target": same_domain,
-                "cross_domain_non_target": cross_domain,
-                "passes": (
-                    target_rho_pass and same_domain["passes"] and cross_domain["passes"]
-                ),
-            },
-            "citc_pass": citc_pass,
-            "target_rho_pass": target_rho_pass,
-            "same_domain_vts_pass": bool(same_domain["passes"]),
-            "cross_domain_vts_pass": bool(cross_domain["passes"]),
-            "passes": (
-                citc_pass and target_rho_pass
-                and bool(same_domain["passes"])
-                and bool(cross_domain["passes"])
-            ),
-        }
-    return results
-
-
-def _virtual_item_metrics(
-    *,
-    item_order: Sequence[str],
-    items: Mapping[str, Mapping[str, Any]],
-    response_wide: pd.DataFrame,
-    tier_wide: Mapping[str, pd.DataFrame],
-    score_frame: pd.DataFrame,
-    score_specs: Sequence[Mapping[str, Any]],
-) -> dict[str, dict[str, Any]]:
-    tier_ids = pd.Series(index=response_wide.index, dtype="object")
-    for tier_id, frame in tier_wide.items():
-        tier_ids.loc[frame.index] = tier_id
-    if tier_ids.isna().any():
-        raise ValueError("合并作答中存在无法映射到tier_id的被试")
-    aggregate = _frame_item_metrics(
-        item_order=item_order,
-        items=items,
-        response_wide=response_wide,
-        score_frame=score_frame,
-        score_specs=score_specs,
-        tier_ids=tier_ids.to_numpy(),
-    )
-    for item_id in item_order:
-        aggregate[item_id]["per_tier_metrics"] = {}
-    for tier_id, frame in tier_wide.items():
-        tier_metrics = _frame_item_metrics(
-            item_order=item_order,
-            items=items,
-            response_wide=frame,
-            score_frame=score_frame.loc[frame.index],
-            score_specs=score_specs,
-        )
-        for item_id in item_order:
-            aggregate[item_id]["per_tier_metrics"][tier_id] = tier_metrics[item_id]
-    return aggregate
-
-
-def _score_neo(
-    records: Sequence[Mapping[str, Any]],
-    *,
-    expected_respondents: Sequence[str],
-) -> tuple[pd.DataFrame, pd.DataFrame]:
-    rows: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for record in records:
-        respondent_id = record.get("respondent_id")
-        item_id = record.get("item_id")
-        dimension = record.get("dimension_code")
-        raw = record.get("raw_response")
-        direction = record.get("scoring_direction")
-        if not isinstance(respondent_id, str) or not respondent_id:
-            raise ValueError("Neo-FFI 作答包含无效 respondent_id")
-        if not isinstance(item_id, str) or not item_id:
-            raise ValueError("Neo-FFI 作答包含无效 item_id")
-        key = (respondent_id, item_id)
-        if key in seen:
-            raise ValueError(f"Neo-FFI 作答包含重复记录：{key}")
-        seen.add(key)
-        if dimension not in {"N", "E", "O", "A", "C"}:
-            raise ValueError(f"Neo-FFI 包含未知维度：{dimension!r}")
-        if (
-            not isinstance(raw, int)
-            or isinstance(raw, bool)
-            or raw < 1
-            or raw > 5
-        ):
-            raise ValueError(f"Neo-FFI 题目 {item_id} 的原始作答无效")
-        if direction not in {"+", "-"}:
-            raise ValueError(f"Neo-FFI 题目 {item_id} 的计分方向无效")
-        rows.append(
-            {
-                "respondent_id": respondent_id,
-                "dimension_code": dimension,
-                "item_id": item_id,
-                "raw_response": raw,
-                "scoring_direction": direction,
-                "score": raw if direction == "+" else 6 - raw,
-            }
-        )
-    long_frame = pd.DataFrame(rows)
-    respondent_ids = sorted(long_frame["respondent_id"].unique())
-    if respondent_ids != sorted(expected_respondents):
-        raise ValueError("SJT 与 Neo-FFI 的被试集合不一致")
-    counts = long_frame.groupby(
-        ["respondent_id", "dimension_code"]
-    ).size()
-    if len(counts) != len(respondent_ids) * 5 or not (counts == 12).all():
-        raise ValueError("每名被试的每个 Neo-FFI 维度必须正好有12题")
-    dimension_scores = (
-        long_frame.groupby(["respondent_id", "dimension_code"])["score"]
-        .mean()
-        .unstack("dimension_code")
-        .reindex(index=respondent_ids, columns=["N", "E", "O", "A", "C"])
-    )
-    return long_frame, dimension_scores
 
 
 def _item_statistics(
@@ -1119,6 +489,45 @@ def _score_matched_sjt(
             raise ValueError(f"条件 {condition_id} 缺少匹配 facet 分数")
         condition_scores[condition_id] = score_series.astype(float)
     return long_frame, condition_wide, condition_scores
+
+
+def _score_target_form_retests(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    item_order: Sequence[str],
+    items: Mapping[str, Mapping[str, Any]],
+    expected_respondent_count: int,
+    administration_ids: Sequence[int],
+) -> pd.DataFrame:
+    """Score target-only repeated administrations without changing item gates."""
+
+    expected_ids = tuple(int(value) for value in administration_ids)
+    if not expected_ids or len(set(expected_ids)) != len(expected_ids):
+        raise ValueError("target 重测 administration_ids 必须非空且唯一")
+    rows: list[pd.DataFrame] = []
+    for administration_id in expected_ids:
+        administration_records = [
+            record
+            for record in records
+            if record.get("administration_id") == administration_id
+        ]
+        scored, _, _ = _score_matched_sjt(
+            administration_records,
+            item_order=item_order,
+            items=items,
+            expected_respondent_count=expected_respondent_count,
+            condition_ids=("target",),
+        )
+        scored.insert(0, "administration_id", administration_id)
+        rows.append(scored)
+    unexpected = {
+        record.get("administration_id")
+        for record in records
+        if record.get("administration_id") not in set(expected_ids)
+    }
+    if unexpected:
+        raise ValueError(f"target 重测包含未声明施测轮次：{sorted(unexpected)}")
+    return pd.concat(rows, ignore_index=True)
 
 
 def _matched_item_metrics(
@@ -1686,6 +1095,33 @@ def _run_matched_condition_analysis(
         expected_respondent_count=expected_per_condition,
         condition_ids=condition_ids,
     )
+    target_retest = response_manifest.get("target_form_retest")
+    if not isinstance(target_retest, Mapping):
+        raise ValueError("作答 manifest 缺少 target 整卷重测元数据")
+    target_retest_path_value = target_retest.get("path")
+    if (
+        not isinstance(target_retest_path_value, str)
+        or not Path(target_retest_path_value).is_file()
+    ):
+        raise ValueError("作答 manifest 缺少有效 target 整卷重测文件")
+    raw_administration_ids = target_retest.get("administration_ids")
+    if (
+        not isinstance(raw_administration_ids, list)
+        or not raw_administration_ids
+        or any(
+            not isinstance(value, int) or isinstance(value, bool)
+            for value in raw_administration_ids
+        )
+    ):
+        raise ValueError("target 整卷重测缺少有效 administration_ids")
+    target_retest_path = Path(target_retest_path_value)
+    target_retest_long = _score_target_form_retests(
+        _read_jsonl(target_retest_path),
+        item_order=item_order,
+        items=items,
+        expected_respondent_count=expected_per_condition,
+        administration_ids=raw_administration_ids,
+    )
     virtual_metrics = _matched_item_metrics(
         item_order=item_order,
         items=items,
@@ -1766,6 +1202,9 @@ def _run_matched_condition_analysis(
     output_dir = manifest_path.parent / "psychometrics"
     output_dir.mkdir(parents=True, exist_ok=True)
     scored_path = output_dir / "scored_matched_condition_sjt_responses.csv"
+    scored_target_retest_path = (
+        output_dir / "scored_target_form_retest_sjt_responses.csv"
+    )
     respondent_path = output_dir / "respondent_scores.csv"
     item_path = output_dir / "item_statistics.csv"
     quality_path = output_dir / "item_quality.csv"
@@ -1776,6 +1215,7 @@ def _run_matched_condition_analysis(
     measurement_path = output_dir / "measurement_evaluation.json"
     analysis_path = output_dir / "analysis_manifest.json"
     _write_csv_atomic(scored_path, sjt_long)
+    _write_csv_atomic(scored_target_retest_path, target_retest_long)
     _write_csv_atomic(respondent_path, respondent_scores)
     _write_csv_atomic(item_path, item_frame)
     _write_csv_atomic(quality_path, item_quality_frame)
@@ -1787,10 +1227,18 @@ def _run_matched_condition_analysis(
     option_order_path = response_manifest.get("option_order_path")
     if not isinstance(option_order_path, str) or not Path(option_order_path).is_file():
         raise ValueError("作答 manifest 缺少有效 option_order_path")
-    output_files = {"scored_matched_condition_sjt_responses": str(scored_path.resolve()), "respondent_scores": str(respondent_path.resolve()), "item_statistics": str(item_path.resolve()), "item_quality": str(quality_path.resolve()), "option_statistics": str(option_path.resolve()), "option_choice_diagnostics": str(option_json_path.resolve()), "scale_statistics": str(scale_path.resolve()), "virtual_screening_metrics": str(validity_path.resolve()), "measurement_evaluation": str(measurement_path.resolve()), "analysis_manifest": str(analysis_path.resolve())}
-    analysis_manifest = {"schema_version": 6, "status": "completed", "formula_version": PSYCHOMETRIC_FORMULA_VERSION, "evaluation_version": MEASUREMENT_EVALUATION_VERSION, "psychometric_analysis_round": analysis_round, "run_id": state["run_id"], "item_bank_id": state["item_bank_id"], "item_bank_version": state["item_bank_version"], "item_bank_fingerprint": state.get("item_bank_fingerprint"), "sample_size": expected_respondents, "sample_size_per_condition": expected_per_condition, "condition_count": 3, "group_count": len(condition_ids), "condition_ids": list(condition_ids), "arm_ids": list(MATCHED_CONDITION_IDS), "sampling_design": "matched_facet_conditions", "conditions": deepcopy(conditions), "persona_mode": PERSONA_MODE_SCORE_PROFILE, "prompt_version": response_manifest.get("prompt_version"), "score_prompt_version": response_manifest.get("score_prompt_version"), "generator_version": response_manifest.get("generator_version"), "virtual_sample_config": deepcopy(response_manifest.get("virtual_sample_config") or {}), "item_count": len(item_order), "qualified_item_count": qualified_count, "qualification_rate": qualified_count / len(item_order), "criteria": {"iteration_gates": {"facet_citc_minimum": CITC_REVISION_THRESHOLD, "target_rho_minimum": TARGET_RHO_THRESHOLD, "same_domain_vts_minimum": SAME_DOMAIN_VTS_THRESHOLD, "cross_domain_vts_minimum": CROSS_DOMAIN_VTS_THRESHOLD, "condition_method": "fixed_three_arms_nested_facet_groups", "filtering_authority": True}, "target_option_gradient": {"filtering_authority": False, "repair_trigger": True}}, "formulas": {"facet_citc": "Pearson(target arm item, target arm same-facet remaining score sum)", "rho_target": "Spearman(Y_target, z_target)", "rho_group": "Spearman(Y_group, z_group), one group per non-target facet", "same_domain_vts": "rho_target - MAX(signed rho of same-domain facet groups)", "cross_domain_vts": "rho_target - MAX(signed rho of cross-domain facet groups)"}, "input_files": {"response_manifest": {"path": str(manifest_path.resolve()), "sha256": _file_sha256(manifest_path)}, "sjt_responses": {"path": str(sjt_path.resolve()), "sha256": _file_sha256(sjt_path)}, "score_profiles": {"path": str(Path(response_manifest["score_profiles_path"]).resolve()), "sha256": _file_sha256(Path(response_manifest["score_profiles_path"]))}, "option_orders": {"path": str(Path(option_order_path).resolve()), "sha256": _file_sha256(Path(option_order_path))}}, "output_files": output_files, "completed_at": utc_timestamp()}
+    output_files = {"scored_matched_condition_sjt_responses": str(scored_path.resolve()), "scored_target_form_retest_sjt_responses": str(scored_target_retest_path.resolve()), "respondent_scores": str(respondent_path.resolve()), "item_statistics": str(item_path.resolve()), "item_quality": str(quality_path.resolve()), "option_statistics": str(option_path.resolve()), "option_choice_diagnostics": str(option_json_path.resolve()), "scale_statistics": str(scale_path.resolve()), "virtual_screening_metrics": str(validity_path.resolve()), "measurement_evaluation": str(measurement_path.resolve()), "analysis_manifest": str(analysis_path.resolve())}
+    reference_questionnaires = response_manifest.get("reference_questionnaires") or {}
+    if isinstance(reference_questionnaires, Mapping):
+        ipip_reference = reference_questionnaires.get("ipip_neo")
+        if isinstance(ipip_reference, Mapping) and isinstance(ipip_reference.get("path"), str) and Path(ipip_reference["path"]).is_file():
+            output_files["ipip_neo_responses"] = str(Path(ipip_reference["path"]).resolve())
+        neo_reference = reference_questionnaires.get("neo_ffi")
+        if isinstance(neo_reference, Mapping) and isinstance(neo_reference.get("path"), str) and Path(neo_reference["path"]).is_file():
+            output_files["neo_ffi_responses"] = str(Path(neo_reference["path"]).resolve())
+    analysis_manifest = {"schema_version": MATCHED_CONDITION_SCHEMA_VERSION, "status": "completed", "formula_version": PSYCHOMETRIC_FORMULA_VERSION, "evaluation_version": MEASUREMENT_EVALUATION_VERSION, "psychometric_analysis_round": analysis_round, "run_id": state["run_id"], "item_bank_id": state["item_bank_id"], "item_bank_version": state["item_bank_version"], "item_bank_fingerprint": state.get("item_bank_fingerprint"), "sample_size": expected_respondents, "sample_size_per_condition": expected_per_condition, "condition_count": 3, "group_count": len(condition_ids), "condition_ids": list(condition_ids), "arm_ids": list(MATCHED_CONDITION_IDS), "sampling_design": "matched_facet_conditions", "conditions": deepcopy(conditions), "persona_mode": PERSONA_MODE_SCORE_PROFILE, "prompt_version": response_manifest.get("prompt_version"), "score_prompt_version": response_manifest.get("score_prompt_version"), "generator_version": response_manifest.get("generator_version"), "virtual_sample_config": deepcopy(response_manifest.get("virtual_sample_config") or {}), "item_count": len(item_order), "qualified_item_count": qualified_count, "qualification_rate": qualified_count / len(item_order), "criteria": {"iteration_gates": {"facet_citc_minimum": CITC_REVISION_THRESHOLD, "target_rho_minimum": TARGET_RHO_THRESHOLD, "same_domain_vts_minimum": SAME_DOMAIN_VTS_THRESHOLD, "cross_domain_vts_minimum": CROSS_DOMAIN_VTS_THRESHOLD, "condition_method": "fixed_three_arms_nested_facet_groups", "filtering_authority": True}, "target_option_gradient": {"filtering_authority": False, "repair_trigger": True}}, "formulas": {"facet_citc": "Pearson(target arm item, target arm same-facet remaining score sum)", "rho_target": "Spearman(Y_target, z_target)", "rho_group": "Spearman(Y_group, z_group), one group per non-target facet", "same_domain_vts": "rho_target - MAX(signed rho of same-domain facet groups)", "cross_domain_vts": "rho_target - MAX(signed rho of cross-domain facet groups)", "target_form_retest": "same target persona and item set under a second balanced option order; used only by whole-form stability"}, "input_files": {"response_manifest": {"path": str(manifest_path.resolve()), "sha256": _file_sha256(manifest_path)}, "sjt_responses": {"path": str(sjt_path.resolve()), "sha256": _file_sha256(sjt_path)}, "target_form_retest_responses": {"path": str(target_retest_path.resolve()), "sha256": _file_sha256(target_retest_path)}, "score_profiles": {"path": str(Path(response_manifest["score_profiles_path"]).resolve()), "sha256": _file_sha256(Path(response_manifest["score_profiles_path"]))}, "option_orders": {"path": str(Path(option_order_path).resolve()), "sha256": _file_sha256(Path(option_order_path))}}, "output_files": output_files, "completed_at": utc_timestamp()}
     _write_json_atomic(analysis_path, analysis_manifest)
-    test_statistics = {**scale_statistics, "sampling_design": "matched_facet_conditions", "condition_count": 3, "group_count": len(condition_ids), "condition_ids": list(condition_ids), "arm_ids": list(MATCHED_CONDITION_IDS), "sample_size_per_condition": expected_per_condition, "qualified_item_count": qualified_count, "qualification_rate": qualified_count / len(item_order), "qualification_criteria": analysis_manifest["criteria"], "virtual_screening_metrics": validity_statistics, "measurement_evaluation": measurement_evaluation, "output_files": output_files, "formula_version": PSYCHOMETRIC_FORMULA_VERSION, "evaluation_version": MEASUREMENT_EVALUATION_VERSION, "psychometric_analysis_round": analysis_round, "option_choice_diagnostics_version": OPTION_CHOICE_DIAGNOSTICS_VERSION}
+    test_statistics = {**scale_statistics, "sampling_design": "matched_facet_conditions", "condition_count": 3, "group_count": len(condition_ids), "condition_ids": list(condition_ids), "arm_ids": list(MATCHED_CONDITION_IDS), "sample_size_per_condition": expected_per_condition, "qualified_item_count": qualified_count, "qualification_rate": qualified_count / len(item_order), "qualification_criteria": analysis_manifest["criteria"], "virtual_screening_metrics": validity_statistics, "measurement_evaluation": measurement_evaluation, "reference_questionnaires": _json_safe(reference_questionnaires), "output_files": output_files, "formula_version": PSYCHOMETRIC_FORMULA_VERSION, "evaluation_version": MEASUREMENT_EVALUATION_VERSION, "psychometric_analysis_round": analysis_round, "option_choice_diagnostics_version": OPTION_CHOICE_DIAGNOSTICS_VERSION}
     state_update = {"item_statistics": item_statistics, "test_statistics": _json_safe(test_statistics), "psychometric_analysis_round": analysis_round, "virtual_analysis_reconfiguration_reason": None}
     from sjt_system.evaluation.round_results import build_psychometric_round_result
     state_update["psychometric_round_result"] = build_psychometric_round_result({**state, **state_update})
@@ -1829,249 +1277,6 @@ def _option_frequency_group(
     return {"group_n": group_n, "options": options}
 
 
-def _option_choice_diagnostics(
-    *,
-    sjt_long: pd.DataFrame,
-    items: Mapping[str, Mapping[str, Any]],
-    item_order: Sequence[str],
-    score_frame: pd.DataFrame,
-    score_specs: Sequence[Mapping[str, Any]],
-    virtual_metrics: Mapping[str, Mapping[str, Any]],
-    score_tiers: Sequence[Mapping[str, Any]],
-) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
-    """Build non-filtering option frequencies for tiers and conditional bands."""
-
-    spec_by_id = {
-        str(spec.get("dimension_id")): dict(spec)
-        for spec in score_specs
-        if isinstance(spec, Mapping) and spec.get("dimension_id") is not None
-    }
-    tier_by_respondent = (
-        sjt_long[["respondent_id", "tier_id"]]
-        .drop_duplicates()
-        .set_index("respondent_id")["tier_id"]
-        .reindex(score_frame.index)
-    )
-    tier_scores = {
-        str(row.get("tier_id")): row.get("facet_score")
-        for row in score_tiers
-        if isinstance(row, Mapping) and row.get("tier_id") is not None
-    }
-    diagnostics_by_item: dict[str, dict[str, Any]] = {}
-    flat_rows: list[dict[str, Any]] = []
-
-    def append_flat_rows(
-        *,
-        item_id: str,
-        group: Mapping[str, Any],
-        grouping_scope: str,
-        tier_id: str | None = None,
-        tier_facet_score: Any = None,
-        dimension_role: str | None = None,
-        vts_category: str | None = None,
-        dimension_id: str | None = None,
-        score_band: str | None = None,
-        estimable: bool = True,
-        contrasts: Mapping[str, Mapping[str, Any]] | None = None,
-    ) -> None:
-        for option in group.get("options") or []:
-            if not isinstance(option, Mapping):
-                continue
-            contrast = (contrasts or {}).get(str(option.get("option_id"))) or {}
-            flat_rows.append(
-                {
-                    "item_id": item_id,
-                    "grouping_scope": grouping_scope,
-                    "tier_id": tier_id,
-                    "tier_facet_score": tier_facet_score,
-                    "dimension_role": dimension_role,
-                    "vts_category": vts_category,
-                    "dimension_id": dimension_id,
-                    "score_band": score_band,
-                    "group_n": group.get("group_n"),
-                    "option_id": option.get("option_id"),
-                    "behavioral_level": option.get("behavioral_level"),
-                    "option_score": option.get("score"),
-                    "selection_count": option.get("selection_count"),
-                    "selection_rate": option.get("selection_rate"),
-                    "high_low_rate_delta": contrast.get(
-                        "high_low_rate_delta"
-                    ),
-                    "rate_range": contrast.get("rate_range"),
-                    "estimable": bool(estimable),
-                    "filtering_authority": False,
-                }
-            )
-
-    for item_id in item_order:
-        item = items[item_id]
-        item_responses = sjt_long[sjt_long["item_id"] == item_id]
-        aggregate = _option_frequency_group(item_responses, item=item)
-        append_flat_rows(
-            item_id=item_id,
-            group=aggregate,
-            grouping_scope="aggregate",
-        )
-        by_tier: list[dict[str, Any]] = []
-        for tier_id in tier_scores:
-            tier_group = _option_frequency_group(
-                item_responses[item_responses["tier_id"] == tier_id],
-                item=item,
-            )
-            tier_result = {
-                "tier_id": tier_id,
-                "facet_score": tier_scores[tier_id],
-                **tier_group,
-            }
-            by_tier.append(tier_result)
-            append_flat_rows(
-                item_id=item_id,
-                group=tier_result,
-                grouping_scope="tier",
-                tier_id=tier_id,
-                tier_facet_score=tier_scores[tier_id],
-            )
-
-        specificity = virtual_metrics[item_id]["virtual_target_specificity"]
-        target_id = str(item.get("target_dimension_id"))
-        target_spec = spec_by_id.get(target_id) or {"dimension_id": target_id}
-        dimension_rows: list[tuple[str, str | None, Mapping[str, Any]]] = [
-            ("target", None, target_spec)
-        ]
-        for role, category, key in (
-            (
-                "same_domain_contaminant",
-                "same_domain",
-                "same_domain_non_target",
-            ),
-            (
-                "cross_domain_contaminant",
-                "cross_domain",
-                "cross_domain_non_target",
-            ),
-        ):
-            competitor = (specificity.get(key) or {}).get(
-                "largest_non_target_facet"
-            )
-            if isinstance(competitor, Mapping) and competitor.get("dimension_id"):
-                dimension_rows.append((role, category, competitor))
-
-        conditional_rows: list[dict[str, Any]] = []
-        seen_dimensions: set[tuple[str, str]] = set()
-        for role, category, dimension in dimension_rows:
-            dimension_id = str(dimension.get("dimension_id") or "")
-            identity = (role, dimension_id)
-            if not dimension_id or identity in seen_dimensions:
-                continue
-            seen_dimensions.add(identity)
-            if dimension_id not in score_frame:
-                band_assignments = pd.Series(index=score_frame.index, dtype="object")
-                band_metadata = {
-                    "conditioning_variable": "tier_id",
-                    "method": "average_rank_residual_tertiles",
-                    "rank_method": "average",
-                    "tier_count": len(tier_scores),
-                    "minimum_group_n": MINIMUM_OPTION_DIAGNOSTIC_GROUP_N,
-                    "filtering_authority": False,
-                    "estimable": False,
-                    "reason": "分数档案缺少该构念分数",
-                    "group_sizes": {"low": 0, "medium": 0, "high": 0},
-                }
-            else:
-                band_assignments, band_metadata = (
-                    _conditional_score_band_assignments(
-                        score_frame[dimension_id], tier_by_respondent
-                    )
-                )
-            groups: list[dict[str, Any]] = []
-            rates_by_option: dict[str, dict[str, float | None]] = {}
-            for band in ("low", "medium", "high"):
-                respondent_ids = set(
-                    band_assignments.index[band_assignments == band].astype(str)
-                )
-                band_group = _option_frequency_group(
-                    item_responses[
-                        item_responses["respondent_id"].isin(respondent_ids)
-                    ],
-                    item=item,
-                )
-                group_result = {"score_band": band, **band_group}
-                groups.append(group_result)
-                for option in band_group["options"]:
-                    rates_by_option.setdefault(option["option_id"], {})[band] = (
-                        option["selection_rate"]
-                    )
-            contrasts: list[dict[str, Any]] = []
-            contrast_by_option: dict[str, dict[str, Any]] = {}
-            for option_id, band_rates in rates_by_option.items():
-                finite_rates = [
-                    float(rate)
-                    for rate in band_rates.values()
-                    if rate is not None and math.isfinite(float(rate))
-                ]
-                low_rate = band_rates.get("low")
-                high_rate = band_rates.get("high")
-                contrast = {
-                    "option_id": option_id,
-                    "high_low_rate_delta": (
-                        float(high_rate) - float(low_rate)
-                        if high_rate is not None and low_rate is not None
-                        else None
-                    ),
-                    "rate_range": (
-                        max(finite_rates) - min(finite_rates)
-                        if finite_rates else None
-                    ),
-                }
-                contrasts.append(contrast)
-                contrast_by_option[option_id] = contrast
-            conditional_result = {
-                "dimension_role": role,
-                "vts_category": category,
-                "dimension_id": dimension_id,
-                "facet_name": dimension.get("facet_name"),
-                "facet_name_en": dimension.get("facet_name_en"),
-                "domain_id": dimension.get("domain_id"),
-                "definition": dimension.get("definition"),
-                "high_behavior": dimension.get("high_behavior"),
-                "low_behavior": dimension.get("low_behavior"),
-                **band_metadata,
-                "groups": groups,
-                "option_contrasts": contrasts,
-            }
-            conditional_rows.append(conditional_result)
-            for group in groups:
-                append_flat_rows(
-                    item_id=item_id,
-                    group=group,
-                    grouping_scope="conditional_score_band",
-                    dimension_role=role,
-                    vts_category=category,
-                    dimension_id=dimension_id,
-                    score_band=str(group.get("score_band")),
-                    estimable=bool(band_metadata.get("estimable")),
-                    contrasts=contrast_by_option,
-                )
-
-        diagnostics_by_item[item_id] = _json_safe(
-            {
-                "version": OPTION_CHOICE_DIAGNOSTICS_VERSION,
-                "filtering_authority": False,
-                "interpretation": (
-                    "选项频率仅用于定位可能需要文本核查的选项；"
-                    "不能独立证明构念污染或触发返修。"
-                ),
-                "aggregate": aggregate,
-                "by_tier": by_tier,
-                "conditional_score_bands": conditional_rows,
-            }
-        )
-
-    return diagnostics_by_item, pd.DataFrame(flat_rows)
-
-
-    # 使用半量表均分；题目数为奇数时避免两半长度不同造成量尺差异。
-    odd_score = frame[odd_columns].mean(axis=1)
 def _scale_statistics(
     sjt_wide: pd.DataFrame,
     items: Mapping[str, Mapping[str, Any]],
@@ -2114,81 +1319,6 @@ def _scale_statistics(
             ),
             "cronbach_alpha": overall_alpha,
             "dimensions": dimensions,
-        }
-    )
-
-
-def _respondent_scores(
-    sjt_wide: pd.DataFrame,
-    neo_dimensions: pd.DataFrame,
-    items: Mapping[str, Mapping[str, Any]],
-) -> pd.DataFrame:
-    output = pd.DataFrame(index=sjt_wide.index)
-    output["sjt_total_sum"] = sjt_wide.sum(axis=1)
-    output["sjt_total_mean"] = sjt_wide.mean(axis=1)
-    dimension_ids = list(
-        dict.fromkeys(
-            str(item.get("target_dimension_id"))
-            for item in items.values()
-            if item.get("target_dimension_id") is not None
-        )
-    )
-    for dimension_id in dimension_ids:
-        columns = [
-            item_id
-            for item_id, item in items.items()
-            if str(item.get("target_dimension_id")) == dimension_id
-        ]
-        output[f"sjt_dimension_{dimension_id}"] = sjt_wide[columns].mean(
-            axis=1
-        )
-    for dimension_code in neo_dimensions.columns:
-        output[f"neo_{dimension_code}"] = neo_dimensions[dimension_code]
-    return output.reset_index()
-
-
-def _validity_statistics(
-    respondent_scores: pd.DataFrame,
-    *,
-    criterion: Mapping[str, str],
-) -> dict[str, Any]:
-    sjt_total = respondent_scores["sjt_total_mean"]
-    neo_correlations = {
-        dimension_code: _spearman(
-            sjt_total,
-            respondent_scores[f"neo_{dimension_code}"],
-        )
-        for dimension_code in ("N", "E", "O", "A", "C")
-    }
-    facet_correlations: dict[str, Any] = {}
-    criterion_code = criterion["neo_ffi_dimension"]
-    for column in respondent_scores.columns:
-        if column.startswith("sjt_dimension_"):
-            facet_correlations[column.removeprefix("sjt_dimension_")] = (
-                _spearman(
-                    respondent_scores[column],
-                    respondent_scores[f"neo_{criterion_code}"],
-                )
-            )
-    return _json_safe(
-        {
-            "method": "spearman",
-            "criterion": dict(criterion),
-            "target_convergent_pair": (
-                f"sjt_total_mean ~ neo_{criterion_code}"
-            ),
-            "sjt_total_by_neo_dimension": neo_correlations,
-            "sjt_dimension_by_target_neo_dimension": facet_correlations,
-            "interpretation_limitations": [
-                (
-                    "SJT与Neo-FFI作答均由同一虚拟人格提示生成，"
-                    "相关可能高估真实人类样本中的聚合效度。"
-                ),
-                (
-                    "本结果是虚拟数据内部一致性证据，"
-                    "不能替代真实被试效度研究。"
-                ),
-            ],
         }
     )
 
@@ -2338,7 +1468,7 @@ def _enrich_item_quality(
             "diagnostic_flags": flags,
             "decision_rule": (
                 "题项决策仅使用分面内CITC、标准化平均得分和"
-                "有效选项数；单题与Neo-FFI上位ddomain的相关不参与返修。"
+                "有效选项数；单题与IPIP-NEO目标facet的相关不参与返修。"
             ),
         }
         item["quality_evaluation"] = _json_safe(evaluation)
@@ -2361,578 +1491,99 @@ def _enrich_item_quality(
     return item_statistics, pd.DataFrame(quality_rows)
 
 
-def _apply_virtual_screening_quality(
-    item_statistics: dict[str, dict[str, Any]],
-    virtual_metrics: Mapping[str, Mapping[str, Any]],
-    *,
-    item_order: Sequence[str],
-) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
-    """Apply the four aggregate iteration gates; tier metrics stay descriptive."""
-
-    rows: list[dict[str, Any]] = []
-    for item_id in item_order:
-        item = item_statistics[item_id]
-        metrics = dict(virtual_metrics[item_id])
-        citc = metrics["facet_citc"]
-        specificity = metrics["virtual_target_specificity"]
-        same_domain = specificity["same_domain_non_target"]
-        cross_domain = specificity["cross_domain_non_target"]
-        legacy_quality = deepcopy(item.get("quality_evaluation") or {})
-        legacy_qualification = deepcopy(item.get("qualification") or {})
-        flags: list[str] = []
-        if citc.get("r") is None:
-            flags.append("分面内CITC无法估计")
-        elif not citc.get("passes"):
-            flags.append("分面内CITC低于0.20")
-        if specificity.get("target_spearman", {}).get("rho") is None:
-            flags.append("控制tier_id后的目标秩相关无法估计")
-        elif not specificity.get("target_rho_pass"):
-            flags.append("控制tier_id后的目标相关低于0.30，可能存在特质激活不足")
-        if same_domain.get("specificity_margin") is None:
-            flags.append("同domain非目标facet VTS无法估计")
-        elif not same_domain.get("passes"):
-            flags.append("同domain非目标facet VTS低于0.10")
-        if cross_domain.get("specificity_margin") is None:
-            flags.append("不同domain非目标facet VTS无法估计")
-        elif not cross_domain.get("passes"):
-            flags.append("不同domain非目标facet VTS低于0.20")
-        qualified = bool(metrics.get("passes"))
-        recommendation = "retain" if qualified else "revise"
-        quality = {
-            "version": MEASUREMENT_EVALUATION_VERSION,
-            "quality_grade": "acceptable" if qualified else "needs_revision",
-            "recommendation": recommendation,
-            "facet_citc": citc,
-            "virtual_target_specificity": specificity,
-            "per_tier_metrics": metrics.get("per_tier_metrics") or {},
-            "diagnostic_flags": flags,
-            "decision_rule": (
-                "自动迭代使用分面内CITC>=.20、控制tier_id的条件目标"
-                "Spearman rho>=.30、"
-                "同domain非目标facet VTS>=.10和不同domain非目标facet VTS>=.20；"
-                "难度、选项使用率和Cronbach alpha仅描述。"
-            ),
-            "descriptive_diagnostics": {
-                "difficulty": item.get("difficulty"),
-                "effective_option_count": legacy_quality.get(
-                    "effective_option_count"
-                ),
-                "minimum_option_rate": item.get("minimum_option_rate"),
-                "legacy_ratings": {
-                    key: legacy_quality.get(key)
-                    for key in (
-                        "discrimination_rating",
-                        "distribution_rating",
-                        "option_function_rating",
-                    )
-                },
-                "legacy_qualification": legacy_qualification,
-            },
-            # Compatibility fields for report/sort code; they are descriptive.
-            "discrimination_rating": legacy_quality.get(
-                "discrimination_rating"
-            ),
-            "distribution_rating": legacy_quality.get("distribution_rating"),
-            "option_function_rating": legacy_quality.get(
-                "option_function_rating"
-            ),
-            "observed_option_count": legacy_quality.get(
-                "observed_option_count"
-            ),
-            "effective_option_count": legacy_quality.get(
-                "effective_option_count"
-            ),
-        }
-        item["virtual_screening_metrics"] = _json_safe(metrics)
-        item["qualification"] = {
-            "citc_pass": bool(citc.get("passes")),
-            "target_rho_pass": bool(specificity.get("target_rho_pass")),
-            "same_domain_vts_pass": bool(same_domain.get("passes")),
-            "cross_domain_vts_pass": bool(cross_domain.get("passes")),
-            "qualified": qualified,
-        }
-        item["quality_evaluation"] = _json_safe(quality)
-        rows.append(
-            {
-                "item_id": item_id,
-                "metric_scope": "aggregate",
-                "tier_id": None,
-                "filtering_authority": True,
-                "correlation_method": "rank_residualization",
-                "conditioning_variable": "tier_id",
-                "dimension_id": item.get("dimension_id"),
-                "quality_grade": quality["quality_grade"],
-                "recommendation": recommendation,
-                "citc_r": citc.get("r"),
-                "target_rho": specificity.get("target_spearman", {}).get(
-                    "rho"
-                ),
-                "conditional_target_rho": specificity.get(
-                    "conditional_target_spearman", {}
-                ).get("rho"),
-                "same_domain_largest_non_target_dimension_id": same_domain.get(
-                    "largest_non_target_dimension_id"
-                ),
-                "same_domain_largest_non_target_conditional_rho": same_domain.get(
-                    "largest_non_target_conditional_rho"
-                ),
-                "same_domain_max_non_target_rho": same_domain.get(
-                    "max_non_target_rho"
-                ),
-                "same_domain_vts": same_domain.get("specificity_margin"),
-                "cross_domain_largest_non_target_dimension_id": cross_domain.get(
-                    "largest_non_target_dimension_id"
-                ),
-                "cross_domain_largest_non_target_conditional_rho": cross_domain.get(
-                    "largest_non_target_conditional_rho"
-                ),
-                "cross_domain_max_non_target_rho": cross_domain.get(
-                    "max_non_target_rho"
-                ),
-                "cross_domain_vts": cross_domain.get("specificity_margin"),
-                "difficulty_descriptive": item.get("difficulty"),
-                "effective_option_count_descriptive": legacy_quality.get(
-                    "effective_option_count"
-                ),
-                "diagnostic_flags": "；".join(flags),
-            }
-        )
-        for tier_id, tier_metric in (metrics.get("per_tier_metrics") or {}).items():
-            tier_citc = (tier_metric or {}).get("facet_citc") or {}
-            tier_specificity = (
-                (tier_metric or {}).get("virtual_target_specificity") or {}
-            )
-            tier_same = tier_specificity.get("same_domain_non_target") or {}
-            tier_cross = tier_specificity.get("cross_domain_non_target") or {}
-            rows.append(
-                {
-                    "item_id": item_id,
-                    "metric_scope": "tier",
-                    "tier_id": tier_id,
-                    "filtering_authority": False,
-                    "correlation_method": "ordinary_spearman",
-                    "conditioning_variable": None,
-                    "dimension_id": item.get("dimension_id"),
-                    "quality_grade": "diagnostic_only",
-                    "recommendation": "diagnostic_only",
-                    "citc_r": tier_citc.get("r"),
-                    "target_rho": (
-                        tier_specificity.get("target_spearman") or {}
-                    ).get("rho"),
-                    "conditional_target_rho": None,
-                    "ordinary_target_rho": (
-                        tier_specificity.get("target_spearman") or {}
-                    ).get("rho"),
-                    "same_domain_largest_non_target_dimension_id": tier_same.get(
-                        "largest_non_target_dimension_id"
-                    ),
-                    "same_domain_max_non_target_rho": tier_same.get(
-                        "max_non_target_rho"
-                    ),
-                    "same_domain_largest_non_target_conditional_rho": None,
-                    "same_domain_vts": tier_same.get("specificity_margin"),
-                    "cross_domain_largest_non_target_dimension_id": tier_cross.get(
-                        "largest_non_target_dimension_id"
-                    ),
-                    "cross_domain_max_non_target_rho": tier_cross.get(
-                        "max_non_target_rho"
-                    ),
-                    "cross_domain_largest_non_target_conditional_rho": None,
-                    "cross_domain_vts": tier_cross.get("specificity_margin"),
-                    "difficulty_descriptive": None,
-                    "effective_option_count_descriptive": None,
-                    "diagnostic_flags": "各分数档指标不参与过滤",
-                }
-            )
-    return item_statistics, pd.DataFrame(rows)
-
-
-def _evaluate_test_quality(
-    *,
-    item_statistics: Mapping[str, Mapping[str, Any]],
-    scale_statistics: Mapping[str, Any],
-    validity_statistics: Mapping[str, Any],
-    criterion: Mapping[str, str],
+def evaluate_single_item_candidate(
+    state: PSJTState,
+    candidate_item: Mapping[str, Any],
+    candidate_records: Sequence[Mapping[str, Any]],
 ) -> dict[str, Any]:
-    alpha = scale_statistics.get("cronbach_alpha")
-    alpha_grade = _reliability_grade(alpha)
-    reliability_grade = alpha_grade
+    """用正式基线的其余题目，评估一个候选题的四项单题指标。
 
-    correlations = validity_statistics.get(
-        "sjt_total_by_neo_dimension", {}
-    )
-    criterion_code = criterion["neo_ffi_dimension"]
-    target = correlations.get(criterion_code, {})
-    target_rho = target.get("rho")
-    non_target = {
-        code: result.get("rho")
-        for code, result in correlations.items()
-        if code != criterion_code and result.get("rho") is not None
-    }
-    max_non_target_code = None
-    max_non_target_rho = None
-    if non_target:
-        max_non_target_code, max_non_target_rho = max(
-            non_target.items(),
-            key=lambda pair: abs(pair[1]),
-        )
-    discriminant_margin = (
-        abs(target_rho) - abs(max_non_target_rho)
-        if target_rho is not None and max_non_target_rho is not None
-        else None
-    )
-    if target_rho is None:
-        convergent_grade = "insufficient_evidence"
-    elif abs(target_rho) >= 0.50:
-        convergent_grade = "strong_numeric_association"
-    elif abs(target_rho) >= 0.30:
-        convergent_grade = "moderate_numeric_association"
-    else:
-        convergent_grade = "weak_numeric_association"
+    局部复测只替换候选题的作答记录；同一批 matched facet 被试、同一
+    condition 分布和其余题目的作答保持不变。因此该结果可用于题目级
+    “修改—复测”反馈，但不冒充整卷信效度报告。
+    """
 
-    if (
-        target_rho is None
-        or max_non_target_rho is None
-        or discriminant_margin is None
+    manifest_path: Path | None = None
+    manifest: Mapping[str, Any] | None = None
+    attempted_refs: list[str] = []
+    for field in (
+        "virtual_response_data_ref",
+        "previous_virtual_response_data_ref",
     ):
-        discriminant_grade = "insufficient_evidence"
-    elif (
-        abs(max_non_target_rho) < 0.30
-        and discriminant_margin >= 0.20
-    ):
-        discriminant_grade = "supportive"
-    elif discriminant_margin >= 0.20:
-        discriminant_grade = "mixed"
-    else:
-        discriminant_grade = "weak"
-
-    recommendation_counts: dict[str, int] = {}
-    for item in item_statistics.values():
-        recommendation = (
-            item.get("quality_evaluation", {}).get("recommendation")
-        )
-        if recommendation:
-            recommendation_counts[recommendation] = (
-                recommendation_counts.get(recommendation, 0) + 1
+        reference = state.get(field)
+        if not isinstance(reference, str) or not reference:
+            continue
+        attempted_refs.append(f"{field}={reference}")
+        candidate_manifest_path = Path(reference).resolve()
+        if not candidate_manifest_path.is_file():
+            continue
+        candidate_manifest = _read_json(candidate_manifest_path)
+        if candidate_manifest.get("schema_version") != MATCHED_CONDITION_SCHEMA_VERSION:
+            continue
+        manifest_path = candidate_manifest_path
+        manifest = candidate_manifest
+        break
+    if manifest_path is None or manifest is None:
+        if not attempted_refs:
+            raise ValueError(
+                "单题局部指标计算前缺少 virtual_response_data_ref；"
+                "当前和上一版基线引用均不存在"
             )
-
-    missing_evidence = [
-        "独立真实被试的聚合与区分效度",
-        "预测效度或效标关联效度",
-        "重测信度",
-    ]
-    overall_status = (
-        "development_ready_with_revision"
-        if reliability_grade in {"strong", "acceptable"}
-        and target_rho is not None
-        and target_rho > 0
-        else "not_ready"
-    )
-
-    return _json_safe(
-        {
-            "version": MEASUREMENT_EVALUATION_VERSION,
-            "evidence_scope": "virtual_development_sample",
-            "criterion": dict(criterion),
-            "overall_status": overall_status,
-            "operational_use_status": "not_validated_for_operational_use",
-            "item_recommendation_counts": recommendation_counts,
-            "reliability": {
-                "overall_grade": reliability_grade,
-                "cronbach_alpha": alpha,
-                "cronbach_alpha_grade": alpha_grade,
-                "interpretation": (
-                    "整体内部一致性按开发期标准评价；分维度仅2至3题，"
-                    "其alpha不作为独立分量表定论。"
-                ),
-            },
-            "validity": {
-                "overall_grade": "preliminary_incomplete",
-                "convergent": {
-                    "grade": convergent_grade,
-                    "target": f"Neo-FFI {criterion_code}",
-                    "rho": target_rho,
-                    "p_value": target.get("p_value"),
-                    "limitation": (
-                        "SJT与Neo-FFI由同一虚拟人格提示生成，"
-                        "该相关不能当作独立效度证据。"
-                    ),
-                },
-                "discriminant": {
-                    "grade": discriminant_grade,
-                    "largest_non_target_dimension": max_non_target_code,
-                    "largest_non_target_rho": max_non_target_rho,
-                    "target_margin": discriminant_margin,
-                },
-            },
-            "missing_evidence": missing_evidence,
-            "interpretation": (
-                "当前结果可以支持开发期保留、修改和补测决策，"
-                "不能支持正式选拔、诊断或个体高风险决策。"
-            ),
-        }
-    )
-
-
-def _manifest_persona_modes(
-    manifest: Mapping[str, Any],
-    sjt_records: Sequence[Mapping[str, Any]],
-) -> list[str]:
-    raw_modes = manifest.get("persona_modes")
-    if raw_modes is None:
-        inferred = sorted(
-            {
-                str(record["persona_mode"])
-                for record in sjt_records
-                if isinstance(record.get("persona_mode"), str)
-            }
+        raise ValueError(
+            "单题局部指标找不到可用的 matched-condition 作答 manifest："
+            + "；".join(attempted_refs)
         )
-        return inferred or [PERSONA_MODE_SUMMARY_PLUS_ITEMS]
-    if (
-        not isinstance(raw_modes, list)
-        or not raw_modes
-        or any(not isinstance(mode, str) or not mode for mode in raw_modes)
-        or len(set(raw_modes)) != len(raw_modes)
+    item_id = str(candidate_item.get("item_id") or "")
+    if not item_id:
+        raise ValueError("单题候选缺少 item_id")
+    if not isinstance(candidate_item.get("version"), int) or isinstance(
+        candidate_item.get("version"), bool
     ):
-        raise ValueError("response manifest 包含无效 persona_modes")
-    if any(mode != PERSONA_MODE_SUMMARY_PLUS_ITEMS for mode in raw_modes):
-        raise ValueError("response manifest 只支持 summary_plus_items")
-    return list(raw_modes)
-
-
-def _filter_persona_mode_records(
-    records: Sequence[Mapping[str, Any]],
-    *,
-    persona_mode: str,
-) -> list[dict[str, Any]]:
-    records_with_mode = [
-        record for record in records if "persona_mode" in record
-    ]
-    if not records_with_mode:
-        return [dict(record) for record in records]
-    if len(records_with_mode) != len(records):
-        raise ValueError("同一作答文件不能混合有无 persona_mode 的记录")
-    filtered = [
+        raise ValueError("单题候选缺少有效 version")
+    item_order, items = _prepare_item_contract(state)
+    if item_id not in items:
+        raise ValueError(f"单题候选不在当前冻结题库中：{item_id}")
+    items[item_id] = deepcopy(dict(candidate_item))
+    baseline_records = _read_jsonl(manifest_path.parent / "sjt_responses.jsonl")
+    replacement_records = [
         dict(record)
-        for record in records
-        if record.get("persona_mode") == persona_mode
+        for record in candidate_records
+        if isinstance(record, Mapping)
+        and str(record.get("item_id") or "") == item_id
     ]
-    if not filtered:
-        raise ValueError(f"缺少 persona_mode={persona_mode} 的作答")
-    return filtered
-
-
-def _paired_choice_comparison(
-    records: Sequence[Mapping[str, Any]],
-    *,
-    primary_mode: str,
-    comparison_mode: str,
-) -> dict[str, Any]:
-    by_mode: dict[str, dict[tuple[str, str], str]] = {}
-    for mode in (primary_mode, comparison_mode):
-        keyed: dict[tuple[str, str], str] = {}
-        for record in records:
-            if record.get("persona_mode") != mode:
-                continue
-            key = (
-                str(record.get("respondent_id")),
-                str(record.get("item_id")),
-            )
-            if key in keyed:
-                raise ValueError(
-                    f"{mode} SJT 作答包含重复 respondent-item 记录"
-                )
-            keyed[key] = str(record.get("selected_option_id"))
-        by_mode[mode] = keyed
-    primary = by_mode[primary_mode]
-    comparison = by_mode[comparison_mode]
-    if set(primary) != set(comparison):
-        raise ValueError("两种 persona_mode 的 SJT 配对记录集合不一致")
-    item_totals: dict[str, int] = {}
-    item_matches: dict[str, int] = {}
-    matches = 0
-    for key, primary_choice in primary.items():
-        item_id = key[1]
-        item_totals[item_id] = item_totals.get(item_id, 0) + 1
-        matched = primary_choice == comparison[key]
-        matches += int(matched)
-        item_matches[item_id] = item_matches.get(item_id, 0) + int(matched)
-    total = len(primary)
-    return {
-        "primary_mode": primary_mode,
-        "comparison_mode": comparison_mode,
-        "paired_response_count": total,
-        "overall_option_agreement": matches / total if total else None,
-        "item_option_agreement": {
-            item_id: item_matches.get(item_id, 0) / count
-            for item_id, count in item_totals.items()
-        },
-    }
-
-
-def _run_paired_persona_mode_analysis(
-    *,
-    state: PSJTState,
-    manifest_path: Path,
-    response_manifest: Mapping[str, Any],
-    sjt_records: Sequence[Mapping[str, Any]],
-    neo_records: Sequence[Mapping[str, Any]],
-    persona_modes: Sequence[str],
-) -> dict[str, Any]:
-    """Analyze each paired prompt condition independently."""
-
-    primary_mode = persona_modes[0]
-    mode_root = manifest_path.parent / "psychometrics" / "persona_modes"
-    mode_results: dict[str, dict[str, Any]] = {}
-    for persona_mode in persona_modes:
-        input_dir = mode_root / persona_mode / "inputs"
-        input_dir.mkdir(parents=True, exist_ok=True)
-        mode_sjt_path = input_dir / "sjt_responses.jsonl"
-        mode_neo_path = input_dir / "neo_ffi_responses.jsonl"
-        mode_manifest_path = input_dir / "manifest.json"
-        mode_sjt_records = _filter_persona_mode_records(
-            sjt_records,
-            persona_mode=persona_mode,
-        )
-        mode_neo_records = _filter_persona_mode_records(
-            neo_records,
-            persona_mode=persona_mode,
-        )
-        _write_jsonl_atomic(mode_sjt_path, mode_sjt_records)
-        _write_jsonl_atomic(mode_neo_path, mode_neo_records)
-        mode_manifest = {
-            **dict(response_manifest),
-            "persona_modes": [persona_mode],
-            "persona_mode_count": 1,
-            "expected_sjt_records": len(mode_sjt_records),
-            "completed_sjt_records": len(mode_sjt_records),
-            "expected_neo_ffi_records": len(mode_neo_records),
-            "completed_neo_ffi_records": len(mode_neo_records),
-            "parent_response_manifest": str(manifest_path),
-        }
-        _write_json_atomic(mode_manifest_path, mode_manifest)
-        mode_state = dict(state)
-        mode_state["virtual_response_data_ref"] = str(mode_manifest_path)
-        result = run_psychometric_analysis(mode_state)  # one-mode base case
-        mode_results[persona_mode] = result
-
-    comparisons = {
-        persona_mode: _paired_choice_comparison(
-            sjt_records,
-            primary_mode=primary_mode,
-            comparison_mode=persona_mode,
-        )
-        for persona_mode in persona_modes
-        if persona_mode != primary_mode
-    }
-    comparison_path = (
-        manifest_path.parent
-        / "psychometrics"
-        / "paired_persona_mode_comparison.json"
-    )
-    comparison_payload = {
-        "schema_version": 1,
-        "primary_mode": primary_mode,
-        "persona_modes": list(persona_modes),
-        "comparisons": comparisons,
-        "interpretation": (
-            "The same respondents completed the same items under each prompt "
-            "condition. Differences estimate prompt-conditioning effects, not "
-            "independent-sample effects."
-        ),
-    }
-    _write_json_atomic(comparison_path, comparison_payload)
-
-    primary = mode_results[primary_mode]
-    primary_update = dict(primary["state_update"])
-    primary_test_statistics = dict(primary_update["test_statistics"])
-    primary_test_statistics.update(
-        {
-            "primary_persona_mode": primary_mode,
-            "persona_modes": list(persona_modes),
-            "persona_mode_results": {
-                mode: {
-                    "item_statistics": result["state_update"][
-                        "item_statistics"
-                    ],
-                    "test_statistics": result["state_update"][
-                        "test_statistics"
-                    ],
-                }
-                for mode, result in mode_results.items()
-            },
-            "paired_persona_mode_comparison": comparison_payload,
-            "paired_persona_mode_comparison_path": str(
-                comparison_path.resolve()
-            ),
-        }
-    )
-    primary_update["test_statistics"] = _json_safe(
-        primary_test_statistics
-    )
-    return {
-        "state_update": primary_update,
-        "summary": (
-            f"已分别完成 {len(persona_modes)} 种人格提示模式的心理测量分析；"
-            f"下游题目筛选以 {primary_mode} 为主分析，其他模式用于配对敏感性比较。"
-        ),
-    }
-
-
-def _run_score_profile_analysis(
-    *,
-    state: PSJTState,
-    manifest_path: Path,
-    sjt_path: Path,
-    response_manifest: Mapping[str, Any],
-    item_order: list[str],
-    items: Mapping[str, Mapping[str, Any]],
-    expected_respondents: int,
-) -> dict[str, Any]:
-    """Analyze tiered single responses with four aggregate iteration gates."""
-
-    persona_modes = response_manifest.get("persona_modes")
-    if persona_modes != [PERSONA_MODE_SCORE_PROFILE]:
-        raise ValueError("schema_version=3 的作答必须使用 score_profile")
-    score_tiers = response_manifest.get("score_tiers")
-    if not isinstance(score_tiers, list) or not 1 <= len(score_tiers) <= 3:
-        raise ValueError("分档分析要求1到3个 score_tiers")
-    tier_ids = [str(tier.get("tier_id")) for tier in score_tiers if isinstance(tier, Mapping)]
-    if len(tier_ids) != len(score_tiers) or len(set(tier_ids)) != len(tier_ids):
-        raise ValueError("score_tiers 缺少唯一 tier_id")
-    sjt_records = _filter_persona_mode_records(
-        _read_jsonl(sjt_path), persona_mode=PERSONA_MODE_SCORE_PROFILE
-    )
-    sjt_long, sjt_wide, tier_wide = _score_tiered_sjt(
-        sjt_records,
+    if not replacement_records:
+        raise ValueError("单题局部复测没有返回候选题作答")
+    combined_records = [
+        record
+        for record in baseline_records
+        if str(record.get("item_id") or "") != item_id
+    ] + replacement_records
+    conditions = manifest.get("conditions")
+    condition_groups = flatten_matched_condition_groups(conditions or [])
+    condition_ids = tuple(str(row.get("condition_id")) for row in condition_groups)
+    expected_per_condition = manifest.get("sample_size_per_condition")
+    if not isinstance(expected_per_condition, int) or expected_per_condition < 1:
+        raise ValueError("作答 manifest 缺少有效 sample_size_per_condition")
+    sjt_long, condition_wide, condition_scores = _score_matched_sjt(
+        combined_records,
         item_order=item_order,
         items=items,
-        expected_respondent_count=expected_respondents,
-        expected_tier_ids=tier_ids,
+        expected_respondent_count=expected_per_condition,
+        condition_ids=condition_ids,
     )
-    score_profiles_path = response_manifest.get("score_profiles_path")
-    if not isinstance(score_profiles_path, str):
-        raise ValueError("作答 manifest 缺少 score_profiles_path")
-    score_payload = _read_json(Path(score_profiles_path))
-    score_specs = score_payload.get("score_specs")
-    if not isinstance(score_specs, list) or not score_specs:
-        raise ValueError("score_profiles.json 缺少 score_specs")
-    score_frame = _score_profile_frame(
-        score_payload,
-        expected_respondents=list(sjt_wide.index),
-        score_specs=score_specs,
-    )
-    virtual_metrics = _virtual_item_metrics(
+    virtual_metrics = _matched_item_metrics(
         item_order=item_order,
         items=items,
-        response_wide=sjt_wide,
-        tier_wide=tier_wide,
-        score_frame=score_frame,
-        score_specs=score_specs,
+        condition_wide=condition_wide,
+        condition_scores=condition_scores,
+        conditions=conditions,
     )
-    item_statistics, item_frame, option_frame = _item_statistics(
+    item_statistics, _, _ = _item_statistics(
         sjt_long,
-        sjt_wide,
+        pd.concat(
+            [condition_wide[condition_id].assign(condition_id=condition_id)
+             for condition_id in condition_ids]
+        ).drop(columns=["condition_id"]),
         item_order=item_order,
         items=items,
     )
@@ -2940,331 +1591,32 @@ def _run_score_profile_analysis(
         item_statistics,
         item_order=item_order,
     )
-    item_statistics, item_quality_frame = _apply_virtual_screening_quality(
+    target_long = sjt_long[sjt_long["condition_id"] == "target"]
+    gradients = {
+        current_item_id: _target_option_gradient(
+            target_long=target_long,
+            item=items[current_item_id],
+            target_scores=condition_scores["target"],
+        )
+        for current_item_id in item_order
+    }
+    item_statistics, _ = _apply_matched_quality(
         item_statistics,
         virtual_metrics,
+        gradients,
         item_order=item_order,
     )
-    option_diagnostics, option_frame = _option_choice_diagnostics(
-        sjt_long=sjt_long,
-        items=items,
-        item_order=item_order,
-        score_frame=score_frame,
-        score_specs=score_specs,
-        virtual_metrics=virtual_metrics,
-        score_tiers=score_tiers,
-    )
-    for item_id in item_order:
-        item_statistics[item_id]["option_choice_diagnostics"] = deepcopy(
-            option_diagnostics[item_id]
-        )
-    scale_statistics = _scale_statistics(sjt_wide, items)
-    analysis_round = int(state.get("psychometric_analysis_round") or 0) + 1
-
-    respondent_scores = score_frame.copy()
-    respondent_scores.insert(0, "respondent_id", respondent_scores.index)
-    tier_by_respondent = (
-        sjt_long[["respondent_id", "tier_id"]]
-        .drop_duplicates()
-        .set_index("respondent_id")["tier_id"]
-    )
-    respondent_scores.insert(
-        1, "tier_id", [tier_by_respondent.loc[index] for index in respondent_scores.index]
-    )
-    respondent_scores["sjt_total_score"] = sjt_wide.mean(axis=1).values
-    for dimension_id in list(
-        dict.fromkeys(str(items[item_id]["target_dimension_id"]) for item_id in item_order)
-    ):
-        columns = [
-            item_id
-            for item_id in item_order
-            if str(items[item_id]["target_dimension_id"]) == dimension_id
-        ]
-        respondent_scores[f"sjt_{dimension_id}"] = sjt_wide[columns].mean(
-            axis=1
-        ).values
-    respondent_scores = respondent_scores.reset_index(drop=True)
-
-    target_rhos = [
-        metrics["virtual_target_specificity"]["target_spearman"]["rho"]
-        for metrics in virtual_metrics.values()
-        if metrics["virtual_target_specificity"]["target_spearman"]["rho"]
-        is not None
-    ]
-    citc_values = [
-        metrics["facet_citc"]["r"]
-        for metrics in virtual_metrics.values()
-        if metrics["facet_citc"]["r"] is not None
-    ]
-    same_domain_margins = [
-        metrics["virtual_target_specificity"]["same_domain_non_target"]["specificity_margin"]
-        for metrics in virtual_metrics.values()
-        if metrics["virtual_target_specificity"]["same_domain_non_target"]["specificity_margin"] is not None
-    ]
-    cross_domain_margins = [
-        metrics["virtual_target_specificity"]["cross_domain_non_target"]["specificity_margin"]
-        for metrics in virtual_metrics.values()
-        if metrics["virtual_target_specificity"]["cross_domain_non_target"]["specificity_margin"] is not None
-    ]
-    validity_statistics = _json_safe(
-        {
-            "evidence_scope": "exploratory_virtual_score_manipulation",
-            "psychometric_analysis_round": analysis_round,
-            "item_metrics": virtual_metrics,
-            "summary": {
-                "median_target_rho": (
-                    float(np.median(target_rhos)) if target_rhos else None
-                ),
-                "median_citc": (
-                    float(np.median(citc_values)) if citc_values else None
-                ),
-                "minimum_same_domain_vts": (
-                    min(same_domain_margins) if same_domain_margins else None
-                ),
-                "minimum_cross_domain_vts": (
-                    min(cross_domain_margins) if cross_domain_margins else None
-                ),
-                "tier_count": len(tier_ids),
-            },
-            "interpretation": (
-                "总目标相关与VTS均先对平均秩控制tier_id；各档普通相关仅作诊断。"
-                "分数操纵与同一模型作答形成探索性虚拟目标特异性证据；"
-                "不能替代SME内容效度和真人构念/效标效度。"
-            ),
-        }
-    )
-    recommendation_counts = {"retain": 0, "revise": 0, "remove": 0}
-    for item in item_statistics.values():
-        recommendation = item["quality_evaluation"]["recommendation"]
-        recommendation_counts[recommendation] += 1
-    qualified_count = recommendation_counts["retain"]
-    measurement_evaluation = _json_safe(
-        {
-            "version": MEASUREMENT_EVALUATION_VERSION,
-            "psychometric_analysis_round": analysis_round,
-            "evidence_scope": "exploratory_virtual_screening_evidence",
-            "overall_status": (
-                "development_ready"
-                if qualified_count == len(item_order)
-                else "development_ready_with_revision"
-            ),
-            "operational_use_status": "not_validated_for_operational_use",
-            "item_recommendation_counts": recommendation_counts,
-            "reliability": {
-                "overall_grade": "exploratory_virtual_screening",
-                "cronbach_alpha": scale_statistics.get("cronbach_alpha"),
-                "median_facet_citc": validity_statistics["summary"]["median_citc"],
-                "interpretation": (
-                    "单题迭代一致性门槛是合并分数档后的分面内CITC>=.20；"
-                    "Cronbach alpha仅作描述。"
-                ),
-            },
-            "validity": {
-                "overall_grade": "exploratory_virtual_screening",
-                "virtual_target_specificity": validity_statistics["summary"],
-                "conditioning": {
-                    "variable": "tier_id",
-                    "method": "rank_residualization",
-                    "rank_method": "average",
-                },
-                "limitation": (
-                    "显式人格分数与SJT反应由同一提示和模型连接，不能称为"
-                    "独立正式效度。"
-                ),
-            },
-            "missing_evidence": [
-                "独立SME盲评内容效度",
-                "真人样本的结构、收敛、区分与效标效度",
-                "真人重测信度",
-            ],
-            "interpretation": (
-                "自动返修仅由总CITC、条件目标相关及拆分后的两类条件VTS触发；"
-                "所有结论限于探索性虚拟预筛。"
-            ),
-        }
-    )
-
-    output_dir = manifest_path.parent / "psychometrics"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    scored_sjt_path = output_dir / "scored_tiered_sjt_responses.csv"
-    respondent_scores_path = output_dir / "respondent_scores.csv"
-    item_statistics_path = output_dir / "item_statistics.csv"
-    item_quality_path = output_dir / "item_quality.csv"
-    option_statistics_path = output_dir / "option_statistics.csv"
-    option_diagnostics_path = output_dir / "option_choice_diagnostics.json"
-    scale_statistics_path = output_dir / "scale_statistics.json"
-    validity_statistics_path = output_dir / "virtual_screening_metrics.json"
-    measurement_evaluation_path = output_dir / "measurement_evaluation.json"
-    analysis_manifest_path = output_dir / "analysis_manifest.json"
-    _write_csv_atomic(scored_sjt_path, sjt_long)
-    _write_csv_atomic(respondent_scores_path, respondent_scores)
-    _write_csv_atomic(item_statistics_path, item_frame)
-    _write_csv_atomic(item_quality_path, item_quality_frame)
-    _write_csv_atomic(option_statistics_path, option_frame)
-    _write_json_atomic(
-        option_diagnostics_path,
-        {
-            "schema_version": 1,
-            "version": OPTION_CHOICE_DIAGNOSTICS_VERSION,
-            "filtering_authority": False,
-            "minimum_group_n": MINIMUM_OPTION_DIAGNOSTIC_GROUP_N,
-            "psychometric_analysis_round": analysis_round,
-            "items": option_diagnostics,
-        },
-    )
-    _write_json_atomic(scale_statistics_path, scale_statistics)
-    _write_json_atomic(validity_statistics_path, validity_statistics)
-    _write_json_atomic(measurement_evaluation_path, measurement_evaluation)
-
-    warnings = [
-        "虚拟指标仅用于开发期预筛，不能作为正式单题信效度结论。"
-    ]
-    if expected_respondents < 100:
-        warnings.append("总样本量少于100，CITC与相关系数可能有较大波动。")
-    output_files = {
-        "scored_tiered_sjt_responses": str(scored_sjt_path.resolve()),
-        "respondent_scores": str(respondent_scores_path.resolve()),
-        "item_statistics": str(item_statistics_path.resolve()),
-        "item_quality": str(item_quality_path.resolve()),
-        "option_statistics": str(option_statistics_path.resolve()),
-        "option_choice_diagnostics": str(option_diagnostics_path.resolve()),
-        "scale_statistics": str(scale_statistics_path.resolve()),
-        "virtual_screening_metrics": str(validity_statistics_path.resolve()),
-        "measurement_evaluation": str(
-            measurement_evaluation_path.resolve()
-        ),
-        "analysis_manifest": str(analysis_manifest_path.resolve()),
+    result = deepcopy(item_statistics[item_id])
+    result["local_retest"] = {
+        "status": "passed" if result.get("qualification", {}).get("qualified") else "failed",
+        "filtering_authority": False,
+        "source_manifest": str(manifest_path),
+        "replaced_item_id": item_id,
+        "replaced_item_version": candidate_item.get("version"),
+        "candidate_response_count": len(replacement_records),
+        "metric_scope": "single_item_candidate_against_current_bank",
     }
-    option_order_path = response_manifest.get("option_order_path")
-    if not isinstance(option_order_path, str) or not Path(
-        option_order_path
-    ).is_file():
-        raise ValueError("作答 manifest 缺少有效 option_order_path")
-    analysis_manifest = {
-        "schema_version": 5,
-        "status": "completed",
-        "formula_version": PSYCHOMETRIC_FORMULA_VERSION,
-        "evaluation_version": MEASUREMENT_EVALUATION_VERSION,
-        "psychometric_analysis_round": analysis_round,
-        "run_id": state["run_id"],
-        "item_bank_id": state["item_bank_id"],
-        "item_bank_version": state["item_bank_version"],
-        "item_bank_fingerprint": state["item_bank_fingerprint"],
-        "sample_size": expected_respondents,
-        "tier_count": len(tier_ids),
-        "score_tiers": deepcopy(score_tiers),
-        "persona_mode": PERSONA_MODE_SCORE_PROFILE,
-        "prompt_version": response_manifest.get("prompt_version"),
-        "score_prompt_version": response_manifest.get(
-            "score_prompt_version"
-        ),
-        "generator_version": response_manifest.get("generator_version"),
-        "virtual_sample_config": deepcopy(
-            response_manifest.get("virtual_sample_config") or {}
-        ),
-        "item_count": len(item_order),
-        "qualified_item_count": qualified_count,
-        "qualification_rate": qualified_count / len(item_order),
-        "criteria": {
-            "iteration_gates": {
-                "facet_citc_minimum": CITC_REVISION_THRESHOLD,
-                "conditional_target_spearman_rho_minimum": TARGET_RHO_THRESHOLD,
-                "same_domain_vts_minimum": SAME_DOMAIN_VTS_THRESHOLD,
-                "cross_domain_vts_minimum": CROSS_DOMAIN_VTS_THRESHOLD,
-                "conditioning_variable": "tier_id",
-                "conditioning_method": "rank_residualization",
-            },
-            "descriptive_only": {
-                "difficulty_range": [DIFFICULTY_LOWER_BOUND, DIFFICULTY_UPPER_BOUND],
-                "minimum_option_rate": MINIMUM_OPTION_RATE,
-                "cronbach_alpha": True,
-                "option_choice_diagnostics": {
-                    "version": OPTION_CHOICE_DIAGNOSTICS_VERSION,
-                    "minimum_group_n": MINIMUM_OPTION_DIAGNOSTIC_GROUP_N,
-                    "filtering_authority": False,
-                },
-            },
-        },
-        "formulas": {
-            "facet_citc": (
-                "Pearson(item score, sum of other items with the same target facet)"
-            ),
-            "same_domain_vts": (
-                "conditional Spearman(target score, item score | tier_id) - maximum "
-                "absolute conditional Spearman(same-domain non-target facet score, "
-                "item score | tier_id)"
-            ),
-            "cross_domain_vts": (
-                "conditional Spearman(target score, item score | tier_id) - maximum "
-                "absolute conditional Spearman(cross-domain non-target facet score, "
-                "item score | tier_id)"
-            ),
-            "difficulty_descriptive": (
-                "(mean item score - theoretical min) / range"
-            ),
-        },
-        "input_files": {
-            "response_manifest": {
-                "path": str(manifest_path.resolve()),
-                "sha256": _file_sha256(manifest_path),
-            },
-            "sjt_responses": {
-                "path": str(sjt_path.resolve()),
-                "sha256": _file_sha256(sjt_path),
-            },
-            "score_profiles": {
-                "path": str(Path(score_profiles_path).resolve()),
-                "sha256": _file_sha256(Path(score_profiles_path)),
-            },
-            "option_orders": {
-                "path": str(Path(option_order_path).resolve()),
-                "sha256": _file_sha256(Path(option_order_path)),
-            },
-        },
-        "output_files": output_files,
-        "warnings": warnings,
-        "completed_at": utc_timestamp(),
-    }
-    _write_json_atomic(analysis_manifest_path, analysis_manifest)
-    test_statistics = {
-        **scale_statistics,
-        "persona_mode": PERSONA_MODE_SCORE_PROFILE,
-        "tier_count": len(tier_ids),
-        "score_tiers": deepcopy(score_tiers),
-        "qualified_item_count": qualified_count,
-        "qualification_rate": qualified_count / len(item_order),
-        "qualification_criteria": analysis_manifest["criteria"],
-        "virtual_screening_metrics": validity_statistics,
-        "measurement_evaluation": measurement_evaluation,
-        "warnings": warnings,
-        "output_files": output_files,
-        "formula_version": PSYCHOMETRIC_FORMULA_VERSION,
-        "evaluation_version": MEASUREMENT_EVALUATION_VERSION,
-        "psychometric_analysis_round": analysis_round,
-        "option_choice_diagnostics_version": OPTION_CHOICE_DIAGNOSTICS_VERSION,
-    }
-    state_update = {
-        "item_statistics": item_statistics,
-        "test_statistics": _json_safe(test_statistics),
-        "psychometric_analysis_round": analysis_round,
-        "virtual_analysis_reconfiguration_reason": None,
-    }
-    from sjt_system.evaluation.round_results import (
-        build_psychometric_round_result,
-    )
-
-    state_update["psychometric_round_result"] = (
-        build_psychometric_round_result({**state, **state_update})
-    )
-    return {
-        "state_update": state_update,
-        "summary": (
-            f"已完成 {expected_respondents} 名分数型虚拟被试、"
-            f"{len(tier_ids)} 个分数档、{len(item_order)} 道题的四门槛分析；"
-            f"保留 {recommendation_counts['retain']} 题，"
-            f"修改 {recommendation_counts['revise']} 题。"
-        ),
-    }
+    return _json_safe(result)
 
 
 def run_psychometric_analysis(
@@ -3297,219 +1649,6 @@ def run_psychometric_analysis(
         "旧 tier/重复作答/条件残差化虚拟作答结果已失效；"
         f"请使用 schema_version={MATCHED_CONDITION_SCHEMA_VERSION} 的固定三臂、多 facet group 匹配协议重新作答"
     )
-
-    sjt_records = _read_jsonl(sjt_path)
-    neo_records = _read_jsonl(neo_path)
-    persona_modes = _manifest_persona_modes(
-        response_manifest,
-        sjt_records,
-    )
-    if len(persona_modes) > 1:
-        return _run_paired_persona_mode_analysis(
-            state=state,
-            manifest_path=manifest_path,
-            response_manifest=response_manifest,
-            sjt_records=sjt_records,
-            neo_records=neo_records,
-            persona_modes=persona_modes,
-        )
-    active_persona_mode = persona_modes[0]
-    sjt_records = _filter_persona_mode_records(
-        sjt_records,
-        persona_mode=active_persona_mode,
-    )
-    neo_records = _filter_persona_mode_records(
-        neo_records,
-        persona_mode=active_persona_mode,
-    )
-    sjt_long, sjt_wide = _score_sjt(
-        sjt_records,
-        item_order=item_order,
-        items=items,
-        expected_respondent_count=expected_respondents,
-    )
-    neo_long, neo_dimensions = _score_neo(
-        neo_records,
-        expected_respondents=list(sjt_wide.index),
-    )
-    item_statistics, item_frame, option_frame = _item_statistics(
-        sjt_long,
-        sjt_wide,
-        item_order=item_order,
-        items=items,
-    )
-    scale_statistics = _scale_statistics(sjt_wide, items)
-    respondent_scores = _respondent_scores(
-        sjt_wide,
-        neo_dimensions,
-        items,
-    )
-    validity_statistics = _validity_statistics(
-        respondent_scores,
-        criterion=criterion,
-    )
-    item_statistics, item_quality_frame = _enrich_item_quality(
-        item_statistics,
-        item_order=item_order,
-    )
-    measurement_evaluation = _evaluate_test_quality(
-        item_statistics=item_statistics,
-        scale_statistics=scale_statistics,
-        validity_statistics=validity_statistics,
-        criterion=criterion,
-    )
-
-    output_dir = manifest_path.parent / "psychometrics"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    scored_sjt_path = output_dir / "scored_sjt_responses.csv"
-    scored_neo_path = output_dir / "scored_neo_ffi_responses.csv"
-    respondent_scores_path = output_dir / "respondent_scores.csv"
-    item_statistics_path = output_dir / "item_statistics.csv"
-    item_quality_path = output_dir / "item_quality.csv"
-    option_statistics_path = output_dir / "option_statistics.csv"
-    scale_statistics_path = output_dir / "scale_statistics.json"
-    validity_statistics_path = output_dir / "validity_statistics.json"
-    measurement_evaluation_path = (
-        output_dir / "measurement_evaluation.json"
-    )
-    analysis_manifest_path = output_dir / "analysis_manifest.json"
-
-    _write_csv_atomic(scored_sjt_path, sjt_long)
-    _write_csv_atomic(scored_neo_path, neo_long)
-    _write_csv_atomic(respondent_scores_path, respondent_scores)
-    _write_csv_atomic(item_statistics_path, item_frame)
-    _write_csv_atomic(item_quality_path, item_quality_frame)
-    _write_csv_atomic(option_statistics_path, option_frame)
-    _write_json_atomic(scale_statistics_path, scale_statistics)
-    _write_json_atomic(validity_statistics_path, validity_statistics)
-    _write_json_atomic(
-        measurement_evaluation_path,
-        measurement_evaluation,
-    )
-
-    qualified_count = sum(
-        bool(item["qualification"]["qualified"])
-        for item in item_statistics.values()
-    )
-    warnings = []
-    if expected_respondents < 100:
-        warnings.append(
-            "样本量少于100，项目统计、信度和相关系数可能有较大抽样波动。"
-        )
-    if expected_respondents == 30:
-        warnings.append(
-            "30人样本中1次选择率为3.33%、2次为6.67%，"
-            "5%选项阈值的判定较粗糙。"
-        )
-    output_files = {
-        "scored_sjt_responses": str(scored_sjt_path.resolve()),
-        "scored_neo_ffi_responses": str(scored_neo_path.resolve()),
-        "respondent_scores": str(respondent_scores_path.resolve()),
-        "item_statistics": str(item_statistics_path.resolve()),
-        "item_quality": str(item_quality_path.resolve()),
-        "option_statistics": str(option_statistics_path.resolve()),
-        "scale_statistics": str(scale_statistics_path.resolve()),
-        "validity_statistics": str(validity_statistics_path.resolve()),
-        "measurement_evaluation": str(
-            measurement_evaluation_path.resolve()
-        ),
-        "analysis_manifest": str(analysis_manifest_path.resolve()),
-    }
-    analysis_manifest = {
-        "schema_version": 1,
-        "status": "completed",
-        "formula_version": PSYCHOMETRIC_FORMULA_VERSION,
-        "evaluation_version": MEASUREMENT_EVALUATION_VERSION,
-        "run_id": state["run_id"],
-        "item_bank_id": state["item_bank_id"],
-        "item_bank_version": state["item_bank_version"],
-        "item_bank_fingerprint": state["item_bank_fingerprint"],
-        "sample_size": expected_respondents,
-        "persona_mode": active_persona_mode,
-        "criterion": criterion,
-        "item_count": len(item_order),
-        "qualified_item_count": qualified_count,
-        "qualification_rate": qualified_count / len(item_order),
-        "criteria": {
-            "difficulty_range": [
-                DIFFICULTY_LOWER_BOUND,
-                DIFFICULTY_UPPER_BOUND,
-            ],
-            "citc_minimum_acceptable": CITC_MINIMUM_ACCEPTABLE,
-            "citc_revision_threshold": CITC_REVISION_THRESHOLD,
-            "minimum_option_rate": MINIMUM_OPTION_RATE,
-            "quality_evaluation": {
-                "citc_minimum_acceptable": CITC_MINIMUM_ACCEPTABLE,
-                "citc_revision_threshold": CITC_REVISION_THRESHOLD,
-                "citc_strong": CITC_STRONG,
-                "statistical_warning_triggers_revision": False,
-                "statistical_warning_triggers_removal": False,
-            },
-        },
-        "formulas": {
-            "difficulty": "(item_mean - theoretical_min) / (theoretical_max - theoretical_min)",
-            "facet_citc": (
-                "Pearson correlation(item, sum of the other items with the "
-                "same target_dimension_id)"
-            ),
-            "multiple_comparison_adjustment": "Benjamini-Hochberg FDR",
-            "cronbach_alpha": "k/(k-1) * (1 - sum(item_sample_variances)/total_sample_variance)",
-            "neo_reverse_scoring": "6 - raw_response",
-            "convergent_validity": "Spearman rank correlation",
-        },
-        "missing_value_policy": "complete response matrices required; no imputation",
-        "input_files": {
-            "response_manifest": {
-                "path": str(manifest_path),
-                "sha256": _file_sha256(manifest_path),
-            },
-            "sjt_responses": {
-                "path": str(sjt_path),
-                "sha256": _file_sha256(sjt_path),
-            },
-            "neo_ffi_responses": {
-                "path": str(neo_path),
-                "sha256": _file_sha256(neo_path),
-            },
-        },
-        "output_files": output_files,
-        "warnings": warnings,
-        "completed_at": utc_timestamp(),
-    }
-    _write_json_atomic(analysis_manifest_path, analysis_manifest)
-
-    test_statistics = {
-        **scale_statistics,
-        "persona_mode": active_persona_mode,
-        "criterion": criterion,
-        "qualified_item_count": qualified_count,
-        "qualification_rate": qualified_count / len(item_order),
-        "qualification_criteria": analysis_manifest["criteria"],
-        "convergent_validity": validity_statistics,
-        "measurement_evaluation": measurement_evaluation,
-        "warnings": warnings,
-        "output_files": output_files,
-        "formula_version": PSYCHOMETRIC_FORMULA_VERSION,
-        "evaluation_version": MEASUREMENT_EVALUATION_VERSION,
-    }
-    recommendation_counts = measurement_evaluation[
-        "item_recommendation_counts"
-    ]
-    return {
-        "state_update": {
-            "item_statistics": item_statistics,
-            "test_statistics": _json_safe(test_statistics),
-        },
-        "summary": (
-            f"已完成 {expected_respondents} 名被试、{len(item_order)} 道题的"
-            f"经典测量分析；评价建议为保留"
-            f"{recommendation_counts.get('retain', 0)}题、修改"
-            f"{recommendation_counts.get('revise', 0)}题、删除"
-            f"{recommendation_counts.get('remove', 0)}题；"
-            f"Cronbach α={scale_statistics['cronbach_alpha']}。"
-        ),
-    }
-
 
 def run_saved_psychometric_analysis(
     manifest_path: str | Path,

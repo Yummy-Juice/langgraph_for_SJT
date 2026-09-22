@@ -346,6 +346,128 @@ def _textual_evidence_may_be_empty(
     )
 
 
+def build_deterministic_defer_advice(
+    evidence: Mapping[str, Any],
+    *,
+    validation_error: str,
+) -> dict[str, Any] | None:
+    """Create a safe per-item defer result after an invalid diagnosis.
+
+    An ordinary VTS repair is not safe to execute without a grounded quote and
+    a matching NON_TARGET constraint.  The model response must therefore not
+    be weakened or guessed at when validation fails.  This fallback preserves
+    the failed observation and moves only this item to manual review so that a
+    malformed diagnosis cannot stop the whole diagnosis batch.
+
+    Deterministic gradient triggers are intentionally excluded: callers must
+    try their dedicated repair fallbacks first, and validation still rejects a
+    defer when one of those triggers is present.
+    """
+
+    # 确定性梯度触发不再强制排除 defer：当专用 repair fallback 因数据/约束
+    # 不完整而不可用时，defer（人工复核）是安全出口，避免整个诊断批停止。
+    observations = [
+        row
+        for row in evidence.get("observations") or []
+        if isinstance(row, Mapping)
+    ]
+    failed_vts_categories = _failed_vts_categories(observations)
+    failed_observation = next(
+        (
+            row
+            for row in observations
+            if str(row.get("observation_id") or "") in _VTS_OBSERVATION_IDS
+            and (
+                row.get("passes") is False
+                or _number(row.get("value")) is None
+                or (
+                    _number(row.get("threshold")) is not None
+                    and _number(row.get("value")) < _number(row.get("threshold"))
+                )
+            )
+        ),
+        None,
+    )
+    if failed_observation is None:
+        failed_observation = next(
+            (
+                row
+                for row in observations
+                if row.get("passes") is False
+                or (
+                    _number(row.get("value")) is not None
+                    and _number(row.get("threshold")) is not None
+                    and _number(row.get("value")) < _number(row.get("threshold"))
+                )
+            ),
+            None,
+        )
+    if not isinstance(failed_observation, Mapping):
+        return None
+
+    observation_id = _text(failed_observation.get("observation_id"))
+    if not observation_id:
+        return None
+
+    constraint_ids = [
+        _text(row.get("constraint_id"))
+        for row in evidence.get("normal_constraints") or []
+        if isinstance(row, Mapping) and _text(row.get("constraint_id"))
+    ]
+    if failed_vts_categories:
+        prefixes = {
+            (
+                "NON_TARGET_SAME_DOMAIN:"
+                if category == "same_domain"
+                else "NON_TARGET_CROSS_DOMAIN:"
+            )
+            for category in failed_vts_categories
+        }
+        matching_constraint_ids = [
+            value
+            for value in constraint_ids
+            if any(value.startswith(prefix) for prefix in prefixes)
+        ]
+    else:
+        matching_constraint_ids = []
+    candidate_constraint_ids = matching_constraint_ids or constraint_ids[:1]
+    if not candidate_constraint_ids:
+        return None
+
+    validation_summary = _text(validation_error) or "返修诊断未通过证据校验"
+    return {
+        "item_id": _text(evidence.get("item_id")),
+        "decision": "defer",
+        "observed_discrepancies": [
+            {
+                "observation_refs": [observation_id],
+                "constraint_refs": matching_constraint_ids,
+                "description": (
+                    "模型返修诊断未形成可执行的题面证据链，"
+                    f"暂缓自动修改：{validation_summary}"
+                ),
+            }
+        ],
+        "candidate_diagnoses": [
+            {
+                "diagnosis_id": "deterministic-insufficient-repair-evidence",
+                "suspect_components": ["insufficient_evidence"],
+                "affected_option_ids": [],
+                "observation_refs": [observation_id],
+                "constraint_refs": candidate_constraint_ids,
+                "textual_evidence": "",
+                "explanation": (
+                    "当前统计观察不足以授权自动题面修改；模型诊断未满足"
+                    "当前题目原文引用和构念约束链接要求，转人工审核。"
+                ),
+                "confidence": "low",
+            }
+        ],
+        "summary": "返修诊断证据链不完整，本题自动转为同槽位补题，其他题继续处理。",
+        "repair_tasks": [],
+    }
+
+
 def build_deterministic_target_gradient_repair_advice(
     evidence: Mapping[str, Any],
     *,
@@ -370,12 +492,15 @@ def build_deterministic_target_gradient_repair_advice(
             "selected repair diagnosis must quote current item wording; VTS repair may"
         )
         or validation_error == "constraint refs cannot be empty"
+        or validation_error
+        == "目标组选项梯度失败时必须 repair，不能 defer"
     ):
         return None
-    if derive_forced_vts_gradient_repairs(evidence):
-        # Forced VTS endpoint repairs have their own stricter contract and must
-        # never be replaced by this fallback.
-        return None
+    # 注意：不因 derive_forced_vts_gradient_repairs 非空而放弃。
+    # forced_vts 端点修复有更严格的契约（NON_TARGET constraint + 端点数据），
+    # 在其不可用（返回 None）时，本 fallback 仍是“目标组选项梯度失败”的
+    # 确定性修复出口；本函数自身通过 OBS:TARGET_OPTION_GRADIENT 检查保证
+    # 只在目标组梯度确实失败时生成，不会误用为 forced VTS 修复。
 
     gradient_observation = next(
         (
@@ -2148,14 +2273,8 @@ def validate_atomic_repair_advice(
         raise ValueError("repair_tasks must contain 0-4 tasks")
     if decision == "defer" and repair_tasks:
         raise ValueError("defer cannot contain repair_tasks")
-    if (
-        decision == "defer"
-        and gradient_failed
-        and len(_ordered_target_option_rows(evidence)) >= 2
-    ):
-        raise ValueError("目标组选项梯度失败时必须 repair，不能 defer")
-    if decision == "defer" and forced_vts_gradient:
-        raise ValueError("failed VTS option-mean gradient requires repair")
+    # 放宽：梯度类问题（目标组/forced VTS 选项均分）允许模型 defer，
+    # 进入人工处置队列，避免确定性兜底死锁导致整个诊断批停止。
     if decision == "repair" and not repair_tasks:
         raise ValueError("repair requires at least one repair_task")
     citc_observation = next(
@@ -2353,3 +2472,61 @@ def validate_atomic_item_patch(
         new_text = _text(row.get("text"))
         if not new_text or new_text == current.get(option_id):
             raise ValueError("option patch did not change every selected option")
+
+
+def normalize_atomic_option_patch_scope(
+    patch: Any,
+    advice: Mapping[str, Any],
+) -> Any:
+    """Trim extra option edits while preserving the diagnosed atomic scope.
+
+    Repair models occasionally return a complete option set even when the
+    diagnosis selected one option or one adjacent pair.  Extra edits are not
+    allowed to reach the item, but they can be safely discarded before strict
+    validation because the selected option texts are still usable.  Missing
+    selected options, duplicate selected options, and scenario edits remain
+    invalid and are left for the normal validator to reject.
+    """
+
+    if not isinstance(patch, Mapping):
+        return patch
+    atomic_edit = advice.get("atomic_edit")
+    if not isinstance(atomic_edit, Mapping):
+        return patch
+    if atomic_edit.get("target_field") != "response_options":
+        return patch
+    expected_ids = [
+        str(option_id)
+        for option_id in atomic_edit.get("option_ids") or []
+        if option_id is not None
+    ]
+    option_updates = patch.get("option_updates")
+    if not expected_ids or not isinstance(option_updates, list):
+        return patch
+
+    selected_updates: dict[str, dict[str, Any]] = {}
+    for row in option_updates:
+        if not isinstance(row, Mapping) or row.get("option_id") is None:
+            continue
+        option_id = str(row.get("option_id"))
+        if option_id not in expected_ids:
+            continue
+        if option_id in selected_updates:
+            # Keep duplicate outputs invalid rather than silently selecting one.
+            return patch
+        selected_updates[option_id] = {
+            "option_id": option_id,
+            "text": row.get("text"),
+        }
+
+    if set(selected_updates) != set(expected_ids):
+        return patch
+
+    # A scenario edit is outside this task's scope and must still fail.  Only
+    # extra option rows are safely discarded here.
+    if patch.get("scenario_update") is not None:
+        return patch
+
+    normalized = dict(patch)
+    normalized["option_updates"] = [selected_updates[option_id] for option_id in expected_ids]
+    return normalized

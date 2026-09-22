@@ -88,9 +88,9 @@ def _reasoning_role_parameters(
             f"{prefix}_REASONING_EFFORT must be low, medium, high, or max"
         )
     if thinking_type == "disabled":
-        raise ValueError(
-            f"{prefix}_THINKING cannot be disabled for a reasoning role"
-        )
+        # 允许关闭推理模式：禁用时不再携带 reasoning_effort
+        # （client.get_model 拒绝 reasoning_effort + thinking=disabled）
+        reasoning_effort = None
     return model_id, temperature, thinking_type, reasoning_effort
 
 
@@ -103,8 +103,18 @@ def create_agent(
     temperature: float | None = None,
     reasoning_effort: str | None = None,
     thinking_type: str | None = None,
+    include_json_schema: bool = True,
 ) -> Runnable:
-    """使用统一的 Prompt、模型和输出类型创建专业 Agent。"""
+    """使用统一的 Prompt、模型和输出类型创建专业 Agent。
+
+    ``include_json_schema`` controls whether the machine-generated JSON Schema
+    is appended to the hand-written prompt for json_mode/plain_json.  It stays
+    True for agents whose prompt does not describe the output object itself.
+    An agent may disable it only when its prompt carries an explicit, current
+    output contract with field checklists and minimal examples; the local
+    Pydantic validation and the bounded schema-repair retry stay active either
+    way.
+    """
 
     model = get_model(
         model_id,
@@ -116,7 +126,10 @@ def create_agent(
         model,
         output_type,
     )
-    if method in {"json_mode", "plain_json"}:
+    if (
+        method in {"json_mode", "plain_json"}
+        and include_json_schema
+    ):
         json_instruction = build_json_output_instruction(output_type)
         json_instruction = json_instruction.replace("{", "{{").replace(
             "}",
@@ -137,6 +150,10 @@ def create_agent(
 requirement_agent = create_agent(
     system_prompt=REQUIREMENT_PROMPT,
     output_type=RequirementResult,
+    # The prompt carries its own explicit output contract with a complete
+    # example object, so the verbose machine-generated JSON Schema is not
+    # appended here.
+    include_json_schema=False,
 )
 
 
@@ -187,7 +204,7 @@ item_regeneration_agent = item_repair_agent
     _psychometric_diagnosis_reasoning_effort,
 ) = _reasoning_role_parameters(
     "PSYCHOMETRIC_DIAGNOSIS",
-    default_model_id="deepseek-v4-pro-guan",
+    default_model_id="glm-5.3-flash",
 )
 psychometric_repair_diagnosis_agent = create_agent(
     system_prompt=PSYCHOMETRIC_REPAIR_DIAGNOSIS_PROMPT,
@@ -196,6 +213,10 @@ psychometric_repair_diagnosis_agent = create_agent(
     temperature=_psychometric_diagnosis_temperature,
     reasoning_effort=_psychometric_diagnosis_reasoning_effort,
     thinking_type=_psychometric_diagnosis_thinking,
+    # The prompt carries its own explicit output contract with field
+    # checklists and minimal defer/repair examples, so the verbose
+    # machine-generated JSON Schema is not appended here.
+    include_json_schema=False,
 )
 
 
@@ -206,7 +227,7 @@ psychometric_repair_diagnosis_agent = create_agent(
     _psychometric_item_repair_reasoning_effort,
 ) = _reasoning_role_parameters(
     "PSYCHOMETRIC_ITEM_REPAIR",
-    default_model_id="deepseek-v4-pro-guan",
+    default_model_id="glm-5.3-flash",
 )
 psychometric_item_repair_agent = create_agent(
     system_prompt=ITEM_REPAIR_PROMPT,

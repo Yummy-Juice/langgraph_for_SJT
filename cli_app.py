@@ -19,6 +19,7 @@ from sjt_system.runtime.checkpoint import (
     prepare_resumed_state,
     save_run_checkpoint,
 )
+from sjt_system.runtime.telemetry import run_context as telemetry_run_context
 from sjt_system.state import TraceEvent, create_initial_state
 from sjt_system.authoring.items import derive_item_review_decision
 from sjt_system.authoring.construct_registry import (
@@ -32,6 +33,7 @@ from sjt_system.evaluation.round_results import (
     build_psychometric_round_result,
     metric_scalar,
 )
+from sjt_system.evaluation.form_metrics import form_quality_summary
 
 app = build_sjt_graph()
 
@@ -53,6 +55,7 @@ ACTION_LABELS = {
     "simulate_responses": "虚拟被试作答",
     "analyze_psychometrics": "心理测量分析",
     "select_items": "心理测量返修诊断",
+    "psychometric_repair_batch": "并发心理测量返修",
     "assemble_test": "测验组卷",
     "review_test": "测验整体审核",
     "rescore_test": "重新计分",
@@ -110,6 +113,60 @@ def print_runtime_progress(event: dict) -> None:
         print(
             f"[虚拟作答] {event.get('stage')}："
             f"{completed}/{total}（{percent}%）",
+            flush=True,
+        )
+    elif event_type == "psychometric_subagent_progress":
+        status = {
+            "batch_started": "批次启动",
+            "batch_completed": "批次完成",
+            "started": "启动",
+            "editing": "修改中",
+            "retesting": "局部复测中",
+            "round_completed": "本轮完成",
+            "completed": "完成",
+            "failed": "失败",
+        }.get(event.get("status"), event.get("status"))
+        position = ""
+        if event.get("queue_position") and event.get("queue_total"):
+            position = (
+                f" [{event.get('queue_position')}/{event.get('queue_total')}]"
+            )
+        round_text = ""
+        if event.get("round"):
+            round_text = (
+                f"；局部轮次 {event.get('round')}/"
+                f"{event.get('max_rounds', '?')}"
+            )
+        gate_text = ""
+        if event.get("passed_gate_count") is not None:
+            gate_text = (
+                f"；通过门槛 {event.get('passed_gate_count')}/"
+                f"{event.get('gate_total', 4)}"
+            )
+        elapsed_text = ""
+        if event.get("elapsed_ms") is not None:
+            elapsed_text = f"；耗时 {event.get('elapsed_ms')} ms"
+        details = str(event.get("message") or "")
+        if event.get("diagnosis_id"):
+            details += f"；诊断={event.get('diagnosis_id')}"
+        if event.get("failed_gates"):
+            details += "；未通过=" + ",".join(
+                str(value) for value in event.get("failed_gates") or []
+            )
+        if event.get("local_status"):
+            details += f"；局部状态={event.get('local_status')}"
+        if event.get("batch_total") is not None:
+            details += (
+                f"；批次进度={event.get('completed_count', 0)}/"
+                f"{event.get('batch_total')}"
+            )
+        if event.get("concurrency") is not None:
+            details += f"；最大并发={event.get('concurrency')}"
+        print(
+            f"[心理测量 subagent]{position} "
+            f"{event.get('item_id', 'unknown')}：{status}"
+            f"{round_text}{gate_text}{elapsed_text}"
+            + (f"；{details}" if details else ""),
             flush=True,
         )
     elif event_type in {"request_retry", "output_repair"}:
@@ -401,7 +458,8 @@ def print_psychometric_summary(
         f"总样本量：{config.get('sample_size', '未知')}；"
         f"固定顶层臂：{config.get('condition_count', statistics.get('condition_count', 3))}；"
         f"facet group：{config.get('group_count', statistics.get('group_count', '?'))}；"
-        f"每组人数：{config.get('sample_size_per_condition', '未知')}；每人每题一次"
+        f"每组人数：{config.get('sample_size_per_condition', '未知')}；"
+        "主施测每人每题一次，target组另做一次整卷重测"
     )
     print(
         "分面内题项一致性：CITC中位数="
@@ -452,6 +510,83 @@ def _print_item_id_list(
         print(f"  - {item_id}：{reason}")
 
 
+def print_provisional_iteration_summary(proposed_update: dict) -> None:
+    """Print the whole-test baseline assembled before single-item repair."""
+
+    history = [
+        row
+        for row in proposed_update.get("psychometric_iteration_history") or []
+        if isinstance(row, dict)
+    ]
+    if not history:
+        return
+    provisional = max(
+        history,
+        key=lambda row: int(row.get("analysis_round") or 0),
+    )
+    form_metrics = provisional.get("form_metrics") or {}
+    reliability = form_metrics.get("reliability") or {}
+    validity = form_metrics.get("validity") or {}
+    recovery = validity.get("target_recovery") or {}
+    selectivity = validity.get("construct_selectivity") or {}
+    optimization = form_metrics.get("optimization") or {}
+    derived_quality = form_quality_summary(form_metrics)
+    stability_gate = (
+        optimization.get("stability_gate")
+        or derived_quality.get("stability_gate")
+        or {}
+    )
+    selectivity_value = selectivity.get("value")
+    if selectivity_value is None:
+        selectivity_value = derived_quality.get("construct_selectivity")
+    candidate_quality = provisional.get("candidate_form_quality")
+    if candidate_quality is None:
+        candidate_quality = derived_quality.get("candidate_form_quality")
+    plateau = provisional.get("plateau_status") or {}
+    best_quality = provisional.get("best_so_far_form_quality")
+    if best_quality is None:
+        best_quality = plateau.get("best_form_quality")
+    print("\n===== 本轮临时组卷（单题返修前基线） =====")
+    print(
+        f"轮次={provisional.get('analysis_round', '?')}；"
+        f"候选题={provisional.get('candidate_count', 0)}；"
+        f"单题通过={provisional.get('qualified_item_count', 0)}；"
+        f"临时测验={provisional.get('item_count', 0)}；"
+        f"状态={provisional.get('form_status', '未记录')}"
+    )
+    print(
+        "整卷指标："
+        "目标恢复R²="
+        f"{_format_metric(recovery.get('cross_validated_r2'))}；"
+        "构念选择性="
+        f"{_format_metric(selectivity_value)}；"
+        "本轮候选质量="
+        f"{_format_metric(candidate_quality)}；"
+        "历史最优质量="
+        f"{_format_metric(best_quality)}"
+    )
+    print(
+        "稳定性门槛："
+        "虚拟重测ICC="
+        f"{_format_metric(reliability.get('virtual_test_retest_icc'))}；"
+        f"最低={_format_metric(stability_gate.get('minimum'))}；"
+        f"通过={'是' if stability_gate.get('passed') else '否'}"
+    )
+    usage = provisional.get("token_usage") or {}
+    print(
+        "本轮成本："
+        f"Token={usage.get('total_tokens', 0)}；"
+        f"模型耗时={usage.get('duration_ms', 0)} ms"
+    )
+    if plateau.get("reached"):
+        print(
+            "平台期：已达到，"
+            f"连续未改善轮数={plateau.get('non_improving_rounds', '?')}"
+        )
+    if provisional.get("form_selection_error"):
+        print(f"临时组卷备注：{provisional['form_selection_error']}")
+
+
 def print_selection_summary(proposed_update: dict) -> None:
     raw_selection = proposed_update.get("selection_results")
     selection = raw_selection if isinstance(raw_selection, dict) else {}
@@ -490,6 +625,8 @@ def print_selection_summary(proposed_update: dict) -> None:
         status = "逐题诊断进行中"
     print(f"状态：{status or '等待下一步'}")
     print("筛选权：仅使用三臂匹配条件的总指标；各条件臂诊断与输入相关不参与过滤。")
+
+    print_provisional_iteration_summary(proposed_update)
 
     _print_item_id_list("正式题", selected, reasons)
     _print_item_id_list("待诊断题" if not raw_selection else "待处理题", revise, reasons)
@@ -538,9 +675,10 @@ def print_workflow_effect(action: str, proposed_update: dict) -> None:
         print(
             "\n[虚拟作答] "
             f"复用未变题作答 {summary.get('reused_sjt_records', 0)} 条；"
-            f"新增SJT调用 {summary.get('scheduled_sjt_api_calls', 0)} 次；"
-            f"匹配条件组 {summary.get('condition_count', '?')} 个；每组每人每题一次；"
-            "本流程未调用人格总结或Neo-FFI。"
+            f"新增主施测SJT调用 {summary.get('scheduled_sjt_api_calls', 0)} 次；"
+            "新增target重测调用 "
+            f"{summary.get('scheduled_target_form_retest_api_calls', 0)} 次；"
+            f"匹配条件组 {summary.get('condition_count', '?')} 个。"
         )
     elif action == "assemble_test":
         assembled = proposed_update.get("assembled_test") or {}
@@ -956,7 +1094,7 @@ def prompt_virtual_sample_selection(payload: dict) -> dict:
     print("\n===== 配置三臂匹配 facet 虚拟被试 =====")
     print(
         f"最多生成：{pool.get('available_count', '?')} 名；"
-        "每名虚拟被试对每题只回答1次。"
+        "主施测中每名虚拟被试对每题回答1次；target组额外完成一次整卷重测。"
     )
     if payload.get("method_note"):
         print(f"说明：{payload['method_note']}")
@@ -1154,6 +1292,7 @@ def prompt_user_decision(payload: dict) -> dict:
             print_psychometric_round_result(round_result)
         else:
             print("本轮缺少统一结果结构，请重新运行心理测量分析。")
+        print_provisional_iteration_summary(payload)
         diagnostics = payload.get("condition_score_diagnostics") or {}
         print("\n补充：匹配条件组分数分布（不参与过滤）")
         for condition in diagnostics.get("conditions") or []:
@@ -1174,6 +1313,149 @@ def prompt_user_decision(payload: dict) -> dict:
                 return {"decision": "stop"}
             print("请输入 1 或 2")
 
+    if payload.get("type") == "plateau_gap_decision":
+        print("\n===== 平台期收卷：蓝图缺口处置 =====")
+        print(payload.get("summary") or "")
+        gap_cells = payload.get("gap_cells") or []
+        resolutions: list[dict] = []
+        stopped = False
+        for index, cell in enumerate(gap_cells, start=1):
+            cell_id = cell.get("blueprint_cell_id")
+            candidates = cell.get("candidates") or []
+            eligible = [row for row in candidates if row.get("eligible")]
+            sme_rows = [
+                row for row in candidates if row.get("force_allowed")
+            ]
+            print(
+                f"\n[{index}/{len(gap_cells)}] 缺口单元 {cell_id}"
+                f"（需保留 {cell.get('planned_retention_count')} 题）"
+            )
+            for row in candidates:
+                if row.get("eligible"):
+                    tag = "（可直接补位/手动改）"
+                elif row.get("force_allowed"):
+                    tag = "（待SME：可强制补位）"
+                else:
+                    tag = "（不可选：已淘汰）"
+                gates = "、".join(row.get("failed_gates") or []) or "无"
+                print(
+                    f"  - {row.get('item_id')} v{row.get('version')} "
+                    f"状态={row.get('disposition_status') or 'none'}{tag} "
+                    f"失败门槛={gates}"
+                )
+            if not eligible and not sme_rows:
+                print("  该单元没有可选的候选（已淘汰）。")
+                print("  请选择停止，先人工处置后再恢复。")
+                stopped = True
+                break
+            while True:
+                cmd = input(
+                    f"  单元 {cell_id} 处理：输入候选 ID 直接补位；"
+                    "改:<ID> 手动修改；强制:<ID> 待SME题开发版补位；"
+                    "强改:<ID> 手动改待SME题；stop 停止："
+                ).strip()
+                if cmd.lower() == "stop":
+                    stopped = True
+                    break
+                manual = False
+                sme_override = False
+                item_id = cmd
+                for prefix in ("强改:", "强改："):
+                    if cmd.startswith(prefix):
+                        manual = True
+                        sme_override = True
+                        item_id = cmd[len(prefix):].strip()
+                        break
+                if not manual:
+                    for prefix in ("强制:", "强制："):
+                        if cmd.startswith(prefix):
+                            sme_override = True
+                            item_id = cmd[len(prefix):].strip()
+                            break
+                if not manual:
+                    for prefix in ("改:", "改："):
+                        if cmd.startswith(prefix):
+                            manual = True
+                            item_id = cmd[len(prefix):].strip()
+                            break
+                if not manual:
+                    for prefix in ("pick:", "pick："):
+                        if cmd.startswith(prefix):
+                            item_id = cmd[len(prefix):].strip()
+                            break
+                candidate = next(
+                    (row for row in eligible if str(row.get("item_id")) == item_id),
+                    None,
+                )
+                if candidate is None and sme_override:
+                    candidate = next(
+                        (
+                            row
+                            for row in sme_rows
+                            if str(row.get("item_id")) == item_id
+                        ),
+                        None,
+                    )
+                if candidate is None:
+                    print(
+                        "  请输入上面列出的候选 ID；待SME题需加 强制:/强改: 前缀"
+                    )
+                    continue
+                if sme_override and not candidate.get("force_allowed"):
+                    print("  该题不是待SME题，不需要 强制 前缀")
+                    continue
+                if manual:
+                    options = candidate.get("response_options") or []
+                    print(
+                        "  当前情境："
+                        + str(candidate.get("scenario") or "")
+                    )
+                    scenario = input("  新的情境文本：").strip()
+                    option_texts = {}
+                    for option in options:
+                        print(
+                            f"  当前选项 {option.get('option_id')}："
+                            f"{option.get('text')}"
+                        )
+                        option_texts[str(option.get("option_id"))] = input(
+                            f"  选项 {option.get('option_id')} 新文本："
+                        ).strip()
+                    resolutions.append(
+                        {
+                            "cell_id": cell_id,
+                            "item_id": item_id,
+                            "mode": "manual",
+                            "sme_override": sme_override,
+                            "manual_item": {
+                                "scenario": scenario,
+                                "response_options": [
+                                    {
+                                        "option_id": option.get("option_id"),
+                                        "text": option_texts.get(
+                                            str(option.get("option_id")), ""
+                                        ),
+                                    }
+                                    for option in options
+                                ],
+                            },
+                        }
+                    )
+                else:
+                    resolutions.append(
+                        {
+                            "cell_id": cell_id,
+                            "item_id": item_id,
+                            "mode": "pick",
+                            "sme_override": sme_override,
+                        }
+                    )
+                break
+            if stopped:
+                break
+        if stopped:
+            return {"decision": "stop"}
+        return {"decision": "resolve", "resolutions": resolutions}
+
     if payload.get("type") == "psychometric_repair_confirmation":
         print("\n===== 心理测量返修确认 =====")
         print(f"题目编号：{payload.get('item_id', '?')}")
@@ -1185,8 +1467,6 @@ def prompt_user_decision(payload: dict) -> dict:
             f"返修轮次：{payload.get('revision_round', '?')}；"
             f"队列位置：1/{max(1, len(payload.get('pending_item_queue') or []))}"
         )
-        if payload.get("defer_batch_mode"):
-            print("批量 defer 处置：已开启；后续 defer 题目自动按第3项淘汰补题")
         observations = payload.get("observations") or []
         if observations:
             print("四门槛与最大污染facet：")
@@ -1273,9 +1553,8 @@ def prompt_user_decision(payload: dict) -> dict:
         print("  2. 保留待 SME 审核")
         print("  3. 淘汰并在同一蓝图槽位补题")
         print("  4. 暂停并保存")
-        print("  5. 淘汰本题，并将此后所有 defer 题目按第3项处理")
         while True:
-            choice = input("你的选择 [1-5]：").strip()
+            choice = input("你的选择 [1-4]：").strip()
             if choice == "1":
                 if not isinstance(item, dict):
                     print("当前题目不可用，不能人工修改")
@@ -1305,9 +1584,7 @@ def prompt_user_decision(payload: dict) -> dict:
                 return {"decision": "eliminate_replenish"}
             if choice == "4":
                 return {"decision": "stop"}
-            if choice == "5":
-                return {"decision": "eliminate_replenish_future_defer"}
-            print("请输入 1、2、3、4 或 5")
+            print("请输入 1、2、3 或 4")
 
     if payload.get("type") == "item_development_mode_selection":
         print("\n===== 选择题目开发模式 =====")
@@ -1383,6 +1660,24 @@ def get_interrupt_payload(interrupt_update: object) -> dict:
 
 
 async def run_with_trace(
+    initial_state: dict,
+    *,
+    debug: bool = False,
+    heartbeat_interval_seconds: float | None = None,
+    checkpoint_root: Path | None = None,
+) -> dict:
+    """流式执行图，并在每个 Agent 结果后暂停等待用户确认。"""
+
+    with telemetry_run_context(initial_state["run_id"]):
+        return await _run_with_trace_impl(
+            initial_state,
+            debug=debug,
+            heartbeat_interval_seconds=heartbeat_interval_seconds,
+            checkpoint_root=checkpoint_root,
+        )
+
+
+async def _run_with_trace_impl(
     initial_state: dict,
     *,
     debug: bool = False,

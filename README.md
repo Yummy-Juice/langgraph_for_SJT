@@ -15,7 +15,7 @@ Curated Behavior Evidence
   ↓
 Behavior Expansion（按目标人群缓存）
   ↓
-Blueprint / 双向细目表
+Blueprint / 双向细目表（每个测量单元先生成2个候选）
   ↓
 Skeleton + Item Writer
   ↓
@@ -27,14 +27,14 @@ Skeleton + Item Writer
   ↓
 异常诊断与逐题原子返修（可选）
   ↓
-冻结题库、组卷与报告
+冻结候选题库、组卷与报告
 ```
 
 正式运行由程序负责状态迁移、JSON 校验、ID/引用、题量、版本和统计计算；模型负责构念内容的生成、题目语言实现、内容审查和异常诊断。当前版本不包含 UI 重构和真实被试数据导入分析。
 
 ## 环境要求
 
-- Windows 10/11
+- Windows 10/11，或 Ubuntu 22.04 LTS 等主流 Linux 发行版
 - Python 3.11（推荐使用与项目开发环境相同的版本）
 - 一个支持 OpenAI 兼容 Chat Completions 接口的模型服务
 - 可用的模型 API Key
@@ -67,6 +67,23 @@ env\Scripts\activate
 ```powershell
 env\Scripts\python.exe -m pip install -r requirements.txt
 ```
+
+在 Ubuntu/Linux 服务器中执行：
+
+```bash
+git clone <你的 GitHub 仓库地址>
+cd langgraph_for_SJT
+
+python3 -m venv env
+source env/bin/activate
+
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python -m pip check
+```
+
+`requirements.txt` 同时包含主流程、实验绘图和 Word 报告所需的运行依赖；
+本地测试工具单独列在 `requirements-dev.txt`。
 
 ## 配置模型服务
 
@@ -125,6 +142,59 @@ python cli_app.py
 
 `cli_app.py` 是开发和故障排查入口，适合检查 checkpoint 恢复、模型输出和流程节点；正式使用优先使用 Streamlit 工作台。命令行入口中的示例需求可能是固定的，若要运行自定义需求，请使用工作台或修改对应的调试配置。
 
+### 独立 A/B/C 系统比较实验
+
+以下命令新建并运行一次独立实验：
+
+```powershell
+python -X utf8 -m experiments.system_comparison run --config experiments/system_comparison/example_config.json
+```
+
+每次运行都会在 `experiment_data/exp_<时间>_<编号>/` 下建立独立目录，分别保存
+A简单提示词问卷、B理论组卷、C闭环迭代问卷、虚拟作答、整卷指标和报告。
+中断后使用终端输出的实验目录恢复：
+
+```powershell
+python -X utf8 -m experiments.system_comparison resume --experiment "experiment_data/exp_<时间>_<编号>"
+```
+
+只根据已有结果重建报告：
+
+```powershell
+python -X utf8 -m experiments.system_comparison report --experiment "experiment_data/exp_<时间>_<编号>"
+```
+
+当前入口一次运行一个完整 A/B/C 实验，不是无人值守的多实验批量调度器。
+选择 Agent 自动开发模式后，题目生成、审查、虚拟施测、返修、同槽位补题和组卷可以自动推进，
+但蓝图审核、施测后继续处理以及自动补题耗尽等情况仍可能等待人工输入。
+
+### 服务器并行运行五个 Mussel facet
+
+可为下面五个目标 facet 分别复制一份 `example_config.json`：
+
+| 代码 | `target_facet` | 建议同域参照 | 建议跨域参照 |
+|---|---|---|---|
+| N4 自我意识 | `neuroticism_self_consciousness` | `neuroticism_anxiety` | `extraversion_gregariousness` |
+| E2 乐群性 | `extraversion_gregariousness` | `extraversion_warmth` | `neuroticism_anxiety` |
+| O5 观念开放 | `openness_ideas` | `openness_actions` | `conscientiousness_self_discipline` |
+| A4 顺从 | `agreeableness_compliance` | `agreeableness_trust` | `neuroticism_angry_hostility` |
+| C5 自律 | `conscientiousness_self_discipline` | `conscientiousness_deliberation` | `neuroticism_impulsiveness` |
+
+五个完整实验可以在五个独立 `tmux` 会话中运行。每份配置建议设定不同 `seed`，并将
+`max_concurrency` 设为 `2`，使五进程总模型并发约为10；不要把每进程并发设为5后直接启动
+五个进程，否则容易触发模型服务限流或503错误。示例：
+
+```bash
+tmux new-session -d -s sjt_n4 "source env/bin/activate && python -X utf8 -m experiments.system_comparison run --config experiments/system_comparison/five_facet_configs/N4_self_consciousness.json 2>&1 | tee logs/N4_self_consciousness.log"
+tmux new-session -d -s sjt_e2 "source env/bin/activate && python -X utf8 -m experiments.system_comparison run --config experiments/system_comparison/five_facet_configs/E2_gregariousness.json 2>&1 | tee logs/E2_gregariousness.log"
+tmux new-session -d -s sjt_o5 "source env/bin/activate && python -X utf8 -m experiments.system_comparison run --config experiments/system_comparison/five_facet_configs/O5_ideas.json 2>&1 | tee logs/O5_ideas.log"
+tmux new-session -d -s sjt_a4 "source env/bin/activate && python -X utf8 -m experiments.system_comparison run --config experiments/system_comparison/five_facet_configs/A4_compliance.json 2>&1 | tee logs/A4_compliance.log"
+tmux new-session -d -s sjt_c5 "source env/bin/activate && python -X utf8 -m experiments.system_comparison run --config experiments/system_comparison/five_facet_configs/C5_self_discipline.json 2>&1 | tee logs/C5_self_discipline.log"
+```
+
+这些命令假定五份配置已放在 `experiments/system_comparison/five_facet_configs/`。
+使用 `tmux attach -t sjt_n4` 等命令进入对应会话处理可能出现的交互提示。
+
 ## Behavior Evidence 数据
 
 正式运行优先读取已经整理好的证据库：
@@ -179,8 +249,7 @@ langgraph_for_SJT/
 │  └─ items/                      # IPIP/NEO 条目结构化资料
 │
 ├─ docs/                          # 研究资料、构念资料和说明文档
-├─ experiments/                   # 对比实验及本地研究脚本
-├─ blind_classification/          # 可选的盲化构念分类实验
+├─ experiments/system_comparison/ # 独立A/B/C比较实验源码
 ├─ tools/                         # 本地分析和报告工具
 └─ outputs/                       # 运行时生成，不提交到 Git
 ```
@@ -195,6 +264,7 @@ outputs/
 ├─ virtual_responses/             # 虚拟被试逐题作答记录
 ├─ assembled_tests/               # 组卷中间结果
 ├─ final_reports/                 # 正式测验、题库和技术报告
+├─ run_telemetry/                 # 每轮模型 Token、调用次数和耗时记录
 └─ behavior_evidence_candidates/  # 离线行为证据候选
 ```
 
@@ -204,6 +274,18 @@ outputs/
 - `item_database.json`：带来源链、版本和评分信息的题库；
 - `technical_report.md`：流程、版本和统计结果；
 - `virtual_respondent_report.json`：开发期虚拟施测报告。
+
+当前整卷迭代采用与 A/B/C 独立评估一致的指标口径：Cronbach's α 和虚拟重测
+ICC 均为最低 `.80` 的门槛；目标 IPIP facet 高低组的 Hedges' g 是主要优化目标；
+目标相关减最大绝对非目标相关得到的 `Δmin` 不得下降；SJT 与目标 IPIP facet 的
+Spearman 相关最多允许相对历史最佳下降 `.02`。旧的目标恢复 R²、构念选择性和 Q
+只保留为历史诊断字段，不再决定新运行中的最优卷或平台期。
+
+这些统计反映同一虚拟被试框架下的开发期表现，不等同于真实被试信效度。
+技术报告还会记录题目数量、累计 Token 和累计模型耗时。
+稳定性指标需要 target 组额外完成一次整卷重测，因此每轮会增加约
+`target组人数 × 候选题数` 次模型调用；虚拟重测ICC只作为稳定性门槛，
+这些调用计入同一轮Token与耗时。
 
 ## 恢复中断运行
 
@@ -217,7 +299,10 @@ outputs/
 python -m pytest -q
 ```
 
-当前仓库策略会忽略测试文件、运行输出、checkpoint、环境文件、`wiki/` 和本地研究导出文件；这些文件不会随常规 Git 提交上传。
+当前仓库策略会忽略本地测试文件、运行输出、checkpoint、环境文件、`wiki/` 和研究导出文件。
+其中 `.env`、`outputs/`、`experiment_data/` 与 `blind_classification/` 均只保留在本地，
+不会随常规 Git 提交上传。`experiments/system_comparison/` 的程序源码属于仓库内容，
+但其生成的实验数据仍写入被忽略的 `experiment_data/`。
 
 ## 常见问题
 
@@ -250,4 +335,5 @@ git status --short
 git diff -- . ':!outputs'
 ```
 
-不要提交 `.env`、API 密钥、`outputs/` 下的运行结果、真实或敏感被试数据，以及本地研究导出文件。
+不要提交 `.env`、API 密钥、`outputs/`、`experiment_data/`、`blind_classification/`、
+真实或敏感被试数据，以及其他本地研究导出文件。

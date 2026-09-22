@@ -8,6 +8,7 @@ from typing import Any
 
 from sjt_system.authoring.situation_space import (
     BlueprintAgentOutput,
+    INCREMENTAL_CANDIDATES_PER_CELL,
     FacetExpansion,
     expansion_cache_path,
     load_facet_expansion,
@@ -15,7 +16,8 @@ from sjt_system.authoring.situation_space import (
 
 
 ANCHOR_LEVELS = ("low", "medium_low", "medium_high", "high")
-GENERATION_BLUEPRINT_VERSION = 7
+GENERATION_BLUEPRINT_VERSION = 8
+EXPANSION_SITUATION_BUFFER = 10
 
 
 def _text(value: Any) -> bool:
@@ -44,8 +46,13 @@ def construct_profile_reference(profile: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def required_generation_total(final_item_count: int) -> int:
-    """Return the exact user-requested item count; repairs reuse the slot."""
-    return int(final_item_count)
+    """Return the initial candidate count for incremental development."""
+    return int(final_item_count) * INCREMENTAL_CANDIDATES_PER_CELL
+
+
+def required_expansion_situation_total(final_item_count: int) -> int:
+    """Return the fixed situation-pool size before blueprint selection."""
+    return required_generation_total(final_item_count) + EXPANSION_SITUATION_BUFFER
 
 
 def _reference_index(
@@ -112,7 +119,7 @@ def build_generation_blueprint(
             "rows: Behavior Expansion 的唯一情境引用不足："
             f"需要 {generation_total} 个，实际 {len(situation_refs)} 个"
         )
-    row_total = generation_total
+    row_total = retention_total
     if row_total < 1:
         raise ValueError("rows: Behavior Expansion 没有可用于蓝图的情境引用")
     if len(result.rows) != row_total:
@@ -120,17 +127,17 @@ def build_generation_blueprint(
             "rows: 细目表必须返回"
             f" {row_total} 个唯一组合，实际为 {len(result.rows)} 个"
         )
-    generation_counts = [1] * row_total
+    generation_counts = [INCREMENTAL_CANDIDATES_PER_CELL] * row_total
     retention_counts = [1] * row_total
     blueprint_id = f"bp-{run_id}"
-    situation_lookup: dict[str, dict[str, str]] = {}
+    situation_lookup: dict[tuple[str, str], dict[str, str]] = {}
     mechanism_lookup: dict[str, str] = {}
     for expansion in expansions:
         for behavior in expansion.behavior_expansions:
             for mechanism in behavior.mechanisms:
                 mechanism_lookup[mechanism.mechanism_id] = mechanism.activation_mechanism
                 for situation in mechanism.situations:
-                    situation_lookup[situation.situation_id] = {
+                    situation_lookup[(mechanism.mechanism_id, situation.situation_id)] = {
                         "domain": situation.domain,
                         "actor_relation": situation.actor_relation,
                         "event_class": situation.event_class,
@@ -138,24 +145,44 @@ def build_generation_blueprint(
     cells = []
     slots = []
     for index, row in enumerate(result.rows, start=1):
+        candidate_references = [
+            reference.model_dump(mode="json")
+            for reference in row.candidate_references
+        ]
+        primary_reference = candidate_references[0]
         cell_id = f"{blueprint_id}-row-{index:02d}"
-        sit = situation_lookup.get(row.situation_id, {})
+        sit = situation_lookup.get(
+            (
+                primary_reference["mechanism_id"],
+                primary_reference["situation_id"],
+            ),
+            {},
+        )
         cell = {
             "cell_id": cell_id,
-            **row.model_dump(mode="json"),
+            "facet_id": row.facet_id,
+            "behavior_id": row.behavior_id,
+            "mechanism_id": primary_reference["mechanism_id"],
+            "situation_id": primary_reference["situation_id"],
+            "candidate_references": candidate_references,
             "domain": sit.get("domain"),
             "actor_relation": sit.get("actor_relation"),
             "event_class": sit.get("event_class"),
-            "activation_mechanism": mechanism_lookup.get(row.mechanism_id),
+            "activation_mechanism": mechanism_lookup.get(
+                primary_reference["mechanism_id"]
+            ),
             "planned_generation_count": generation_counts[index - 1],
             "planned_retention_count": retention_counts[index - 1],
         }
         cells.append(cell)
-        for slot_index in range(1, generation_counts[index - 1] + 1):
+        for slot_index, candidate_reference in enumerate(
+            candidate_references, start=1
+        ):
             slots.append(
                 {
                     "specification_id": f"{cell_id}-slot-{slot_index}",
                     "blueprint_cell_id": cell_id,
+                    "candidate_reference": candidate_reference,
                 }
             )
     blueprint = {
@@ -212,6 +239,7 @@ def resolve_blueprint_design(
     cell: Mapping[str, Any],
     *,
     expansions: list[FacetExpansion] | None = None,
+    candidate_reference: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     profile = blueprint["construct_profile_snapshot"]
     facet = next(
@@ -230,13 +258,16 @@ def resolve_blueprint_design(
         row for row in expansion.behavior_expansions
         if row.behavior_id == cell.get("behavior_id")
     )
+    reference = candidate_reference or cell
+    mechanism_id = reference.get("mechanism_id")
+    situation_id = reference.get("situation_id")
     mechanism = next(
         row for row in behavior_expansion.mechanisms
-        if row.mechanism_id == cell.get("mechanism_id")
+        if row.mechanism_id == mechanism_id
     )
     situation = next(
         row for row in mechanism.situations
-        if row.situation_id == cell.get("situation_id")
+        if row.situation_id == situation_id
     )
     return {
         "facet": deepcopy(facet),
@@ -372,6 +403,7 @@ def validate_generation_blueprint(
         errors["expansion_refs"] = "必须逐一覆盖当前 facet"
     cell_ids = set()
     combinations = set()
+    candidate_combinations: dict[tuple[str, str, str, str], str] = {}
     for index, cell in enumerate(cells):
         prefix = f"cells[{index}]"
         if not isinstance(cell, Mapping):
@@ -382,7 +414,7 @@ def validate_generation_blueprint(
             "situation_id", "planned_generation_count",
             "planned_retention_count",
             "domain", "actor_relation", "event_class",
-            "activation_mechanism",
+            "activation_mechanism", "candidate_references",
         }
         if set(cell) != required:
             errors[prefix] = "字段无效"
@@ -399,6 +431,38 @@ def validate_generation_blueprint(
         if combination in combinations:
             errors[f"{prefix}.reference"] = "同一引用组合不得重复成行"
         combinations.add(combination)
+        candidate_references = cell.get("candidate_references")
+        if (
+            not isinstance(candidate_references, list)
+            or len(candidate_references) != INCREMENTAL_CANDIDATES_PER_CELL
+            or any(
+                not isinstance(reference, Mapping)
+                or set(reference) != {"mechanism_id", "situation_id"}
+                or not _text(reference.get("mechanism_id"))
+                or not _text(reference.get("situation_id"))
+                for reference in candidate_references or []
+            )
+        ):
+            errors[f"{prefix}.candidate_references"] = (
+                f"必须包含 {INCREMENTAL_CANDIDATES_PER_CELL} 个有效候选引用"
+            )
+            candidate_references = []
+        else:
+            candidate_pairs = [
+                (
+                    str(reference["mechanism_id"]),
+                    str(reference["situation_id"]),
+                )
+                for reference in candidate_references
+            ]
+            if len(candidate_pairs) != len(set(candidate_pairs)):
+                errors[f"{prefix}.candidate_references"] = (
+                    "同一测量单元的候选情境不得重复"
+                )
+            if (mechanism_id, situation_id) != candidate_pairs[0]:
+                errors[f"{prefix}.reference"] = (
+                    "主引用必须与第一个候选引用一致"
+                )
         if facet_id not in facet_ids or (facet_id, behavior_id) not in behavior_refs:
             errors[f"{prefix}.reference"] = "facet或behavior引用无效"
         elif (facet_id, behavior_id, mechanism_id) not in mechanism_refs:
@@ -407,6 +471,26 @@ def validate_generation_blueprint(
             facet_id, behavior_id, mechanism_id, situation_id
         ) not in situation_refs:
             errors[f"{prefix}.situation_id"] = "引用无效"
+        for reference in candidate_references:
+            if not isinstance(reference, Mapping):
+                continue
+            candidate_combination = (
+                facet_id,
+                behavior_id,
+                str(reference.get("mechanism_id") or ""),
+                str(reference.get("situation_id") or ""),
+            )
+            if candidate_combination not in situation_refs:
+                errors[f"{prefix}.candidate_references"] = "候选情境引用无效"
+            first_cell = candidate_combinations.get(candidate_combination)
+            if first_cell is not None and first_cell != prefix:
+                errors[f"{prefix}.candidate_references"] = (
+                    "候选情境引用 "
+                    f"{candidate_combination[2]}/{candidate_combination[3]} "
+                    f"已在 {first_cell} 使用，不得在不同测量单元重复"
+                )
+            elif first_cell is None:
+                candidate_combinations[candidate_combination] = prefix
         generated = cell.get("planned_generation_count")
         retained = cell.get("planned_retention_count")
         retention_valid = (
@@ -414,7 +498,11 @@ def validate_generation_blueprint(
             and not isinstance(retained, bool)
             and retained >= 0
         )
-        if not _positive_int(generated) or not retention_valid:
+        if (
+            not _positive_int(generated)
+            or generated < INCREMENTAL_CANDIDATES_PER_CELL
+            or not retention_valid
+        ):
             errors[f"{prefix}.counts"] = "生成题数必须为正整数，保留题数不得为负"
         elif retained > generated:
             errors[f"{prefix}.counts"] = "保留题数不得超过生成题数"
@@ -457,8 +545,17 @@ def materialize_item_specifications(
         if not isinstance(skeleton, Mapping):
             continue
         cell = cells[str(slot["blueprint_cell_id"])]
+        candidate_reference = slot.get("candidate_reference")
+        if not isinstance(candidate_reference, Mapping):
+            candidate_reference = {
+                "mechanism_id": cell["mechanism_id"],
+                "situation_id": cell["situation_id"],
+            }
         design = resolve_blueprint_design(
-            blueprint, cell, expansions=expansions
+            blueprint,
+            cell,
+            expansions=expansions,
+            candidate_reference=candidate_reference,
         )
         options = {
             row["behavioral_level"]: row
@@ -472,8 +569,8 @@ def materialize_item_specifications(
                 "blueprint_cell_id": cell["cell_id"],
                 "target_dimension_id": cell["facet_id"],
                 "behavior_evidence_id": cell["behavior_id"],
-                "mechanism_id": cell["mechanism_id"],
-                "situation_id": cell["situation_id"],
+                "mechanism_id": candidate_reference["mechanism_id"],
+                "situation_id": candidate_reference["situation_id"],
                 "context_category": situation["domain"],
                 "context_seed": situation["event_class"],
                 "situation_type": skeleton["situation_type"],

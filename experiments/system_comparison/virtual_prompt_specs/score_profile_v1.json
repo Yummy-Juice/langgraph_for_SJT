@@ -1,0 +1,12 @@
+{
+  "prompt_id": "score_profile_v1",
+  "label": "当前纯分数提示词",
+  "description": "保留现有显式人格分数逻辑，作为基线条件。",
+  "persona_information": "提供系统预先设定的人格维度分数，不提供行为总结。",
+  "response_behavior": "根据显式人格分数直接选择SJT选项；IPIP使用1至5级标准自陈作答。",
+  "persona_input": "score_values",
+  "sjt_response_mode": "single_selection",
+  "ipip_response_mode": "likert_1_5",
+  "version": "score-profile-v1-frozen",
+  "template": ""
+}

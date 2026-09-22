@@ -20,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RUN_KNOWLEDGE_ROOT = PROJECT_ROOT / "outputs" / "run_knowledge"
 
 _MAX_VALIDATION_RETRIES = 2
+BLUEPRINT_SEMANTIC_RETRY_ATTEMPTS = 2
+INCREMENTAL_CANDIDATES_PER_CELL = 2
 
 
 class SituationDraft(StrictModel):
@@ -63,11 +65,18 @@ class FacetExpansion(StrictModel):
     behavior_expansions: list[BehaviorExpansionRecord] = Field(min_length=1)
 
 
+class BlueprintCandidateReference(StrictModel):
+    mechanism_id: str = Field(min_length=1)
+    situation_id: str = Field(min_length=1)
+
+
 class BlueprintRowDraft(StrictModel):
     facet_id: str = Field(min_length=1)
     behavior_id: str = Field(min_length=1)
-    mechanism_id: str = Field(min_length=1)
-    situation_id: str = Field(min_length=1)
+    candidate_references: list[BlueprintCandidateReference] = Field(
+        min_length=INCREMENTAL_CANDIDATES_PER_CELL,
+        max_length=INCREMENTAL_CANDIDATES_PER_CELL,
+    )
 
 
 class BlueprintAgentOutput(StrictModel):
@@ -115,10 +124,11 @@ behavior evidence.
 OUTPUT SCOPE
 
 The input includes required_situation_count. Across all behavior expansions,
-return at least that many unique situation entries. Distribute the required
+return exactly that many unique situation entries. Distribute the required
 situations across supported mechanisms without forcing extra mechanisms. A
 mechanism may contain one or more situations. Do not duplicate situations
-through superficial wording changes merely to satisfy capacity.
+through superficial wording changes merely to satisfy capacity. Do not return
+more or fewer situation entries than requested.
 
 For each supplied behavior_id, return exactly one behavior expansion. Preserve
 the supplied behavior_id and do not create new IDs.
@@ -265,14 +275,14 @@ Each situation entry contains exactly:
 
 * domain;
 * actor_relation;
-* abstract_event_class.
+* event_class.
 
 domain identifies a broad area of ordinary life relevant to target_population.
 
 actor_relation identifies the relationship and any psychologically relevant
 role feature, without inventing unnecessary personal detail.
 
-abstract_event_class must describe the trait-relevant cue and decision tension,
+event_class must describe the trait-relevant cue and decision tension,
 not merely name a generic activity. Avoid broad labels such as:
 
 * asking for help;
@@ -281,7 +291,7 @@ not merely name a generic activity. Avoid broad labels such as:
 * giving feedback;
 * resolving a conflict.
 
-The abstract_event_class must be abstract enough to support multiple later SJT
+The event_class must be abstract enough to support multiple later SJT
 items but specific enough to preserve:
 
 * the activation cue;
@@ -328,20 +338,30 @@ the object.
 
 BLUEPRINT_PROMPT = """
 Design a PSJT two-way specification table from the supplied facets, behavior
-evidence expansions, and the exact requested item count. The measurement
-axis is facet plus behavior_id. The situation axis is mechanism_id plus
-situation_id.
+evidence expansions, and the exact requested final item count. The measurement
+axis is facet plus behavior_id. The candidate situation axis is mechanism_id
+plus situation_id.
 
-Return exactly row_total unique rows, ordered by construct coverage. row_total
-equals the requested item count, and Expansion has already prepared at least
-that many unique reference combinations. Each row becomes exactly one item.
+Return exactly row_total unique measurement rows, ordered by construct
+coverage. row_total equals the requested final item count. Each row must
+contain exactly two candidate_references, so the program can generate two
+candidate items for the same measurement cell and retain one later. Expansion
+has prepared a situation pool larger than generation_total; select exactly
+generation_total unique situation references from it.
 Do not return generation or retention counts.
 
-Every row must cite IDs exactly as supplied. Prioritize construct
-representation: cover every supplied behavior_id when the requested count allows,
-and cover multiple mechanisms within a behavior when available slots allow.
-Do not concentrate rows merely to simplify selection. Do not generate item
-content, explanations, row IDs, or duplicated combinations.
+Every candidate reference must cite IDs exactly as supplied. The two
+candidates in one row must use different situation references. Prefer
+different activation mechanisms when the evidence supports them; when they
+share a mechanism, their situation entries must represent substantively
+different pressure structures or competing priorities, not merely different
+locations, actors, names, or wording. Do not create or infer IDs.
+
+Prioritize construct representation: cover every supplied behavior_id when the
+requested count allows, and cover multiple mechanisms within a behavior when
+available candidate references allow. Do not concentrate rows merely to
+simplify selection. Do not generate item content, explanations, row IDs, or
+duplicated combinations.
 
 EVIDENCE-GUIDED SELECTION
 
@@ -365,12 +385,17 @@ Reject any mechanism whose activation_mechanism:
 
 When a mechanism is rejected, do not select any of its situations.
 Prefer mechanisms whose activation_mechanism operates on the same
-behavioral dimension the evidence defines, so that the selected rows
-remain construct-pure.
+behavioral dimension the evidence defines, so that both candidates in every
+row remain construct-pure.
 
-If the available mechanisms cannot supply row_total unique construct-
-pure rows, return the maximum construct-pure subset and let the program
-raise an error rather than padding with out-of-scope mechanisms.
+If blueprint_semantic_feedback is supplied in the task input, treat it as a hard
+correction to the previous proposal. Replace the cited candidate references
+and re-check global uniqueness across all rows before returning the object.
+
+If the available mechanisms cannot supply row_total rows with two unique,
+construct-pure candidate references each, return the maximum construct-pure
+subset and let the program raise an error rather than padding with out-of-
+scope mechanisms or repeating a situation.
 """.strip()
 
 
@@ -434,7 +459,8 @@ def assign_expansion_ids(
 
 
 def expansion_cache_path(run_id: str, facet_id: str) -> Path:
-    return DEFAULT_RUN_KNOWLEDGE_ROOT / run_id / "expansions" / f"{facet_id}.json"
+    from sjt_system.runtime.output_paths import scoped_output
+    return scoped_output("run_knowledge", DEFAULT_RUN_KNOWLEDGE_ROOT) / run_id / "expansions" / f"{facet_id}.json"
 
 
 def load_facet_expansion(path: Path | str) -> FacetExpansion:
@@ -457,6 +483,7 @@ async def ensure_facet_expansion(
     path = expansion_cache_path(run_id, str(facet["facet_id"]))
     if path.exists():
         cached = load_facet_expansion(path)
+        # 数量满足“至少”即可：蓝图从情境池中选取所需条目，池子偏大不影响
         if expansion_situation_count(cached) >= required_situation_count:
             return cached
     runnable = agent or create_expansion_agent()
@@ -465,10 +492,10 @@ async def ensure_facet_expansion(
         revision = ""
         if attempt:
             revision = (
-                f"上一候选只有 {last_count} 个情境条目，少于当前需要的 "
+                f"上一候选有 {last_count} 个情境条目，但至少需要 "
                 f"{required_situation_count} 个。保持现有 Behavior Evidence 和"
-                "实质机制边界，通过增加真实不同的情境条目补足容量；不要为凑数"
-                "创建重复机制。"
+                "实质机制边界；如果数量不足，增加真实不同的情境条目；"
+                "不要为凑数创建重复机制或同质情境。"
             )
         expansion = await _generate_expansion(
             runnable,
@@ -482,15 +509,13 @@ async def ensure_facet_expansion(
         last_count = expansion_situation_count(expansion)
         if last_count < required_situation_count:
             continue
-        # Expansion is an offline design proposal. Its schema, stable IDs and
-        # requested capacity are checked here; semantic quality is handled by
-        # the unified item review after realization, not by one LLM call per
-        # mechanism.
+        # 数量满足“至少”即接受（不足才重试，偏大直接用）；
+        # Expansion 是离线设计提案，语义质量由统一审题把关。
         break
     else:
         raise ValueError(
-            f"Behavior Expansion 仅提供 {last_count} 个情境条目，"
-            f"无法满足当前 {required_situation_count} 道题的容量要求"
+            f"Behavior Expansion 最终提供 {last_count} 个情境条目，"
+            f"但至少需要 {required_situation_count} 个"
         )
     expected_behavior_ids = {
         str(row["behavior_id"]) for row in behavior_evidence
@@ -680,6 +705,7 @@ async def propose_blueprint_rows(
     expansions: list[FacetExpansion],
     generation_total: int,
     retention_total: int,
+    retry_feedback: str = "",
     agent: Any | None = None,
 ) -> BlueprintAgentOutput:
     runnable = agent or create_blueprint_agent()
@@ -694,35 +720,39 @@ async def propose_blueprint_rows(
             "Behavior Expansion 的唯一情境引用不足："
             f"需要 {generation_total} 个，实际 {available_reference_count} 个"
         )
-    row_total = generation_total
+    row_total = retention_total
     if row_total < 1:
         raise ValueError("Behavior Expansion 没有可用于蓝图的情境引用")
+    input_data: dict[str, Any] = {
+        "facets": [
+            {
+                "facet_id": facet["facet_id"],
+                "facet_name": facet["facet_name"],
+                "behavior_evidence": [
+                    {
+                        "behavior_id": ev["behavior_id"],
+                        "behavior_dimension": ev["behavior_dimension"],
+                        "high_expression": ev["high_expression"],
+                        "low_expression": ev["low_expression"],
+                        "boundary_condition": ev["boundary_condition"],
+                    }
+                    for ev in (facet.get("behavior_evidence") or [])
+                ],
+            }
+            for facet in profile.get("facets") or []
+        ],
+        "expansions": [row.model_dump(mode="json") for row in expansions],
+        "generation_total": generation_total,
+        "retention_total": retention_total,
+        "row_total": row_total,
+        "candidate_count_per_row": INCREMENTAL_CANDIDATES_PER_CELL,
+    }
+    if retry_feedback:
+        input_data["blueprint_semantic_feedback"] = retry_feedback
     raw = await ainvoke_model_with_schema_repair(
         runnable,
         {
-            "input_data": {
-                "facets": [
-                    {
-                        "facet_id": facet["facet_id"],
-                        "facet_name": facet["facet_name"],
-                        "behavior_evidence": [
-                            {
-                                "behavior_id": ev["behavior_id"],
-                                "behavior_dimension": ev["behavior_dimension"],
-                                "high_expression": ev["high_expression"],
-                                "low_expression": ev["low_expression"],
-                                "boundary_condition": ev["boundary_condition"],
-                            }
-                            for ev in (facet.get("behavior_evidence") or [])
-                        ],
-                    }
-                    for facet in profile.get("facets") or []
-                ],
-                "expansions": [row.model_dump(mode="json") for row in expansions],
-                "generation_total": generation_total,
-                "retention_total": retention_total,
-                "row_total": row_total,
-            }
+            "input_data": input_data,
         },
         job_label="双向细目表设计",
     )
