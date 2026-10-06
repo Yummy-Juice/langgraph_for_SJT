@@ -1,6 +1,7 @@
 """Dispatch LLM-backed and deterministic workflow actions."""
 
 import asyncio
+import os
 from collections.abc import Mapping
 from copy import deepcopy
 from time import perf_counter
@@ -30,9 +31,11 @@ from sjt_system.authoring.generation_plan import (
     GENERATION_BLUEPRINT_VERSION,
     materialize_item_specifications,
     planned_generation_count,
+    repair_blueprint_proposal,
     required_expansion_situation_total,
     validate_generation_blueprint,
     required_generation_total,
+    resolve_facet_item_counts,
     resolve_blueprint_design,
 )
 from sjt_system.state import ItemRepairResult, PSJTRouteDecision, PSJTState
@@ -57,12 +60,17 @@ from sjt_system.authoring.bank import (
 )
 from sjt_system.agent.retry import ainvoke_model_with_schema_repair
 from sjt_system.runtime.progress import emit_progress
+from sjt_system.runtime.concurrency import UnlimitedConcurrency, gather_all
 from sjt_system.runtime.telemetry import (
     aggregate_iteration_calls,
     iteration_context,
     read_ledger,
 )
 from sjt_system.runtime.trace import utc_timestamp
+from sjt_system.runtime.iteration_metrics import (
+    persist_iteration_metrics_snapshot,
+    validate_same_measurement,
+)
 from sjt_system.evaluation.simulation import (
     run_single_item_virtual_retest,
     run_virtual_response_simulation,
@@ -78,6 +86,11 @@ from sjt_system.evaluation.form_metrics import (
     build_provisional_form_metrics,
     form_quality_summary,
 )
+from sjt_system.evaluation.round_results import (
+    build_iteration_metrics_snapshot,
+    build_facet_iteration_metric,
+    build_item_iteration_metric,
+)
 from sjt_system.evaluation.selection import (
     build_psychometric_repair_evidence,
     _psychometric_repair_entry,
@@ -86,7 +99,17 @@ from sjt_system.evaluation.selection import (
     validate_psychometric_repair_diagnosis,
 )
 from sjt_system.evaluation.form_optimizer import optimize_test_form_with_agent
+from sjt_system.evaluation.virtual_content_review import (
+    MAX_MEASUREMENTS,
+    PROTOCOL as VIRTUAL_CONTENT_REVIEW_PROTOCOL,
+    build_virtual_content_repair_entry,
+    iteration_gates_pass,
+    is_enabled as virtual_content_review_enabled,
+    round_label as virtual_content_round_label,
+)
+from sjt_system.workflow.replacement_policy import replacement_capacity_available
 from sjt_system.evaluation.diagnosis import (
+    build_scenario_repair_entry,
     build_construct_diagnosis_evidence,
     build_deterministic_forced_vts_repair_advice,
     build_deterministic_defer_advice,
@@ -113,8 +136,17 @@ from sjt_system.authoring.situation_space import (
 )
 from sjt_system.delivery.assembly import run_test_assembly
 from sjt_system.delivery.lifecycle import run_test_rescore, run_test_review
-from sjt_system.delivery.reporting import run_report_generation
+from sjt_system.delivery.reporting import (
+    development_round_batch_label,
+    run_report_generation,
+)
 from sjt_system.workflow.constants import PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS
+from sjt_system.evaluation.facet_iteration import (
+    is_enabled as fixed_facet_iteration_enabled,
+    ensure_measurement_allowed,
+    facet_repair_candidates,
+    record_measurement as record_facet_measurement,
+)
 
 
 MAX_ITEM_OUTPUT_CANDIDATES = 2
@@ -125,13 +157,14 @@ def _development_iteration_for_action(
     action: str,
     state: Mapping[str, Any],
 ) -> int | None:
-    """Return the development iteration that should own model-call usage."""
+    """Return the measurement batch that owns model-call usage."""
 
     current_round = int(state.get("psychometric_analysis_round") or 0)
     if action == "psychometric_repair_batch":
         return max(1, current_round)
     if action in {
         "generate_item",
+        "generate_items_batch",
         "regenerate_item",
         "review_item",
         "simulate_responses",
@@ -212,10 +245,18 @@ async def _build_provisional_iteration_record(
     test_statistics = state.get("test_statistics")
     optimizer_result: dict[str, Any] | None = None
     selection_error: str | None = None
+    optimizer_candidates = candidates
+    if fixed_facet_iteration_enabled(state):
+        accepted = state["facet_iteration_state"].get("accepted_facets") or {}
+        optimizer_candidates = [
+            item for item in candidates
+            if str(item.get("target_dimension_id")) not in accepted
+            or str(item.get("item_id")) in accepted[str(item.get("target_dimension_id"))]["selected_item_ids"]
+        ]
     try:
         optimizer_result = await optimize_test_form_with_agent(
             state,
-            candidates,
+            optimizer_candidates,
             item_statistics,
             test_statistics if isinstance(test_statistics, Mapping) else None,
         )
@@ -224,7 +265,7 @@ async def _build_provisional_iteration_record(
         ]
     except Exception as exc:
         selection_error = str(exc)
-        selected_ids = _partial_provisional_form_ids(state, candidates)
+        selected_ids = _partial_provisional_form_ids(state, optimizer_candidates)
 
     final_item_count = sum(
         int(cell.get("planned_retention_count") or 0)
@@ -232,18 +273,38 @@ async def _build_provisional_iteration_record(
         if isinstance(cell, Mapping)
     )
     form_metrics = build_provisional_form_metrics(state, selected_ids)
-    qualified_count = sum(
-        1
-        for item_id in candidates
-        if (
-            (item_statistics.get(str(item_id.get("item_id"))) or {})
-            .get("quality_evaluation", {})
-            .get("recommendation")
-            == "retain"
+    candidate_by_id = {
+        str(item.get("item_id")): item
+        for item in candidates
+        if isinstance(item, Mapping) and item.get("item_id") is not None
+    }
+    candidate_item_metrics = {
+        str(item_id): build_item_iteration_metric(
+            str(item_id),
+            item_statistics.get(str(item_id)) or {},
+            candidate_by_id.get(str(item_id)),
         )
-        and isinstance(item_id, Mapping)
+        for item_id in candidate_by_id
+    }
+    for item_id, metric in candidate_item_metrics.items():
+        metric["selected_for_form"] = item_id in selected_ids
+    item_metrics = {
+        item_id: metric
+        for item_id, metric in candidate_item_metrics.items()
+        if item_id in selected_ids
+    }
+    facet_metrics = {
+        str(row.get("sjt_facet_id")): build_facet_iteration_metric(row)
+        for row in (form_metrics.get("facet_metrics") or [])
+        if isinstance(row, Mapping) and row.get("sjt_facet_id") is not None
+    }
+    qualified_count = sum(
+        1 for item in candidates if isinstance(item, Mapping)
+        and (iteration_gates_pass(item_statistics.get(str(item.get("item_id"))) or {})
+             if virtual_content_review_enabled(state)
+             else (item_statistics.get(str(item.get("item_id"))) or {}).get("quality_evaluation", {}).get("recommendation") == "retain")
     )
-    return {
+    record = {
         "analysis_round": iteration,
         "recorded_at": utc_timestamp(),
         "candidate_count": len(candidates),
@@ -252,11 +313,43 @@ async def _build_provisional_iteration_record(
         "item_count": len(selected_ids),
         "form_status": "complete" if len(selected_ids) == final_item_count else "incomplete",
         "form_item_ids": selected_ids,
+        "item_metrics": item_metrics,
+        "candidate_item_metrics": candidate_item_metrics,
+        "facet_metrics": facet_metrics,
         "form_metrics": form_metrics,
         "form_optimizer": deepcopy(optimizer_result),
         "form_selection_error": selection_error,
         "token_usage": _iteration_token_usage(state, iteration),
     }
+    if virtual_content_review_enabled(state):
+        record.update(
+            virtual_content_review_protocol=VIRTUAL_CONTENT_REVIEW_PROTOCOL,
+            round_label=virtual_content_round_label(iteration),
+            workflow_stage="initial_measurement" if iteration == 1 else "virtual_content_review",
+            item_snapshots=deepcopy(candidate_by_id),
+            item_statistics_snapshot=deepcopy(item_statistics),
+            item_content_evidence=deepcopy(state.get("item_content_evidence") or {}),
+            item_lineage=deepcopy(state.get("item_lineage") or {}),
+            response_data_ref=state.get("virtual_response_data_ref"),
+            item_bank_id=state.get("item_bank_id"),
+            item_bank_version=state.get("item_bank_version"),
+            item_dispositions=deepcopy(state.get("item_final_dispositions") or {}),
+            virtual_sample_config=deepcopy(state.get("virtual_sample_config")),
+        )
+    if fixed_facet_iteration_enabled(state):
+        record.update(
+            iteration_policy_version=state["facet_iteration_state"]["policy_version"],
+            development_round=state["facet_iteration_state"]["development_round"],
+            measurement_batch=iteration,
+            development_round_batch=(
+                int(state["facet_iteration_state"].get("development_round_batch") or 0) + 1
+            ),
+            round_label=f"第{state['facet_iteration_state']['development_round']}轮",
+        )
+    artifact_path = persist_iteration_metrics_snapshot(state, record)
+    if artifact_path:
+        record["iteration_metrics_artifact"] = artifact_path
+    return record
 
 
 def _upsert_iteration_record(
@@ -273,11 +366,55 @@ def _upsert_iteration_record(
     refreshed["token_usage"] = _iteration_token_usage(state, iteration)
     for index, existing in enumerate(output):
         if int(existing.get("analysis_round") or 0) == iteration:
+            # Older in-memory/checkpoint records may only contain the legacy
+            # ``candidate_item_metrics`` field. Do not compare those records
+            # with the newer canonical snapshot shape: the durable artifact
+            # writer below is the authority for immutable measured values.
+            # Once both sides carry canonical ``item_metrics``, keep the
+            # overwrite guard active for resumed/current runs.
+            if (
+                virtual_content_review_enabled(state)
+                and isinstance(existing.get("item_metrics"), Mapping)
+                and isinstance(refreshed.get("item_metrics"), Mapping)
+            ):
+                validate_same_measurement(
+                    build_iteration_metrics_snapshot(existing, run_id=state.get("run_id")),
+                    build_iteration_metrics_snapshot(refreshed, run_id=state.get("run_id")),
+                )
+            # A later selection/annotation pass can carry less metric detail
+            # than the analysis pass. Preserve the already-persisted snapshot
+            # instead of replacing it with an empty or unavailable value.
+            for field in (
+                "item_metrics",
+                "candidate_item_metrics",
+                "facet_metrics",
+                "iteration_metrics_artifact",
+            ):
+                if not refreshed.get(field) and existing.get(field):
+                    refreshed[field] = deepcopy(existing[field])
+            existing_form = existing.get("form_metrics")
+            refreshed_form = refreshed.get("form_metrics")
+            existing_facets = (
+                existing_form.get("facet_metrics")
+                if isinstance(existing_form, Mapping)
+                else None
+            )
+            refreshed_facets = (
+                refreshed_form.get("facet_metrics")
+                if isinstance(refreshed_form, Mapping)
+                else None
+            )
+            if existing_facets and not refreshed_facets:
+                refreshed["form_metrics"] = deepcopy(existing_form)
             output[index] = refreshed
             break
     else:
         output.append(refreshed)
     output.sort(key=lambda row: int(row.get("analysis_round") or 0))
+    if virtual_content_review_enabled(state):
+        artifact = persist_iteration_metrics_snapshot(state, refreshed)
+        if artifact:
+            refreshed["iteration_metrics_artifact"] = artifact
     return output
 
 
@@ -296,6 +433,13 @@ def _annotate_iteration_quality(
     annotated: list[dict[str, Any]] = []
     for entry in history:
         row = deepcopy(dict(entry))
+        if (
+            plateau_status.get("objective_source") == "ipip_facet_gates_v4"
+            and (row.get("form_metrics") or {}).get("metric_framework")
+            != "virtual_form_response_transmission_v4"
+        ):
+            annotated.append(row)
+            continue
         round_number = int(row.get("analysis_round") or 0)
         quality_row = trajectory.get(round_number) or {}
         summary = form_quality_summary(row.get("form_metrics") or {})
@@ -331,6 +475,14 @@ async def execute_psychometric_analysis_with_provisional_form(
     deciding whether to enter the single-item repair queue.
     """
 
+    ensure_measurement_allowed(state)
+    if (
+        virtual_content_review_enabled(state)
+        and not fixed_facet_iteration_enabled(state)
+        and int(state.get("psychometric_analysis_round") or 0) >= MAX_MEASUREMENTS
+        and not state.get("deferred_replacement_measurement_pending")
+    ):
+        raise ValueError("首测及三轮虚拟内容复审已完成，且当前没有待测同槽位替代题")
     result = await asyncio.to_thread(run_psychometric_analysis, state)
     state_update = result.get("state_update")
     if not isinstance(state_update, dict):
@@ -347,6 +499,19 @@ async def execute_psychometric_analysis_with_provisional_form(
     ]
     if not candidates:
         raise ValueError("心理测量分析后缺少冻结题库，无法临时组卷")
+    if virtual_content_review_enabled(state):
+        content_evidence = deepcopy(state.get("item_content_evidence") or {})
+        for item in candidates:
+            item_id = str(item["item_id"])
+            evidence = content_evidence.setdefault(item_id, {"status": "not_evaluated"})
+            evidence["last_measured_version"] = item["version"]
+            evidence["last_measurement_round"] = analysis_state["psychometric_analysis_round"]
+            if evidence.get("status") == "pending_remeasurement":
+                evidence["status"] = "virtually_remeasured"
+            # A statistical retest does not invent an unperformed interview.
+            evidence["evidence_scope"] = "exploratory_virtual_development_evidence"
+        state_update["item_content_evidence"] = content_evidence
+        analysis_state["item_content_evidence"] = content_evidence
 
     provisional = await _build_provisional_iteration_record(
         analysis_state,
@@ -359,6 +524,21 @@ async def execute_psychometric_analysis_with_provisional_form(
         if isinstance(row, Mapping)
         and int(row.get("analysis_round") or 0) != iteration
     ]
+    if fixed_facet_iteration_enabled(state):
+        controller = record_facet_measurement(analysis_state, provisional)
+        provisional.update(
+            facet_iteration_state=deepcopy(controller),
+            round_completed=controller["completed_rounds"] > state["facet_iteration_state"]["completed_rounds"],
+        )
+        history = _upsert_iteration_record(prior_history, provisional, state=analysis_state)
+        return {
+            **result,
+            "state_update": {
+                **state_update, "facet_iteration_state": controller,
+                "psychometric_iteration_history": history, "psychometric_plateau_status": None,
+                "deferred_replacement_measurement_pending": False,
+            },
+        }
     plateau_status = assess_form_plateau(
         [*prior_history, provisional],
         patience=int(
@@ -388,31 +568,66 @@ async def execute_psychometric_analysis_with_provisional_form(
         **state_update,
         "psychometric_iteration_history": iteration_history,
         "psychometric_plateau_status": deepcopy(plateau_status),
+        # The extra measurement was consumed; a later deferred replacement
+        # may open the flag again when its same-slot transaction commits.
+        "deferred_replacement_measurement_pending": False,
     }
     return {
         **result,
         "state_update": state_update,
         "summary": (
             f"{result.get('summary') or '心理测量分析完成'}"
-            f" 已完成第 {iteration} 轮临时组卷，"
+            f" 已完成{development_round_batch_label(iteration_history, provisional)}临时组卷，"
             f"整卷指标状态={provisional.get('form_status', 'unknown')}。"
         ),
     }
 
 
 def distribute_situation_quotas(
-    final_item_count: int, facet_count: int
-) -> list[int]:
-    """Distribute the requested unique situations evenly across facets."""
+    total_situations: int,
+    facet_item_counts: Mapping[str, int],
+    *,
+    minimum_situations: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """Allocate expansion situations in proportion to explicit facet quotas.
 
-    final_item_count = int(final_item_count)
-    facet_count = int(facet_count)
-    if final_item_count < 1 or facet_count < 1:
-        raise ValueError("题数和 facet 数必须为正整数")
-    if final_item_count < facet_count:
-        raise ValueError("最终题数必须不少于所选 facet 数")
-    base, remainder = divmod(final_item_count, facet_count)
-    return [base + (1 if index < remainder else 0) for index in range(facet_count)]
+    Each retained item needs the configured number of candidate references.
+    The base allocation therefore reserves that many situations per requested
+    item and puts the remaining expansion buffer back across facets without
+    changing the retained-item quotas.
+    """
+
+    total_situations = int(total_situations)
+    if total_situations < 1 or not facet_item_counts:
+        raise ValueError("情境池总数和 facet 配额必须有效")
+    quotas = {
+        str(facet_id): int(quota)
+        for facet_id, quota in facet_item_counts.items()
+    }
+    if any(quota < 1 for quota in quotas.values()):
+        raise ValueError("facet 配额必须是正整数")
+    minimum = {
+        facet_id: INCREMENTAL_CANDIDATES_PER_CELL * quota
+        for facet_id, quota in quotas.items()
+    }
+    if minimum_situations:
+        for facet_id, required in minimum_situations.items():
+            if facet_id in minimum:
+                minimum[facet_id] = max(minimum[facet_id], int(required))
+    minimum_total = sum(minimum.values())
+    if total_situations < minimum_total:
+        raise ValueError(
+            "情境扩展池不足以为每个保留题提供所需候选情境引用"
+        )
+    result = dict(minimum)
+    remaining = total_situations - minimum_total
+    facet_ids = list(result)
+    index = 0
+    while remaining:
+        result[facet_ids[index % len(facet_ids)]] += 1
+        remaining -= 1
+        index += 1
+    return result
 
 
 class SkeletonDevelopmentFailure(ValueError):
@@ -611,6 +826,15 @@ async def execute_item_review(state: PSJTState) -> dict[str, Any]:
 
 async def execute_virtual_simulation(state: PSJTState) -> dict[str, Any]:
     """Freeze the live candidate pool, then simulate against that exact version."""
+
+    ensure_measurement_allowed(state)
+    if (
+        virtual_content_review_enabled(state)
+        and not fixed_facet_iteration_enabled(state)
+        and int(state.get("psychometric_analysis_round") or 0) >= MAX_MEASUREMENTS
+        and not state.get("deferred_replacement_measurement_pending")
+    ):
+        raise ValueError("首测及三轮虚拟内容复审已完成，且当前没有待测同槽位替代题")
 
     candidate_bank_audit = audit_candidate_item_bank(state)
     freeze_update = build_item_bank_freeze_update(state)
@@ -853,21 +1077,135 @@ def apply_plateau_gap_fills(
     )
 
 
+def _select_fixed_facet_iteration(state: PSJTState) -> dict[str, Any]:
+    """Freeze qualifying versions, then investigate only unfinished facets."""
+    controller = state["facet_iteration_state"]
+    items = {str(item["item_id"]): deepcopy(dict(item)) for item in state.get("frozen_item_bank") or []}
+    statistics = state.get("item_statistics") or {}
+    batch = int(state.get("psychometric_analysis_round") or 0)
+    record = next((row for row in state.get("psychometric_iteration_history") or []
+                   if int(row.get("analysis_round") or 0) == batch), None)
+    if not items or not isinstance(record, Mapping):
+        raise ValueError("Fixed-facet selection requires the committed measurement ledger")
+    dispositions = deepcopy(state.get("item_final_dispositions") or {})
+    locks = dict(state.get("locked_retained_item_versions") or {})
+    for item_id, item in items.items():
+        if iteration_gates_pass(statistics.get(item_id) or {}):
+            if locks.get(item_id) != item["version"] or not (dispositions.get(item_id) or {}).get("qualification_snapshot"):
+                dispositions[item_id] = {
+                    "status": "qualified_locked", "item_version": item["version"],
+                    "retention_basis": "four_iteration_gates_passed",
+                    "qualification_analysis_round": batch,
+                    "qualification_response_data_ref": record.get("response_data_ref"),
+                    "qualification_snapshot": deepcopy(statistics[item_id]),
+                }
+            locks[item_id] = item["version"]
+    base_update = {
+        "locked_retained_item_versions": locks, "item_final_dispositions": dispositions,
+        "psychometric_plateau_status": None, "items_to_regenerate": [],
+        "psychometric_repair_confirmation": None, "active_psychometric_repair": None,
+    }
+    if controller["status"] == "paused":
+        return {"state_update": {
+            **base_update, "status": "stopped", "items_to_revise": [],
+            "selection_results": {"status": "facet_iteration_paused", "reason": controller["paused_reason"]},
+            "virtual_content_review_stop_reason": controller["paused_reason"],
+        }}
+    if controller["status"] == "complete":
+        selected_ids = [item_id for snapshot in controller["baseline_facets"].values()
+                        for item_id in snapshot["selected_item_ids"]]
+        if len(set(selected_ids)) != len(selected_ids) or any(item_id not in items for item_id in selected_ids):
+            raise ValueError("Completed facet forms cannot be resolved to the current item bank")
+        coverage_cells = []
+        for cell in (state.get("blueprint") or {}).get("cells") or []:
+            cell_ids = [item_id for item_id in selected_ids
+                        if items[item_id].get("blueprint_cell_id") == cell["cell_id"]]
+            planned = int(cell.get("planned_retention_count") or 0)
+            coverage_cells.append({"blueprint_cell_id": cell["cell_id"], "planned_retention_count": planned,
+                                   "selected_item_ids": cell_ids, "selected_count": len(cell_ids),
+                                   "passed": len(cell_ids) == planned})
+        if not coverage_cells or not all(cell["passed"] for cell in coverage_cells):
+            raise ValueError("Completed facet forms no longer satisfy the fixed blueprint")
+        for item_id in selected_ids:
+            if not iteration_gates_pass(statistics.get(item_id) or {}):
+                dispositions[item_id] = {
+                    "status": "facet_form_retained", "item_version": items[item_id]["version"],
+                    "retention_basis": "three_successful_facet_rounds", "monitoring_pass": False,
+                    "source_analysis_round": batch,
+                }
+        return {"state_update": {
+            **base_update, "items_to_revise": [],
+            "blueprint_coverage": {"passed": True, "cells": coverage_cells,
+                                   "selected_total": len(selected_ids), "available_total": len(items)},
+            "selection_reasons": {item_id: dispositions[item_id]["retention_basis"] for item_id in selected_ids},
+            "selected_items": [items[item_id] for item_id in selected_ids],
+            "reserve_items": [item for item_id, item in items.items()
+                              if item_id not in selected_ids and iteration_gates_pass(statistics.get(item_id) or {})],
+            "selection_results": {"status": "ready_for_assembly", "iteration_policy_version": controller["policy_version"],
+                                  "completed_rounds": 3, "selected_count": len(selected_ids)},
+            "virtual_content_review_stop_reason": "three_successful_facet_repair_rounds_completed",
+        }}
+    if controller["status"] != "awaiting_repair":
+        raise ValueError("Cannot plan a second repair before the committed changes are measured")
+    selected_ids = set(record.get("form_item_ids") or [])
+    comparisons = {row["sjt_facet_id"]: row for row in controller.get("comparisons") or []}
+    queue = []
+    for facet_id in controller["failed_facet_ids"]:
+        members = [item for item in items.values() if str(item.get("target_dimension_id")) == facet_id]
+        candidates, thaw_selection = facet_repair_candidates(members, statistics)
+        if not candidates and thaw_selection is None:
+            candidates = [item for item in members if str(item["item_id"]) in selected_ids]
+        if not candidates:
+            raise ValueError(f"Failed facet has no version-bound repair candidates: {facet_id}")
+        for item in candidates:
+            item_id = str(item["item_id"])
+            entry = build_virtual_content_repair_entry(
+                state, item, revision_round=int((state.get("psychometric_repair_rounds") or {}).get(item_id) or 0) + 1,
+            )
+            failure = {
+                "facet_id": facet_id, "development_round": controller["development_round"],
+                "comparison": deepcopy(comparisons.get(facet_id) or {}),
+                "baseline_metrics": deepcopy(controller["baseline_facets"][facet_id]["metrics"]),
+                "required_change": (
+                    "All three facet validity values must strictly increase and alpha/ICC must reach .70; "
+                    "qualified items in the bottom quartile of any active item-validity metric receive a full repair."
+                ),
+            }
+            if thaw_selection is not None:
+                failure["qualified_item_thaw"] = True
+                failure["thaw_selection"] = deepcopy(thaw_selection)
+            entry.update(facet_level_failure=True, facet_id=facet_id,
+                         development_round=controller["development_round"], facet_form_failure=failure)
+            entry["diagnosis_evidence"]["facet_form_failure"] = failure
+            if thaw_selection is not None:
+                entry["qualified_item_thaw"] = True
+                entry["thaw_selection"] = deepcopy(thaw_selection)
+            queue.append(entry)
+    return {"state_update": {
+        **base_update, "items_to_revise": queue, "selection_results": None,
+        "selected_items": [], "reserve_items": [],
+        "scenario_repair_progress": {
+            str(entry["item_id"]): deepcopy((state.get("scenario_repair_progress") or {}).get(str(entry["item_id"])))
+                                           or {"status": "planned", "stage": "planning", "rewrite_count": 0,
+                                               "archive_ref": entry.get("content_review_archive_ref")}
+            for entry in queue
+        },
+    }}
+
+
 async def execute_item_selection_with_diagnosis(
     state: PSJTState,
 ) -> dict[str, Any]:
     """Diagnose flagged items and queue all confirmed edits for one item."""
+    if fixed_facet_iteration_enabled(state) and virtual_content_review_enabled(state):
+        return _select_fixed_facet_iteration(state)
     frozen = state.get("frozen_item_bank")
     if not isinstance(frozen, list) or not frozen:
         raise ValueError("心理测量诊断前缺少冻结题库")
     statistics = state.get("item_statistics") or {}
     rounds = dict(state.get("psychometric_repair_rounds") or {})
+    virtual_review = virtual_content_review_enabled(state)
     defer_after_rounds = PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS
-    prior_fingerprints = {
-        str(event.get("diagnosis_fingerprint"))
-        for event in state.get("psychometric_repair_history") or []
-        if isinstance(event, Mapping) and event.get("diagnosis_fingerprint")
-    }
     item_by_id: dict[str, dict[str, Any]] = {}
     for raw_item in frozen:
         if not isinstance(raw_item, Mapping):
@@ -936,7 +1274,7 @@ async def execute_item_selection_with_diagnosis(
         if isinstance(entry, Mapping) and entry.get("item_id") is not None
     }
     queued_item_ids = set(existing_queue_entries)
-    continuing_existing_batch = bool(queued_item_ids)
+    continuing_existing_batch = bool(queued_item_ids) and not virtual_review
 
     retained: list[dict[str, Any]] = []
     # Outer queue: keep every statistically abnormal item here.  The first
@@ -958,11 +1296,11 @@ async def execute_item_selection_with_diagnosis(
     fingerprints: dict[str, str] = {}
     diagnosis_call_count = 0
     diagnosis_events: list[dict[str, Any]] = []
-    diagnosis_jobs: list[dict[str, Any]] = []
     existing_confirmation = state.get("psychometric_repair_confirmation")
     if (
         isinstance(existing_confirmation, Mapping)
         and existing_confirmation.get("status") == "pending"
+        and (existing_confirmation.get("atomic_repair_advice") or {}).get("protocol") == "scenario_detection_first_v1"
     ):
         pending_item_id = str(existing_confirmation.get("item_id") or "")
         pending_entry = next(
@@ -1008,30 +1346,66 @@ async def execute_item_selection_with_diagnosis(
         locked_versions[item_id] = item_version
         dispositions[item_id] = {
             "status": "qualified_locked",
+            "retention_basis": "four_iteration_gates_passed",
             "warning_reason": None,
             "item_version": item_version,
+            "qualification_analysis_round": current_iteration,
             "qualified_at_repair_round": int(rounds.get(item_id, 0)),
             "qualification_snapshot": deepcopy(statistics.get(item_id) or {}),
         }
         reasons[item_id] = reason
 
     for item_id, item in item_by_id.items():
+        item_statistics = statistics.get(item_id) or {}
+        requires_diagnosis = (not iteration_gates_pass(item_statistics)
+                              if virtual_review else item_requires_psychometric_diagnosis(item_statistics))
         if plateau_reached:
             existing_disposition = dispositions.get(item_id)
             if isinstance(existing_disposition, Mapping) and existing_disposition.get(
                 "status"
             ) in {"pending_sme_review", "eliminated"}:
                 continue
+            existing_basis = (
+                existing_disposition.get("retention_basis")
+                if isinstance(existing_disposition, Mapping)
+                else None
+            )
+            previously_gate_qualified = (
+                existing_basis == "four_iteration_gates_passed"
+            )
+            retention_basis = (
+                existing_basis
+                if previously_gate_qualified
+                else (
+                    "four_iteration_gates_passed"
+                    if not requires_diagnosis
+                    else "plateau_retained"
+                )
+            )
+            qualification_snapshot = (
+                deepcopy(existing_disposition.get("qualification_snapshot"))
+                if previously_gate_qualified
+                and isinstance(existing_disposition.get("qualification_snapshot"), Mapping)
+                else deepcopy(statistics.get(item_id) or {})
+            )
             retained.append(deepcopy(item))
             item_version = int(item.get("version") or 0)
             locked_versions[item_id] = item_version
             dispositions[item_id] = {
                 "status": "qualified_locked",
+                "retention_basis": retention_basis,
                 "warning_reason": "整卷指标达到平台期，停止继续自动返修。",
                 "item_version": item_version,
+                "qualification_analysis_round": (
+                    current_iteration
+                    if retention_basis == "four_iteration_gates_passed"
+                    else existing_disposition.get("qualification_analysis_round")
+                    if isinstance(existing_disposition, Mapping)
+                    else None
+                ),
                 "qualified_at_repair_round": int(rounds.get(item_id, 0)),
-                "qualification_snapshot": deepcopy(statistics.get(item_id) or {}),
-                "monitoring_pass": False,
+                "qualification_snapshot": qualification_snapshot,
+                "monitoring_pass": not requires_diagnosis if virtual_review else False,
                 "monitoring_metrics": deepcopy(statistics.get(item_id) or {}),
             }
             reasons[item_id] = "整卷指标达到平台期，保留当前最佳组卷候选。"
@@ -1047,6 +1421,9 @@ async def execute_item_selection_with_diagnosis(
             and isinstance(existing_queue_entry, Mapping)
             and isinstance(
                 existing_queue_entry.get("atomic_repair_advice"), Mapping
+            )
+            and existing_queue_entry["atomic_repair_advice"].get("protocol") == (
+                VIRTUAL_CONTENT_REVIEW_PROTOCOL if virtual_review else "scenario_detection_first_v1"
             )
         ):
             # This item has already been diagnosed in the current outer
@@ -1065,14 +1442,15 @@ async def execute_item_selection_with_diagnosis(
             in {"pending_sme_review", "eliminated"}
         ):
             continue
-        item_statistics = statistics.get(item_id) or {}
-        completed_rounds = int(rounds.get(item_id, 0))
+        root_id = (state.get("item_lineage") or {}).get(item_id, {}).get("root_item_id", item_id)
+        completed_rounds = max(int(rounds.get(item_id, 0)), int(rounds.get(root_id, 0)))
         if locked_versions.get(item_id) == int(item.get("version") or 0):
             retained.append(deepcopy(item))
-            monitored_pass = not item_requires_psychometric_diagnosis(item_statistics)
+            monitored_pass = not requires_diagnosis
             dispositions[item_id] = {
                 **deepcopy(dict(existing_disposition or {})),
                 "status": "qualified_locked",
+                "retention_basis": (existing_disposition or {}).get("retention_basis", "previously_qualified_locked"),
                 "item_version": item.get("version"),
                 "monitoring_pass": monitored_pass,
                 "monitoring_metrics": deepcopy(item_statistics),
@@ -1087,15 +1465,81 @@ async def execute_item_selection_with_diagnosis(
                     }
                 )
             continue
-        if not item_requires_psychometric_diagnosis(item_statistics):
+        if not requires_diagnosis:
             accept(
                 item_id,
                 item,
                 reason=(
-                    "合并分数档后的CITC、条件目标相关、同域条件VTS与跨域条件VTS"
-                    "均达到虚拟迭代阈值。"
+                    "合并分数档后的CITC及三项单题IPIP指标均达到四项虚拟迭代阈值；"
+                    "条件目标相关与两项VTS仅作诊断。"
                 ),
             )
+            continue
+        if virtual_review:
+            if current_iteration >= MAX_MEASUREMENTS or completed_rounds >= defer_after_rounds:
+                # A deferred item is a discarded candidate, never a temporary
+                # form fill.  Queue a replacement-only transaction so the
+                # same blueprint slot is occupied again and measured next.
+                if replacement_capacity_available(state, str(item_id)):
+                    queue_entry = build_virtual_content_repair_entry(
+                        state, item, revision_round=completed_rounds + 1,
+                    )
+                    queue_entry.update(
+                        {
+                            "action": "replace",
+                            "queue_status": "deferred_replenishment",
+                            "deferred_replacement_only": True,
+                            "completed_repair_rounds": completed_rounds,
+                            "defer_after_rounds": defer_after_rounds,
+                            "diagnosis_status": "repair_rounds_exhausted",
+                            "atomic_repair_advice": {
+                                "protocol": VIRTUAL_CONTENT_REVIEW_PROTOCOL,
+                                "decision": "defer",
+                                "summary": (
+                                    f"已完成 {completed_rounds} 轮返修仍未达标，"
+                                    "删除原题并在同一蓝图槽位生成替代题。"
+                                ),
+                                "repair_tasks": [],
+                            },
+                        }
+                    )
+                    repair_queue.append(queue_entry)
+                    repairs.append(queue_entry)
+                    reasons[item_id] = (
+                        "返修额度耗尽，删除原题并在同一蓝图槽位补题；"
+                        "替代题将在下一轮虚拟测量。"
+                    )
+                    continue
+                dispositions[item_id] = {
+                    "status": "deferred_decision", "item_version": item["version"],
+                    "source_analysis_round": current_iteration,
+                    "diagnosis_status": "repair_rounds_exhausted",
+                    "completed_repair_rounds": completed_rounds,
+                    "reason": (
+                        "返修额度和同槽位补题额度均已耗尽；"
+                        "不将未通过题目纳入组卷。"
+                    ),
+                }
+                reasons[item_id] = dispositions[item_id]["reason"]
+                continue
+            if (isinstance(existing_disposition, Mapping)
+                    and existing_disposition.get("status") == "deferred_decision"
+                    and existing_disposition.get("item_version") == item["version"]
+                    and existing_disposition.get("source_analysis_round") == current_iteration):
+                continue
+            if (isinstance(existing_queue_entry, Mapping)
+                    and existing_queue_entry.get("repair_protocol") == VIRTUAL_CONTENT_REVIEW_PROTOCOL
+                    and existing_queue_entry.get("source_analysis_round") == current_iteration
+                    and (existing_queue_entry.get("diagnosis_evidence") or {}).get("current_item") == item):
+                repair_queue.append(deepcopy(dict(existing_queue_entry)))
+                repairs.append(deepcopy(dict(existing_queue_entry)))
+                continue
+            queue_entry = build_virtual_content_repair_entry(
+                state, item, revision_round=completed_rounds + 1,
+            )
+            repair_queue.append(queue_entry)
+            repairs.append(queue_entry)
+            reasons[item_id] = "当轮四项单题门槛未通过，进入材料核查、虚拟专家审题、认知访谈和证据诊断。"
             continue
         if completed_rounds >= defer_after_rounds:
             queue_entry = _psychometric_repair_entry(
@@ -1128,383 +1572,12 @@ async def execute_item_selection_with_diagnosis(
             repair_queue.append(queue_entry)
             repairs.append(queue_entry)
             continue
-        queue_entry = _psychometric_repair_entry(
-            item=item,
-            statistics=item_statistics,
-            revision_round=completed_rounds + 1,
+        queue_entry = build_scenario_repair_entry(
+            state, item, revision_round=completed_rounds + 1,
         )
-        queue_entry["queue_status"] = "pending_diagnosis"
         repair_queue.append(queue_entry)
-        evidence = build_construct_diagnosis_evidence(
-            state,
-            item_id,
-            revision_round=completed_rounds + 1,
-        )
-        fingerprint = diagnosis_fingerprint(evidence)
-        evidence["diagnosis_fingerprint"] = fingerprint
-        fingerprints[item_id] = fingerprint
-        if fingerprint in prior_fingerprints:
-            duplicate_advice = {
-                "decision": "defer",
-                "summary": "相同题目版本和统计指纹已经诊断，自动转为同槽位补题。",
-                "observed_discrepancies": [],
-                "candidate_diagnoses": [],
-                "repair_tasks": [],
-            }
-            repair_queue[-1].update(
-                {
-                    "action": "defer",
-                    "queue_status": "deferred_decision",
-                    "atomic_repair_advice": duplicate_advice,
-                    "diagnosis_evidence": evidence,
-                    "diagnosis_fingerprint": fingerprint,
-                    "diagnosis_status": "duplicate_fingerprint",
-                }
-            )
-            repairs.append(repair_queue[-1])
-            continue
-        diagnosis_jobs.append(
-            {
-                "item_id": item_id,
-                "item": deepcopy(item),
-                "completed_rounds": completed_rounds,
-                "queue_index": len(repair_queue) - 1,
-                "evidence": deepcopy(evidence),
-                "fingerprint": fingerprint,
-            }
-        )
-
-    if diagnosis_jobs:
-        diagnosis_concurrency = max(
-            1,
-            min(
-                8,
-                int(
-                    state.get("psychometric_diagnosis_concurrency")
-                    or PSYCHOMETRIC_REPAIR_SUBAGENT_CONCURRENCY
-                ),
-            ),
-        )
-        diagnosis_batch_id = (
-            f"psychometric-diagnosis-batch/"
-            f"{current_iteration}/{len(diagnosis_events) + 1}"
-        )
-        emit_progress(
-            {
-                "type": "psychometric_subagent_progress",
-                "status": "batch_started",
-                "batch_id": diagnosis_batch_id,
-                "batch_total": len(diagnosis_jobs),
-                "concurrency": diagnosis_concurrency,
-                "message": (
-                    f"启动 {len(diagnosis_jobs)} 个心理测量诊断任务，"
-                    f"最大并发 {diagnosis_concurrency}；全部完成后统一形成返修队列"
-                ),
-            }
-        )
-        diagnosis_semaphore = asyncio.Semaphore(diagnosis_concurrency)
-
-        async def diagnose_one(job: Mapping[str, Any]) -> dict[str, Any]:
-            item_id = str(job["item_id"])
-            evidence = job["evidence"]
-            queue_position = int(job["queue_index"]) + 1
-            emit_progress(
-                {
-                    "type": "psychometric_subagent_progress",
-                    "status": "started",
-                    "batch_id": diagnosis_batch_id,
-                    "item_id": item_id,
-                    "queue_position": queue_position,
-                    "queue_total": len(diagnosis_jobs),
-                    "message": "开始生成心理测量返修诊断",
-                }
-            )
-            async with diagnosis_semaphore:
-                try:
-                    diagnosis = await _ainvoke_model(
-                        psychometric_repair_diagnosis_agent,
-                        {
-                            "input_data": build_psychometric_agent_input(
-                                evidence
-                            )
-                        },
-                        job_label=f"psychometric_repair_diagnosis / {item_id}",
-                        timeout_seconds=PSYCHOMETRIC_REPAIR_TIMEOUT_SECONDS,
-                        max_attempts=1,
-                    )
-                    if isinstance(diagnosis, Mapping) and not diagnosis.get(
-                        "item_id"
-                    ):
-                        diagnosis = {**dict(diagnosis), "item_id": item_id}
-                    diagnosis_status = "completed"
-                    diagnosis_validation_error = None
-                    try:
-                        validate_atomic_repair_advice(diagnosis, evidence)
-                    except ValueError as exc:
-                        fallback = build_deterministic_forced_vts_repair_advice(
-                            evidence,
-                            validation_error=str(exc),
-                        )
-                        fallback_status = "deterministic_forced_vts_fallback"
-                        if fallback is None:
-                            fallback = build_deterministic_target_gradient_repair_advice(
-                                evidence,
-                                validation_error=str(exc),
-                            )
-                            fallback_status = "deterministic_target_gradient_fallback"
-                        if fallback is None:
-                            # Ordinary VTS repairs require a literal quote from
-                            # the current item and a matching NON_TARGET
-                            # constraint.  If the model does not provide that
-                            # evidence, do not guess a patch and do not stop
-                            # the whole concurrent batch; defer only this item.
-                            fallback = build_deterministic_defer_advice(
-                                evidence,
-                                validation_error=str(exc),
-                            )
-                            fallback_status = "validation_fallback_defer"
-                        if fallback is None:
-                            raise
-                        diagnosis = fallback
-                        validate_atomic_repair_advice(diagnosis, evidence)
-                        diagnosis_status = fallback_status
-                        diagnosis_validation_error = str(exc)
-                    if diagnosis.get("decision") == "repair":
-                        try:
-                            diagnosis = normalize_target_gradient_repair_advice(
-                                diagnosis,
-                                evidence,
-                            )
-                            validate_atomic_repair_advice(
-                                diagnosis,
-                                evidence,
-                                require_target_gradient_task=True,
-                            )
-                        except ValueError as exc:
-                            # Normalization adds the mandatory target-gradient
-                            # preflight.  If that second validation reveals an
-                            # invalid ordinary repair link, keep the same safe
-                            # per-item defer behavior instead of aborting the
-                            # entire diagnosis batch.
-                            fallback = build_deterministic_defer_advice(
-                                evidence,
-                                validation_error=str(exc),
-                            )
-                            if fallback is None:
-                                raise
-                            diagnosis = fallback
-                            validate_atomic_repair_advice(diagnosis, evidence)
-                            diagnosis_status = "validation_fallback_defer"
-                            diagnosis_validation_error = str(exc)
-                    emit_progress(
-                        {
-                            "type": "psychometric_subagent_progress",
-                            "status": "completed",
-                            "batch_id": diagnosis_batch_id,
-                            "item_id": item_id,
-                            "queue_position": queue_position,
-                            "queue_total": len(diagnosis_jobs),
-                            "message": (
-                                "心理测量诊断完成；决策="
-                                f"{diagnosis.get('decision')}"
-                            ),
-                        }
-                    )
-                    return {
-                        "item_id": item_id,
-                        "diagnosis": deepcopy(dict(diagnosis)),
-                        "diagnosis_status": diagnosis_status,
-                        "diagnosis_validation_error": diagnosis_validation_error,
-                        "error": None,
-                    }
-                except TimeoutError as exc:
-                    # A timeout means that no diagnosis was received.  It is
-                    # therefore unsafe to invent a repair, but it is also not
-                    # necessary to abort all other independent items.  Keep
-                    # the failed item for manual review and let the batch
-                    # barrier continue with the remaining results.
-                    fallback = build_deterministic_defer_advice(
-                        evidence,
-                        validation_error=str(exc),
-                    )
-                    if fallback is None:
-                        emit_progress(
-                            {
-                                "type": "psychometric_subagent_progress",
-                                "status": "failed",
-                                "batch_id": diagnosis_batch_id,
-                                "item_id": item_id,
-                                "queue_position": queue_position,
-                                "queue_total": len(diagnosis_jobs),
-                                "message": f"心理测量诊断超时且无法安全降级：{exc}",
-                            }
-                        )
-                        return {
-                            "item_id": item_id,
-                            "diagnosis": None,
-                            "diagnosis_status": "failed",
-                            "diagnosis_validation_error": None,
-                            "error": str(exc),
-                        }
-                    validate_atomic_repair_advice(fallback, evidence)
-                    emit_progress(
-                        {
-                            "type": "psychometric_subagent_progress",
-                            "status": "completed",
-                            "batch_id": diagnosis_batch_id,
-                            "item_id": item_id,
-                            "queue_position": queue_position,
-                            "queue_total": len(diagnosis_jobs),
-                            "message": "心理测量诊断请求超时，本题已自动转为同槽位补题",
-                        }
-                    )
-                    return {
-                        "item_id": item_id,
-                        "diagnosis": deepcopy(dict(fallback)),
-                        "diagnosis_status": "timeout_fallback_defer",
-                        "diagnosis_validation_error": str(exc),
-                        "error": None,
-                    }
-                except Exception as exc:
-                    # 单题诊断异常：优先安全转 defer（后续自动同槽位补题），
-                    # 不让单题故障停整批；仅当连 defer 兜底都不可用时才标记该题失败。
-                    try:
-                        fallback = build_deterministic_defer_advice(
-                            evidence,
-                            validation_error=str(exc),
-                        )
-                    except Exception:
-                        fallback = None
-                    if fallback is not None:
-                        emit_progress(
-                            {
-                                "type": "psychometric_subagent_progress",
-                                "status": "completed",
-                                "batch_id": diagnosis_batch_id,
-                                "item_id": item_id,
-                                "queue_position": queue_position,
-                                "queue_total": len(diagnosis_jobs),
-                                "message": (
-                                    "心理测量诊断异常，本题已安全转为 defer"
-                                ),
-                            }
-                        )
-                        return {
-                            "item_id": item_id,
-                            "diagnosis": deepcopy(dict(fallback)),
-                            "diagnosis_status": "exception_fallback_defer",
-                            "diagnosis_validation_error": str(exc),
-                            "error": None,
-                        }
-                    emit_progress(
-                        {
-                            "type": "psychometric_subagent_progress",
-                            "status": "failed",
-                            "batch_id": diagnosis_batch_id,
-                            "item_id": item_id,
-                            "queue_position": queue_position,
-                            "queue_total": len(diagnosis_jobs),
-                            "message": f"心理测量诊断失败：{exc}",
-                        }
-                    )
-                    return {
-                        "item_id": item_id,
-                        "diagnosis": None,
-                        "diagnosis_status": "failed",
-                        "diagnosis_validation_error": None,
-                        "error": str(exc),
-                    }
-
-        diagnosis_results = await asyncio.gather(
-            *(diagnose_one(job) for job in diagnosis_jobs),
-            return_exceptions=False,
-        )
-        diagnosis_failures = [
-            result
-            for result in diagnosis_results
-            if result.get("error")
-        ]
-        successful_count = len(diagnosis_results) - len(diagnosis_failures)
-        if diagnosis_failures and successful_count == 0:
-            # 全部失败 = 服务级故障（模型端点/配置问题），保留 checkpoint 停止，
-            # 避免把系统性故障伪装成逐题 defer 空转。
-            first_failure = diagnosis_failures[0]
-            raise PsychometricDiagnosisUnavailable(
-                "心理测量返修诊断不可用，已停止自动返修队列；"
-                f"题目 {first_failure.get('item_id')} 的诊断未完成："
-                f"{first_failure.get('error')}"
-            )
-        # 部分失败：失败题保留在待诊断队列（下一轮再试），
-        # 其余题目照常进入返修队列，不再因单题故障停整批。
-
-        diagnosis_call_count = len(diagnosis_results)
-        for job, result in zip(diagnosis_jobs, diagnosis_results, strict=True):
-            item_id = str(job["item_id"])
-            item = job["item"]
-            completed_rounds = int(job["completed_rounds"])
-            evidence = job["evidence"]
-            fingerprint = str(job["fingerprint"])
-            diagnosis = result["diagnosis"]
-            if diagnosis is None:
-                # 单题诊断失败：保留待诊断状态，下一轮再试，不阻塞其他题目。
-                continue
-            diagnosis_status = str(result["diagnosis_status"])
-            diagnosis_validation_error = result.get(
-                "diagnosis_validation_error"
-            )
-            diagnoses[item_id] = deepcopy(dict(diagnosis))
-            diagnosis_event = {
-                "event": "psychometric_item_diagnosed",
-                "item_id": item_id,
-                "item_version": item.get("version"),
-                "revision_round": completed_rounds + 1,
-                "diagnosis_fingerprint": fingerprint,
-                "decision": diagnosis.get("decision"),
-                "summary": diagnosis.get("summary"),
-                "repair_task_count": len(repair_tasks_from_advice(diagnosis)),
-                "diagnosis_status": diagnosis_status,
-            }
-            if diagnosis_validation_error is not None:
-                diagnosis_event["validation_error"] = diagnosis_validation_error
-            diagnosis_events.append(diagnosis_event)
-            if diagnosis["decision"] == "defer":
-                diagnosed_entry = {
-                    "item_id": item_id,
-                    "blueprint_cell_id": item.get("blueprint_cell_id"),
-                    "target_dimension_id": item.get("target_dimension_id"),
-                    "action": "defer",
-                    "revision_round": completed_rounds + 1,
-                    "atomic_repair_advice": deepcopy(dict(diagnosis)),
-                    "diagnosis_evidence": deepcopy(evidence),
-                    "diagnosis_fingerprint": fingerprint,
-                    "diagnosis_status": diagnosis_status,
-                    "queue_status": "deferred_decision",
-                }
-                if diagnosis_validation_error is not None:
-                    diagnosed_entry["diagnosis_validation_error"] = diagnosis_validation_error
-                repair_queue[int(job["queue_index"])] = diagnosed_entry
-                repairs.append(diagnosed_entry)
-                reasons[item_id] = str(
-                    diagnosis.get("summary") or "证据不足，自动转为同槽位补题。"
-                )
-                continue
-            diagnosed_entry = {
-                "item_id": item_id,
-                "blueprint_cell_id": item.get("blueprint_cell_id"),
-                "target_dimension_id": item.get("target_dimension_id"),
-                "action": "revise_item",
-                "revision_round": completed_rounds + 1,
-                "atomic_repair_advice": deepcopy(dict(diagnosis)),
-                "diagnosis_evidence": deepcopy(evidence),
-                "diagnosis_fingerprint": fingerprint,
-                "diagnosis_status": diagnosis_status,
-                "queue_status": "diagnosed",
-            }
-            if diagnosis_validation_error is not None:
-                diagnosed_entry["diagnosis_validation_error"] = diagnosis_validation_error
-            repair_queue[int(job["queue_index"])] = diagnosed_entry
-            repairs.append(diagnosed_entry)
-            reasons[item_id] = str(diagnosis.get("summary") or "进入原子返修。")
+        repairs.append(queue_entry)
+        reasons[item_id] = "按正式指标确定检测组，先检测情境再修改选项。"
 
     pending_sme = [
         item_id for item_id, disposition in dispositions.items()
@@ -1674,6 +1747,9 @@ async def execute_item_selection_with_diagnosis(
         if (
             isinstance(provisional_form_optimizer, Mapping)
             and provisional_form_optimizer.get("status") == "validated"
+            and set(provisional_form_optimizer.get("selected_item_ids") or []) <= {
+                str(item["item_id"]) for item in retained
+            }
         ):
             form_optimizer = deepcopy(dict(provisional_form_optimizer))
         else:
@@ -1721,7 +1797,7 @@ async def execute_item_selection_with_diagnosis(
     # the manual-edit / pick interaction instead of run_test_assembly raising.
     plateau_flags_update: dict[str, Any] | None = None
     plateau_gap_decision: dict[str, Any] | None = None
-    if plateau_finalized and not blueprint_coverage.get("passed"):
+    if plateau_finalized and not blueprint_coverage.get("passed") and not virtual_review:
         fills = state.get("plateau_gap_fills") or {}
         if fills:
             (
@@ -1747,7 +1823,23 @@ async def execute_item_selection_with_diagnosis(
                 state,
                 blueprint_coverage,
             )
+    virtual_stop_reason = None
+    if virtual_review and not repair_queue:
+        if plateau_finalized:
+            virtual_stop_reason = "plateau_retained"
+        elif current_iteration > MAX_MEASUREMENTS:
+            virtual_stop_reason = "deferred_replacement_measurement_completed"
+        elif current_iteration >= MAX_MEASUREMENTS:
+            virtual_stop_reason = "three_content_review_rounds_completed_without_deferred_items"
+        elif any(row.get("status") == "deferred_decision" for row in dispositions.values()):
+            virtual_stop_reason = "no_evidence_supported_edit"
+        else:
+            virtual_stop_reason = "all_items_qualified_or_locked"
+        if not blueprint_coverage.get("passed"):
+            status = "virtual_review_complete"
     if provisional_iteration is not None:
+        if virtual_review:
+            provisional_iteration["item_dispositions"] = deepcopy(dispositions)
         iteration_history = _upsert_iteration_record(
             iteration_history,
             provisional_iteration,
@@ -1765,6 +1857,14 @@ async def execute_item_selection_with_diagnosis(
             "reserve_items": reserve_items,
             "items_to_revise": repair_queue,
             "items_to_regenerate": [],
+            "scenario_repair_progress": {
+                str(entry["item_id"]): deepcopy(
+                    (state.get("scenario_repair_progress") or {}).get(str(entry["item_id"]))
+                    or {"status": "planned", "stage": "planning", "rewrite_count": 0,
+                        "archive_ref": entry.get("content_review_archive_ref") or entry.get("scenario_archive_ref")}
+                ) for entry in repair_queue
+                if entry.get("repair_protocol") in {"scenario_detection_first_v1", VIRTUAL_CONTENT_REVIEW_PROTOCOL}
+            },
             "items_deferred_for_revision": [],
             "selection_results": None if repair_queue else {
                 "status": status,
@@ -1773,6 +1873,11 @@ async def execute_item_selection_with_diagnosis(
                 "repair_count": len(repair_queue),
                 "selected_count": len(selected_items),
                 "reserve_count": len(reserve_items),
+                "mode": (form_optimizer or {}).get("mode") if isinstance(form_optimizer, Mapping) else None,
+                "temporary_unqualified_item_ids": deepcopy(
+                    (form_optimizer or {}).get("temporary_unqualified_item_ids")
+                    if isinstance(form_optimizer, Mapping) else []
+                ),
                 "psychometric_repair_diagnoses": diagnoses,
                 "diagnosis_evidence_fingerprints": fingerprints,
                 "diagnosis_call_count": diagnosis_call_count,
@@ -1814,7 +1919,7 @@ async def execute_item_selection_with_diagnosis(
                         repair_queue[0].get("diagnosis_evidence")
                     ),
                 }
-                if repairs and isinstance(repair_queue[0].get("atomic_repair_advice"), Mapping)
+                if repairs and not virtual_review and isinstance(repair_queue[0].get("atomic_repair_advice"), Mapping)
                 else None
             ),
             "psychometric_repair_history": [
@@ -1832,6 +1937,7 @@ async def execute_item_selection_with_diagnosis(
             ),
             "psychometric_monitoring_warnings": monitoring_warnings,
             "psychometric_iteration_history": iteration_history,
+            **({"virtual_content_review_stop_reason": virtual_stop_reason} if virtual_review else {}),
         },
         "summary": (
             f"构念约束诊断完成：当前保留 {len(retained)} 题，"
@@ -1864,6 +1970,7 @@ def _construct_domain_summary(
         "review_status",
         "selection_level",
         "domain_id",
+        "domain_ids",
         "domain_name",
         "domain_name_en",
         "profile_hash",
@@ -1884,7 +1991,7 @@ async def _fill_compact_slots(
     target_ids: set[str] | None = None,
     attempts_used: int = 0,
 ) -> tuple[dict[str, dict[str, Any]], int]:
-    """Fill fixed slots one at a time without exposing their IDs to the model.
+    """Fill independent fixed slots together without exposing IDs to the model.
 
     Slot identity is workflow state, not generated content.  Each model call
     therefore returns one anonymous skeleton payload; this function attaches
@@ -1917,9 +2024,10 @@ async def _fill_compact_slots(
         and slot.get("specification_id") in targets
     ]
     max_attempt_depth = max(1, attempts_used)
-    for ordinal, specification_id in enumerate(slot_order, start=1):
+    async def fill_one(ordinal: int, specification_id: str) -> None:
+        nonlocal max_attempt_depth
         if specification_id in valid:
-            continue
+            return
         slot = slot_by_id.get(specification_id)
         if not isinstance(slot, Mapping):
             raise ValueError(f"心理骨架槽位不存在：{specification_id}")
@@ -2021,6 +2129,7 @@ async def _fill_compact_slots(
                 f"{MAX_ITEM_SKELETON_ATTEMPTS} 次尝试仍未形成有效骨架："
                 + "；".join(details)
             )
+    await gather_all(*(fill_one(index, key) for index, key in enumerate(slot_order, start=1)))
     return valid, max_attempt_depth
 
 
@@ -2032,33 +2141,59 @@ async def execute_fixed_blueprint(state: PSJTState) -> dict:
         raise ValueError("建立题目计划前缺少 TestSpecification")
     profile = resolve_specification_profile(specification)
     corpus = load_ipip_corpus()
-    bundles = {}
-    for facet in profile["facets"]:
-        facet_id = str(facet["facet_id"])
-        bundles[facet_id] = await ensure_behavior_evidence(facet_id, corpus)
+    evidence_bundles = await gather_all(*(
+        ensure_behavior_evidence(
+            str(facet["facet_id"]),
+            corpus,
+            # A cross-domain/multi-facet request must be executable even when
+            # only part of the registry has curated evidence. The fallback is
+            # explicitly marked on each facet and remains development-only;
+            # single-facet runs retain the curated-evidence gate.
+            allow_legacy_fallback=(
+                len(profile["facets"]) > 1
+                or profile.get("selection_level") == "inventory"
+            ),
+        ) for facet in profile["facets"]
+    ))
+    bundles = {
+        str(facet["facet_id"]): bundle
+        for facet, bundle in zip(profile["facets"], evidence_bundles, strict=True)
+    }
     profile = attach_behavior_evidence(profile, bundles)
     retention_total = int(specification["final_item_count"])
+    facet_quotas = resolve_facet_item_counts(specification, profile)
     generation_total = required_generation_total(retention_total)
-    expansion_situation_total = required_expansion_situation_total(
+    behavior_counts = {
+        str(facet["facet_id"]): len(facet.get("behavior_evidence") or [])
+        for facet in profile["facets"]
+    }
+    base_expansion_situation_total = required_expansion_situation_total(
         retention_total
     )
-    situation_quotas = distribute_situation_quotas(
-        expansion_situation_total, len(profile["facets"])
+    pairability_minimums = {
+        facet_id: INCREMENTAL_CANDIDATES_PER_CELL * int(facet_quotas[facet_id]) + max(0, behavior_count - 1)
+        for facet_id, behavior_count in behavior_counts.items()
+    }
+    expansion_situation_total = max(
+        base_expansion_situation_total,
+        sum(pairability_minimums.values()),
     )
-    expansions = []
-    for facet, required_situation_count in zip(
-        profile["facets"], situation_quotas, strict=True
-    ):
-        expansions.append(
-            await ensure_facet_expansion(
+    situation_quotas = distribute_situation_quotas(
+        expansion_situation_total,
+        facet_quotas,
+        minimum_situations=pairability_minimums,
+    )
+    expansions = await gather_all(*(
+            ensure_facet_expansion(
                 run_id=state["run_id"],
                 facet=facet,
                 behavior_evidence=facet["behavior_evidence"],
                 target_population=str(specification["target_population"]),
                 output_language=str(specification["output_language"]),
-                required_situation_count=required_situation_count,
+                required_situation_count=situation_quotas[str(facet["facet_id"])],
             )
-        )
+            for facet in profile["facets"]
+    ))
     blueprint: dict[str, Any] | None = None
     errors: dict[str, str] = {}
     retry_feedback = ""
@@ -2079,9 +2214,16 @@ async def execute_fixed_blueprint(state: PSJTState) -> dict:
             expansions=expansions,
             generation_total=generation_total,
             retention_total=retention_total,
+            facet_retention_quotas=facet_quotas,
             retry_feedback=retry_feedback,
         )
         try:
+            proposal = repair_blueprint_proposal(
+                proposal,
+                profile,
+                expansions,
+                facet_quotas,
+            )
             candidate_blueprint = build_generation_blueprint(
                 specification,
                 profile,
@@ -2107,6 +2249,13 @@ async def execute_fixed_blueprint(state: PSJTState) -> dict:
         )
     if blueprint is None:
         raise ValueError(format_blueprint_errors_for_user(errors))
+    fallback_count = sum(
+        1
+        for bundle in bundles.values()
+        if str(getattr(bundle, "generated_at", "")).startswith(
+            "legacy_registry_fallback:"
+        )
+    )
     return {
         "state_update": {
             "construct_profile": profile,
@@ -2118,7 +2267,14 @@ async def execute_fixed_blueprint(state: PSJTState) -> dict:
             f"facet；情境扩展池固定 {expansion_situation_total} 个，"
             f"蓝图筛选 {planned_generation_count(blueprint)} 个候选槽位（每个测量单元 "
             f"{INCREMENTAL_CANDIDATES_PER_CELL} 个候选），"
-            f"计划最终保留 {specification['final_item_count']} 题。"
+            f"计划最终保留 {specification['final_item_count']} 题，facet 配额为 "
+            f"{facet_quotas}。"
+            + (
+                f"其中 {fallback_count} 个 facet 使用未完成 SME 审查的注册表证据兜底，"
+                "仅用于开发期生成。"
+                if fallback_count
+                else ""
+            )
         ),
         "repair_attempt_count": 0,
         "semantic_retry_count": attempt,
@@ -2268,7 +2424,9 @@ async def _run_psychometric_local_retest(
     state: PSJTState,
     candidate_item: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Run one candidate-only administration and return the four item gates."""
+    """Legacy candidate-only administration, outside fixed-cohort rounds."""
+    if fixed_facet_iteration_enabled(state):
+        raise ValueError("Fixed-cohort candidates must be committed and measured in a scheduled batch")
 
     simulation = await run_single_item_virtual_retest(
         state,
@@ -2299,379 +2457,54 @@ async def _execute_psychometric_repair_item(
     atomic_advice: Mapping[str, Any],
     diagnosis_evidence: Mapping[str, Any],
     program_update: Mapping[str, Any],
-) -> dict[str, Any] | None:
-    """Apply every confirmed task for one item before any re-simulation.
-
-    Each task still gets its own narrowly scoped repair-model call.  The
-    intermediate item is kept local until all tasks succeed, so a failed task
-    cannot leave a partially repaired item in the workflow.  The caller then
-    commits one new item version and clears statistics once, which triggers one
-    subsequent virtual re-test for the completed batch.
-    """
-
-    effective_advice = deepcopy(dict(atomic_advice))
-    if (
-        isinstance(active_psychometric_repair.get("atomic_repair_advice"), Mapping)
-        and diagnosis_evidence
-    ):
-        effective_advice = normalize_target_gradient_repair_advice(
-            effective_advice,
-            diagnosis_evidence,
-        )
-        validate_atomic_repair_advice(
-            effective_advice,
-            diagnosis_evidence,
-            require_target_gradient_task=True,
-        )
-    tasks = repair_tasks_from_advice(effective_advice)
-    if not tasks:
-        return None
-    working_item = deepcopy(state.get("current_item") or {})
-    if not working_item:
-        raise ValueError("psychometric repair batch requires current_item")
-    base_version = int(working_item.get("version") or 0)
-    agent_packet = build_psychometric_agent_input(diagnosis_evidence)
-    normal_constraints = agent_packet.get("normal_constraints")
-    target_construct_constraints = agent_packet.get("target_construct_constraints")
-    item_content = agent_packet.get("item_content")
-    option_evidence = agent_packet.get("option_evidence")
-    option_score_comparisons = agent_packet.get("option_score_comparisons")
-    target_gradient_plan = agent_packet.get("target_gradient_plan")
-    total_attempts = 0
-    local_retest_history: list[dict[str, Any]] = []
-    local_feedback: Mapping[str, Any] | None = None
-    best_item = deepcopy(working_item)
-    best_metrics: dict[str, Any] | None = None
-    best_pass_count = -1
-    local_round_limit = max(
-        1,
-        min(
-            5,
-            int(state.get("max_item_revision_attempts") or 3),
-        ),
+    progress_reporter: Any | None = None,
+) -> dict[str, Any]:
+    """Stage one repair-only candidate; never run a local formal retest."""
+    from sjt_system.evaluation.scenario_detection import (
+        archive_path, make_model_invoker, run_scenario_repair,
     )
-    item_id = str(working_item.get("item_id") or route.get("target_item_id") or "item")
-    queued_item_ids = [
-        str(entry.get("item_id"))
-        for entry in state.get("items_to_revise") or []
-        if isinstance(entry, Mapping) and entry.get("item_id") is not None
-    ]
-    queue_position = (
-        queued_item_ids.index(item_id) + 1
-        if item_id in queued_item_ids
-        else None
+    from pathlib import Path
+
+    item = deepcopy(state.get("current_item") or {})
+    if not item:
+        raise ValueError("scenario repair requires current_item")
+    invoke, model_info = make_model_invoker(state)
+    from sjt_system.evaluation.repair_reconstruction import make_rebuilder
+    progress = await run_scenario_repair(
+        item=item,
+        evidence=diagnosis_evidence,
+        path=(Path(active_psychometric_repair["scenario_archive_ref"])
+              if active_psychometric_repair.get("scenario_archive_ref")
+              else archive_path(state, item, int(active_psychometric_repair.get("revision_round") or 1))),
+        invoke=invoke,
+        model_info=model_info,
+        knowledge_snapshot=state.get("_repair_knowledge_snapshot"),
+        source_context={"run_id": state.get("run_id"),
+                        "psychometric_analysis_round": state.get("psychometric_analysis_round", 0)},
+        rebuild=make_rebuilder(state, item, state.get("_repair_knowledge_snapshot")),
+        progress=progress_reporter,
     )
-    queue_total = len(queued_item_ids) or None
-    subagent_id = f"psychometric-repair/{item_id}"
-    subagent_started_at = perf_counter()
-    emit_progress(
-        {
+    if progress_reporter is None:
+        emit_progress({
             "type": "psychometric_subagent_progress",
-            "subagent_id": subagent_id,
-            "item_id": item_id,
-            "status": "started",
-            "queue_position": queue_position,
-            "queue_total": queue_total,
-            "round": 0,
-            "max_rounds": local_round_limit,
-            "elapsed_ms": 0,
-            "message": "开始处理该题的修改—单题复测闭环",
-        }
-    )
-
-    # A psychometric repair is now an item-local loop.  All model calls in this
-    # block belong to one candidate; no candidate is committed to item_pool and
-    # no whole-form measurement is triggered until the outer repair queue drains.
-    for local_round in range(1, local_round_limit + 1):
-        for task_index, task in enumerate(tasks, start=1):
-            diagnosis_id = str(task.get("diagnosis_id") or f"D{task_index}")
-            task_advice = deepcopy(dict(effective_advice))
-            task_advice["selected_diagnosis_id"] = diagnosis_id
-            task_advice["atomic_edit"] = deepcopy(task.get("atomic_edit"))
-            if "repair_tasks" in effective_advice:
-                task_advice["repair_tasks"] = [deepcopy(dict(task))]
-            emit_progress(
-                {
-                    "type": "psychometric_subagent_progress",
-                    "subagent_id": subagent_id,
-                    "item_id": item_id,
-                    "status": "editing",
-                    "queue_position": queue_position,
-                    "queue_total": queue_total,
-                    "round": local_round,
-                    "max_rounds": local_round_limit,
-                    "task_index": task_index,
-                    "task_total": len(tasks),
-                    "diagnosis_id": diagnosis_id,
-                    "elapsed_ms": round(
-                        (perf_counter() - subagent_started_at) * 1000
-                    ),
-                    "message": "返修 Agent 正在生成当前题的候选修改",
-                }
-            )
-            input_data: dict[str, Any] = {
-                "action": action,
-                "state": build_psychometric_repair_model_state(
-                    {**state, "current_item": working_item}
-                ),
-                "generation_context": build_psychometric_repair_generation_context(
-                    {**state, "current_item": working_item}
-                ),
-                "blocking_findings": [],
-                "repair_source": "psychometric_diagnosis",
-                "atomic_repair_advice": task_advice,
-                "normal_constraints": normal_constraints,
-                "target_construct_constraints": target_construct_constraints,
-                "item_content": item_content,
-                "option_evidence": option_evidence,
-                "option_score_comparisons": option_score_comparisons,
-                "target_gradient_plan": target_gradient_plan,
-                "local_retest_feedback": deepcopy(local_feedback),
-                "local_retest_round": local_round,
-                "required_context_category": (
-                    item_specification.get("context_category")
-                    if isinstance(item_specification, Mapping)
-                    else None
-                ),
-                "validation_feedback": None,
-                "previous_invalid_candidate": None,
-            }
-            task_error: ValueError | None = None
-            task_succeeded = False
-            for repair_attempt in range(MAX_ITEM_OUTPUT_CANDIDATES):
-                total_attempts += 1
-                result: Any = None
-                try:
-                    result = await _ainvoke_model(
-                        psychometric_item_repair_agent,
-                        {"input_data": input_data},
-                        job_label=(
-                            f"{action} / {route.get('target_item_id') or 'item'}"
-                            f" / {diagnosis_id} / local-{local_round}"
-                        ),
-                        timeout_seconds=PSYCHOMETRIC_REPAIR_TIMEOUT_SECONDS,
-                    )
-                    result = _normalize_item_repair_result(result)
-                    if not isinstance(result, Mapping):
-                        raise ValueError("Agent output must be an object")
-                    proposed_update = result.get("state_update")
-                    if not isinstance(proposed_update, Mapping):
-                        raise ValueError("Agent output missing valid state_update")
-                    proposed_update = deepcopy(dict(proposed_update))
-                    proposed_update = normalize_atomic_option_patch_scope(
-                        proposed_update,
-                        task_advice,
-                    )
-                    validate_atomic_item_patch(
-                        proposed_update,
-                        working_item,
-                        task_advice,
-                    )
-                    proposed_update = canonicalize_item_agent_update(
-                        action,
-                        proposed_update,
-                        specification=state.get("test_specification"),
-                        blueprint_cell=state.get("current_blueprint_cell"),
-                        item_specification=item_specification,
-                        previous_item=working_item,
-                    )
-                    validate_item_agent_update(
-                        action,
-                        proposed_update,
-                        target_item_id=route.get("target_item_id"),
-                        target_blueprint_cell_id=route.get("target_blueprint_cell_id"),
-                        specification=state.get("test_specification"),
-                        blueprint_cell=state.get("current_blueprint_cell"),
-                        item_specification=item_specification,
-                        previous_item=working_item,
-                    )
-                    working_item = deepcopy(proposed_update["current_item"])
-                    task_succeeded = True
-                    break
-                except ValueError as exc:
-                    task_error = exc
-                    if repair_attempt >= MAX_ITEM_OUTPUT_CANDIDATES - 1:
-                        break
-                    emit_progress(
-                        {
-                            "type": "output_repair",
-                            "retry_kind": _output_error_kind(exc),
-                            "job_label": f"{action} / {diagnosis_id}",
-                            "attempt": repair_attempt + 2,
-                            "max_attempts": MAX_ITEM_OUTPUT_CANDIDATES,
-                            "reason": str(exc),
-                        }
-                    )
-                    input_data = {
-                        **input_data,
-                        "validation_feedback": str(exc),
-                        "previous_invalid_candidate": _invalid_candidate(
-                            result,
-                            exc,
-                            state_update_only=True,
-                        ),
-                    }
-            if not task_succeeded:
-                raise ValueError(
-                    f"{action} task {diagnosis_id} did not produce a valid patch: "
-                    f"{task_error}"
-                )
-
-        candidate_for_retest = deepcopy(working_item)
-        candidate_for_retest["version"] = base_version + 1
-        emit_progress(
-            {
-                "type": "psychometric_subagent_progress",
-                "subagent_id": subagent_id,
-                "item_id": item_id,
-                "status": "retesting",
-                "queue_position": queue_position,
-                "queue_total": queue_total,
-                "round": local_round,
-                "max_rounds": local_round_limit,
-                "elapsed_ms": round(
-                    (perf_counter() - subagent_started_at) * 1000
-                ),
-                "message": "候选题已生成，开始单题局部复测",
-            }
-        )
-        local_result = await _run_psychometric_local_retest(
-            state=state,
-            candidate_item=candidate_for_retest,
-        )
-        metrics = deepcopy(local_result["metrics"])
-        qualification = metrics.get("qualification") or {}
-        pass_count = sum(
-            bool(qualification.get(key))
-            for key in (
-                "citc_pass",
-                "target_rho_pass",
-                "same_domain_vts_pass",
-                "cross_domain_vts_pass",
-            )
-        )
-        local_event = {
-            "round": local_round,
-            "candidate_version": candidate_for_retest.get("version"),
-            "candidate_item": deepcopy(candidate_for_retest),
-            "metrics": metrics,
-            "simulation": deepcopy(local_result.get("simulation") or {}),
-            "pass_count": pass_count,
-        }
-        local_retest_history.append(local_event)
-        failed_gates = [
-            key
-            for key in (
-                "citc_pass",
-                "target_rho_pass",
-                "same_domain_vts_pass",
-                "cross_domain_vts_pass",
-            )
-            if not bool(qualification.get(key))
-        ]
-        emit_progress(
-            {
-                "type": "psychometric_subagent_progress",
-                "subagent_id": subagent_id,
-                "item_id": item_id,
-                "status": "round_completed",
-                "queue_position": queue_position,
-                "queue_total": queue_total,
-                "round": local_round,
-                "max_rounds": local_round_limit,
-                "passed_gate_count": pass_count,
-                "gate_total": 4,
-                "qualified": bool(qualification.get("qualified")),
-                "failed_gates": failed_gates,
-                "elapsed_ms": round(
-                    (perf_counter() - subagent_started_at) * 1000
-                ),
-                "message": (
-                    "单题局部复测完成"
-                    if qualification.get("qualified")
-                    else "单题局部复测未通过"
-                ),
-            }
-        )
-        if pass_count > best_pass_count:
-            best_pass_count = pass_count
-            best_item = deepcopy(candidate_for_retest)
-            best_metrics = metrics
-        if bool(qualification.get("qualified")):
-            best_item = deepcopy(candidate_for_retest)
-            best_metrics = metrics
-            break
-        local_feedback = metrics
-        if local_round < local_round_limit:
-            emit_progress(
-                {
-                    "type": "psychometric_local_retest",
-                    "status": "failed",
-                    "item_id": candidate_for_retest.get("item_id"),
-                    "round": local_round,
-                    "max_rounds": local_round_limit,
-                    "passed_gate_count": pass_count,
-                    "message": "单题局部复测未通过，继续让返修 Agent 修改当前候选",
-                }
-            )
-
-    working_item = deepcopy(best_item)
-    working_item["version"] = base_version + 1
-    local_status = (
-        "passed"
-        if best_metrics
-        and bool((best_metrics.get("qualification") or {}).get("qualified"))
-        else "bounded_not_passed"
-    )
-    local_retest = {
-        "status": local_status,
-        "max_rounds": local_round_limit,
-        "rounds_completed": len(local_retest_history),
-        "best_passed_gate_count": max(0, best_pass_count),
-        "best_metrics": deepcopy(best_metrics),
-        "history": local_retest_history,
-    }
-    emit_progress(
-        {
-            "type": "psychometric_subagent_progress",
-            "subagent_id": subagent_id,
-            "item_id": item_id,
-            "status": "completed",
-            "queue_position": queue_position,
-            "queue_total": queue_total,
-            "round": len(local_retest_history),
-            "max_rounds": local_round_limit,
-            "passed_gate_count": max(0, best_pass_count),
-            "gate_total": 4,
-            "qualified": local_status == "passed",
-            "local_status": local_status,
-            "elapsed_ms": round(
-                (perf_counter() - subagent_started_at) * 1000
-            ),
-            "message": "该题返修闭环完成，等待主流程汇总",
-        }
-    )
-
-    # The individual task results are deliberately kept in memory.  They are
-    # one psychometric repair transaction, so the persisted item receives one
-    # version bump, not one bump per option/task.  The local retest history is
-    # retained on the active repair for audit; the main process still performs
-    # one unified full-bank administration after all item candidates are ready.
-
+            "item_id": item["item_id"],
+            "status": "completed" if progress["status"] == "ready" else "failed",
+            "stage": progress["stage"],
+            "rewrite_count": progress["rewrite_count"],
+            "archive_ref": progress["archive_ref"],
+            "message": "情境检测及选项修改已暂存" if progress["status"] == "ready" else "情境检测暂停，整批不提交",
+        })
     return {
         "state_update": {
-            "current_item": working_item,
+            **dict(program_update),
+            "current_item": progress.get("candidate"),
             "active_psychometric_repair": {
                 **deepcopy(dict(active_psychometric_repair)),
-                "local_retest": local_retest,
+                "scenario_detection": progress,
             },
-            **dict(program_update),
         },
-        "repair_attempt_count": total_attempts,
-        "summary": (
-            f"同一题完成 {len(local_retest_history)} 轮‘修改—单题复测’；"
-            f"局部状态={local_status}，随后由主流程统一整卷施测"
-        ),
+        "repair_attempt_count": 0,
+        "summary": "候选已暂存，等待整批提交" if progress["status"] == "ready" else str(progress.get("pause_reason")),
     }
 
 
@@ -2719,275 +2552,361 @@ def _psychometric_batch_blueprint_cell(
     )
 
 
+async def prepare_repair_knowledge_review(state: PSJTState) -> dict[str, Any]:
+    """Learn from the complete formal review queue before repair/defer decisions."""
+    from sjt_system.evaluation.repair_knowledge import KnowledgeSession
+    session = None
+    try:
+        entries = [*(state.get("items_to_revise") or []), *(state.get("items_to_regenerate") or [])]
+        session = KnowledgeSession(state, entries)
+        await session.prepare()
+        return {"repair_knowledge_state": session.summary()}
+    except Exception as exc:
+        if session is not None:
+            session.pause("review", exc)
+        return {"repair_knowledge_state": session.summary() if session else {
+                    "stage": "review", "status": "paused", "error": str(exc)},
+                "scenario_repair_pause": {"recovery_version": 2, "failures": {"knowledge": str(exc)},
+                    "knowledge_pending": True, "limit_reached": False,
+                    "message": "审题知识归纳暂停，返修和外层确认尚未推进。"}}
+
+
 async def _execute_psychometric_repair_batch(
-    *,
-    action: str,
-    route: PSJTRouteDecision,
-    state: PSJTState,
+    *, action: str, route: PSJTRouteDecision, state: PSJTState,
 ) -> dict[str, Any]:
-    """Run all diagnosed item-local repair loops concurrently, then merge once.
+    """Stage all repairs, stop dispatch on failure, and commit only all-ready batches."""
+    if virtual_content_review_enabled(state):
+        from sjt_system.workflow.virtual_content_review import execute_virtual_content_review_batch
+        return await execute_virtual_content_review_batch(state)
+    from sjt_system.evaluation.scenario_detection import (
+        DESIGN_LIMIT_REASON, DETECTION_PROTOCOL, PROTOCOL, is_current_ready,
+    )
+    from sjt_system.evaluation.repair_reconstruction import (
+        is_budget_replenishment, replenish_exhausted_design, validate_replacement,
+    )
 
-    Subagents receive independent shallow state copies and can only return an
-    item candidate plus its local retest history.  They never mutate the
-    shared item pool and never run the whole-form administration.  The main
-    workflow merges successful candidates after the batch barrier, invalidates
-    the old formal response snapshot once, and lets the next workflow pass
-    perform one unified administration for the updated bank.
-    """
-
-    del action, route
-    queue_entries = [
-        deepcopy(dict(entry))
-        for entry in [
-            *(state.get("items_to_regenerate") or []),
-            *(state.get("items_to_revise") or []),
-        ]
-        if isinstance(entry, Mapping)
-        and entry.get("item_id")
-        and isinstance(entry.get("atomic_repair_advice"), Mapping)
-        and entry["atomic_repair_advice"].get("decision") == "repair"
-        and entry["atomic_repair_advice"].get("repair_tasks")
-    ]
-    unique_entries: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for entry in queue_entries:
-        item_id = str(entry["item_id"])
-        if item_id not in seen_ids:
-            seen_ids.add(item_id)
-            unique_entries.append(entry)
-    if not unique_entries:
-        raise ValueError("并发心理测量返修没有可执行的诊断任务")
+    pending_entries = [*(state.get("items_to_regenerate") or []),
+                       *(state.get("items_to_revise") or [])]
+    exhausted = next((entry for entry in pending_entries if isinstance(entry, Mapping)
+                      and entry.get("diagnosis_status") == "repair_rounds_exhausted"), None)
+    if exhausted is not None:
+        # Outer-round decisions are not new repair candidates or legacy advice to replan.
+        return {
+            "state_update": {
+                "psychometric_repair_confirmation": {
+                    **deepcopy(dict(exhausted)), "status": "pending", "decision": None,
+                },
+            },
+            "summary": "先处理原有外层返修次数耗尽的确认项，再启动整批情境检测。",
+            "repair_attempt_count": 0,
+        }
 
     item_by_id = {
-        str(item.get("item_id")): deepcopy(dict(item))
-        for item in state.get("item_pool") or []
+        str(item["item_id"]): deepcopy(dict(item))
+        for item in state.get("item_pool") or state.get("frozen_item_bank") or []
         if isinstance(item, Mapping) and item.get("item_id")
     }
-    if not item_by_id:
-        item_by_id = {
-            str(item.get("item_id")): deepcopy(dict(item))
-            for item in state.get("frozen_item_bank") or []
-            if isinstance(item, Mapping) and item.get("item_id")
-        }
-    missing_ids = [
-        str(entry["item_id"])
-        for entry in unique_entries
-        if str(entry["item_id"]) not in item_by_id
-    ]
-    if missing_ids:
-        raise ValueError("并发返修找不到题目：" + "、".join(missing_ids))
-
+    unique_entries = []
+    seen_ids = set()
+    for raw in pending_entries:
+        if not isinstance(raw, Mapping) or not raw.get("item_id"):
+            continue
+        item_id = str(raw["item_id"])
+        if item_id in seen_ids:
+            continue
+        seen_ids.add(item_id)
+        entry = deepcopy(dict(raw))
+        if entry.get("repair_protocol") != PROTOCOL and item_id in item_by_id:
+            entry = build_scenario_repair_entry(
+                state, item_by_id[item_id], revision_round=int(entry.get("revision_round") or 1),
+            )
+        unique_entries.append(entry)
+    if not unique_entries:
+        raise ValueError("情境检测返修没有待处理题目")
+    from sjt_system.runtime.checkpoint import DEFAULT_CHECKPOINT_ROOT, save_run_checkpoint
+    from sjt_system.runtime.output_paths import scoped_output
+    # A long-running batch must have a durable queue before its first model call.
+    save_run_checkpoint(state, checkpoint_root=scoped_output("run_checkpoints", DEFAULT_CHECKPOINT_ROOT))
+    from sjt_system.evaluation.repair_knowledge import KnowledgeSession
+    knowledge = None
+    try:
+        knowledge = KnowledgeSession(state, unique_entries)
+        await knowledge.prepare()
+    except Exception as exc:
+        if knowledge is not None:
+            knowledge.pause("review", exc)
+        summary = knowledge.summary() if knowledge is not None else {"status": "paused", "stage": "review", "error": str(exc)}
+        return {"state_update": {
+            "repair_knowledge_state": summary,
+            "scenario_repair_pause": {"recovery_version": 2, "detection_protocol": DETECTION_PROTOCOL,
+                "failures": {"knowledge": str(exc)}, "knowledge_pending": True,
+                "limit_reached": False, "message": "审题知识归纳暂停；候选题库尚未修改。"},
+            "items_to_revise": unique_entries, "items_to_regenerate": [],
+        }, "summary": "知识归纳失败，保存后等待恢复", "repair_attempt_count": 0}
     batch_id = (
-        f"psychometric-repair-batch/"
-        f"{int(state.get('psychometric_analysis_round') or 0)}/"
-        f"{len(state.get('psychometric_repair_history') or []) + 1}"
+        f"scenario-repair-batch/{state.get('run_id')}/"
+        f"{int(state.get('psychometric_analysis_round') or 0)}"
     )
-    concurrency = max(
-        1,
-        min(
-            8,
-            int(
-                state.get("psychometric_subagent_max_concurrency")
-                or PSYCHOMETRIC_REPAIR_SUBAGENT_CONCURRENCY
-            ),
-        ),
-    )
-    emit_progress(
-        {
+    concurrency = len(unique_entries)
+    semaphore = UnlimitedConcurrency()
+    progress_lock = asyncio.Lock()
+    progress_counts = {
+        "started_count": 0,
+        "completed_count": 0,
+        "failed_count": 0,
+        "active_count": 0,
+    }
+    progress_by_id = {key: deepcopy(value) for key, value in
+                      (state.get("scenario_repair_progress") or {}).items() if key in seen_ids}
+    batch_total = len(unique_entries)
+
+    def progress_event(*, status: str, item_id: str = "batch", stage: str | None = None,
+                       message: str | None = None, **extra: Any) -> None:
+        event = {
             "type": "psychometric_subagent_progress",
-            "status": "batch_started",
+            "status": status,
+            "item_id": item_id,
             "batch_id": batch_id,
-            "batch_total": len(unique_entries),
+            "batch_total": batch_total,
             "concurrency": concurrency,
-            "message": (
-                f"启动 {len(unique_entries)} 个单题返修 subagent，"
-                f"最大并发 {concurrency}；全部完成后统一合并"
-            ),
+            "stage": stage,
+            "message": message,
+            **progress_counts,
+            **extra,
         }
+        emit_progress({key: value for key, value in event.items() if value is not None})
+
+    async def update_progress_counts(*, item_id: str, started: bool = False,
+                                     completed: bool = False, failed: bool = False) -> None:
+        async with progress_lock:
+            if started:
+                progress_counts["started_count"] += 1
+                progress_counts["active_count"] += 1
+            if completed or failed:
+                progress_counts["active_count"] = max(0, progress_counts["active_count"] - 1)
+                progress_counts["completed_count"] += int(completed)
+                progress_counts["failed_count"] += int(failed)
+
+    async def snapshot_progress_counts() -> dict[str, int]:
+        async with progress_lock:
+            return dict(progress_counts)
+
+    progress_event(
+        status="batch_started",
+        message="开始情境检测优先返修；全部就绪才提交，不执行逐题复测",
     )
-    semaphore = asyncio.Semaphore(concurrency)
-    batch_response_ref = (
-        state.get("virtual_response_data_ref")
-        or state.get("previous_virtual_response_data_ref")
-    )
+
+    async def batch_heartbeat() -> None:
+        try:
+            interval = max(
+                5.0,
+                float(os.getenv("SJT_PSYCHOMETRIC_REPAIR_PROGRESS_INTERVAL_SECONDS", "15")),
+            )
+        except (TypeError, ValueError):
+            interval = 15.0
+        while True:
+            await asyncio.sleep(interval)
+            counts = await snapshot_progress_counts()
+            progress_event(
+                status="running",
+                message="批次仍在运行，等待并发返修任务完成",
+                **counts,
+            )
+
+    heartbeat_task = asyncio.create_task(batch_heartbeat())
 
     async def run_one(entry: Mapping[str, Any]) -> dict[str, Any]:
         item_id = str(entry["item_id"])
-        item = item_by_id[item_id]
-        blueprint_cell = _psychometric_batch_blueprint_cell(state, item)
-        active_repair = {
-            **deepcopy(dict(entry)),
-            "baseline_item": deepcopy(item),
-            "baseline_profile": deepcopy(
-                (state.get("item_pattern_profiles") or {}).get(item_id)
-            ),
-            # A batch has one shared formal baseline.  The full snapshot is
-            # intentionally not copied into every task; the next admission
-            # pass can safely fall back to incremental remeasurement.
-            "baseline_analysis_snapshot": None,
-        }
-        local_state = dict(state)
-        local_state.update(
-            {
-                "current_item": deepcopy(item),
-                "current_blueprint_cell": blueprint_cell,
-                "current_item_specification": _psychometric_batch_item_specification(
-                    state,
-                    item,
-                ),
-                "current_item_review": None,
-                "active_psychometric_repair": active_repair,
-                "_psychometric_batch_id": batch_id,
-            }
-        )
-        # Pass the shared formal baseline explicitly into every isolated
-        # worker. After a bank change the current reference may be cleared
-        # while the previous baseline is retained for reuse/local retesting.
-        if batch_response_ref:
-            local_state["virtual_response_data_ref"] = batch_response_ref
-        local_route: PSJTRouteDecision = {
-            "next_action": "revise_item",
-            "reason": "批量返修 subagent 的单题局部任务",
-            "target_item_id": item_id,
-            "target_blueprint_cell_id": item.get("blueprint_cell_id"),
-        }
         async with semaphore:
+            await update_progress_counts(item_id=item_id, started=True)
+            counts = await snapshot_progress_counts()
+            progress_event(
+                status="started",
+                item_id=item_id,
+                stage="planning",
+                message="子任务已开始，等待情境检测模型调用",
+                **counts,
+            )
+
+            def report_stage(event: Mapping[str, Any]) -> None:
+                progress_event(
+                    status=str(event.get("status") or "editing"),
+                    item_id=item_id,
+                    stage=str(event.get("stage") or "unknown"),
+                    message="情境检测模型调用中",
+                    rewrite_count=event.get("rewrite_count", 0),
+                    model_call_count=event.get("model_call_count", 0),
+                    **progress_counts,
+                )
+
             try:
+                item = item_by_id[item_id]
+                active = {**deepcopy(dict(entry)), "baseline_item": deepcopy(item),
+                          "scenario_archive_ref": entry.get("scenario_archive_ref"),
+                          "baseline_profile": deepcopy((state.get("item_pattern_profiles") or {}).get(item_id)),
+                          "baseline_analysis_snapshot": None}
+                local_state = {**state, "current_item": deepcopy(item),
+                               "_repair_knowledge_snapshot": knowledge.for_item(entry.get("diagnosis_evidence") or {}),
+                               "current_blueprint_cell": _psychometric_batch_blueprint_cell(state, item),
+                               "current_item_specification": _psychometric_batch_item_specification(state, item),
+                               "current_item_review": None, "active_psychometric_repair": active,
+                               "_psychometric_batch_id": batch_id}
                 result = await _execute_psychometric_repair_item(
-                    action="revise_item",
-                    route=local_route,
-                    state=local_state,  # type: ignore[arg-type]
-                    item_specification=local_state["current_item_specification"],
-                    active_psychometric_repair=active_repair,
-                    atomic_advice=entry["atomic_repair_advice"],
-                    diagnosis_evidence=entry.get("diagnosis_evidence") or {},
-                    program_update={},
+                    action="revise_item", route={"next_action": "revise_item", "reason": "情境检测返修",
+                    "target_item_id": item_id, "target_blueprint_cell_id": item.get("blueprint_cell_id")},
+                    state=local_state, item_specification=local_state["current_item_specification"],
+                    active_psychometric_repair=active, atomic_advice=entry.get("atomic_repair_advice") or {},
+                    diagnosis_evidence=entry.get("diagnosis_evidence") or {}, program_update={},
+                    progress_reporter=report_stage,
                 )
-                return {
-                    "item_id": item_id,
-                    "result": result,
-                    "error": None,
-                }
+                progress = (result["state_update"].get("active_psychometric_repair") or {}).get("scenario_detection") or {}
+                if progress.get("status") == "paused" and progress.get("pause_reason") == DESIGN_LIMIT_REASON:
+                    progress_event(
+                        status="replenishing", item_id=item_id, stage="blueprint",
+                        message="设计预算耗尽，正在同一蓝图单元重新组装候选题",
+                        **(await snapshot_progress_counts()),
+                    )
+                    progress = await replenish_exhausted_design(
+                        local_state, item, progress, local_state["_repair_knowledge_snapshot"],
+                    )
+                    result["state_update"]["current_item"] = progress["candidate"]
+                    result["state_update"]["active_psychometric_repair"]["scenario_detection"] = progress
+                if progress.get("status") == "ready" and not is_current_ready(progress):
+                    raise ValueError("候选尚未通过当前差异检测和选项修改协议，必须重新检测")
+                accepted = is_current_ready(progress) or is_budget_replenishment(progress)
+                await update_progress_counts(
+                    item_id=item_id,
+                    completed=accepted,
+                    failed=not accepted,
+                )
+                counts = await snapshot_progress_counts()
+                progress_event(
+                    status="completed" if accepted else "failed",
+                    item_id=item_id,
+                    stage=progress.get("stage"),
+                    message=("同槽位补题已暂存，等待整批提交" if is_budget_replenishment(progress)
+                             else "情境检测及选项修改已暂存" if accepted else "情境检测暂停，整批不提交"),
+                    rewrite_count=progress.get("rewrite_count", 0),
+                    archive_ref=progress.get("archive_ref"),
+                    **counts,
+                )
+                return {"item_id": item_id, "result": result, "error": progress.get("pause_reason")}
             except Exception as exc:
-                emit_progress(
-                    {
-                        "type": "psychometric_subagent_progress",
-                        "status": "failed",
-                        "batch_id": batch_id,
-                        "item_id": item_id,
-                        "error": str(exc),
-                        "message": "该题 subagent 失败，主流程保留原版本",
-                    }
+                await update_progress_counts(item_id=item_id, failed=True)
+                counts = await snapshot_progress_counts()
+                progress_event(
+                    status="failed",
+                    item_id=item_id,
+                    stage="error",
+                    message=str(exc),
+                    **counts,
                 )
-                return {
-                    "item_id": item_id,
-                    "result": None,
-                    "error": str(exc),
-                }
+                return {"item_id": item_id, "result": None, "error": str(exc)}
 
-    outcomes = await asyncio.gather(
-        *(run_one(entry) for entry in unique_entries),
-        return_exceptions=False,
-    )
-    successful: dict[str, dict[str, Any]] = {}
-    failures: dict[str, str] = {}
+    # Wait for in-flight jobs to finish journaling; never cancel their partial records.
+    try:
+        outcomes = await asyncio.gather(*(run_one(entry) for entry in unique_entries))
+    finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+    successful, failures = {}, {}
+    candidate_ids = set(item_by_id)
     for outcome in outcomes:
-        item_id = str(outcome["item_id"])
-        result = outcome.get("result")
-        if not isinstance(result, Mapping):
-            failures[item_id] = str(outcome.get("error") or "subagent 没有返回结果")
+        item_id = outcome["item_id"]
+        update = ((outcome.get("result") or {}).get("state_update") or {})
+        active = update.get("active_psychometric_repair") or {}
+        progress = active.get("scenario_detection") or {}
+        if progress:
+            progress_by_id[item_id] = deepcopy(progress)
+        elif item_id not in progress_by_id:
+            progress_by_id[item_id] = {
+                "status": "paused", "stage": "not_started", "pause_reason": outcome.get("error"),
+            }
+        candidate = update.get("current_item")
+        try:
+            if not (is_current_ready(progress) or is_budget_replenishment(progress)) or not isinstance(candidate, Mapping):
+                raise ValueError(outcome.get("error") or "情境检测未完成")
+            validate_replacement(item_by_id[item_id], candidate, progress)
+            candidate_id = str(candidate["item_id"])
+            if candidate_id != item_id and candidate_id in candidate_ids:
+                raise ValueError(f"replacement ID already exists: {candidate_id}")
+        except (KeyError, TypeError, ValueError) as exc:
+            failures[item_id] = str(exc)
             continue
-        candidate = (result.get("state_update") or {}).get("current_item")
-        if not isinstance(candidate, Mapping) or str(candidate.get("item_id")) != item_id:
-            failures[item_id] = "subagent 返回的题目 ID 不匹配"
-            continue
-        if int(candidate.get("version") or 0) <= int(item_by_id[item_id].get("version") or 0):
-            failures[item_id] = "subagent 没有生成新题目版本"
-            continue
-        successful[item_id] = {
-            "candidate": deepcopy(dict(candidate)),
-            "active_repair": deepcopy(
-                (result.get("state_update") or {}).get(
-                    "active_psychometric_repair"
-                )
-                or {}
-            ),
-            "summary": result.get("summary"),
-        }
+        candidate_ids.add(candidate_id)
+        successful[item_id] = {"candidate": deepcopy(dict(candidate)), "active_repair": deepcopy(active)}
 
-    if not successful:
-        # A batch-level model/output failure must not discard the current bank
-        # or invalidate an otherwise usable response snapshot. Keep every item
-        # in its queue with a retryable status; the next route pass can
-        # diagnose it again instead of terminating the whole run.
-        failed_revise = [
-            {
-                **deepcopy(dict(entry)),
-                "queue_status": "batch_failed",
-                "batch_error": failures.get(str(entry.get("item_id")))
-                or "subagent 没有返回有效候选",
-            }
-            for entry in state.get("items_to_revise") or []
-            if isinstance(entry, Mapping) and entry.get("item_id")
-        ]
-        failed_regenerate = [
-            {
-                **deepcopy(dict(entry)),
-                "queue_status": "batch_failed",
-                "batch_error": failures.get(str(entry.get("item_id")))
-                or "subagent 没有返回有效候选",
-            }
-            for entry in state.get("items_to_regenerate") or []
-            if isinstance(entry, Mapping) and entry.get("item_id")
-        ]
-        detail = "；".join(
-            f"{item_id}：{reason}" for item_id, reason in failures.items()
-        )
-        batch_summary = {
-            "batch_id": batch_id,
-            "batch_total": len(unique_entries),
-            "completed_count": 0,
-            "failed_count": len(failures),
-            "remaining_count": len(failed_revise) + len(failed_regenerate),
-            "concurrency": concurrency,
-            "status": "completed_with_failures",
-            "error_detail": detail,
-        }
-        emit_progress(
-            {
-                "type": "psychometric_subagent_progress",
-                "status": "batch_completed",
-                "batch_id": batch_id,
-                "batch_total": len(unique_entries),
-                "completed_count": 0,
-                "failed_count": len(failures),
-                "remaining_count": len(failed_revise) + len(failed_regenerate),
-                "message": (
-                    f"并发返修本批没有成功候选，已保留 {len(failures)} 道题，"
-                    "下一轮重新诊断；当前施测数据保留"
-                ),
-            }
-        )
+    knowledge_error = None
+    try:
+        await knowledge.finish(progress_by_id)
+    except Exception as exc:
+        knowledge_error = str(exc)
+        knowledge.pause("post_repair", exc)
+    if failures or knowledge_error:
+        staged = {key: deepcopy(value) for key, value in
+                  (state.get("scenario_repair_staged") or {}).items() if key in seen_ids}
+        staged.update({item_id: deepcopy(payload["candidate"]) for item_id, payload in successful.items()})
+        pause = {"recovery_version": 2, "detection_protocol": DETECTION_PROTOCOL,
+                 "batch_id": batch_id, "failures": {**failures, **({"knowledge": knowledge_error} if knowledge_error else {})},
+                 "knowledge_pending": bool(knowledge_error),
+                 "limit_reached": not knowledge_error and any(row.get("rewrite_count", 0) >= row.get("max_rewrites", 5) for row in progress_by_id.values()),
+                 "message": "自动恢复或设计升级额度已用尽；原题库、正式版本和正式作答均未更新，已完成候选已暂存。"}
         return {
             "state_update": {
-                "current_item": None,
-                "current_item_specification": None,
-                "current_blueprint_cell": None,
-                "current_item_review": None,
-                "current_item_repair_attempted": False,
-                "current_item_repair_failure": None,
-                "active_psychometric_repair": None,
-                "psychometric_repair_confirmation": None,
-                "items_to_revise": failed_revise,
-                "items_to_regenerate": failed_regenerate,
-                "psychometric_repair_batch_summary": batch_summary,
+                "repair_knowledge_state": knowledge.summary(),
+                "scenario_repair_pause": pause, "scenario_repair_progress": progress_by_id,
+                "scenario_repair_staged": staged,
+                "items_to_revise": [{
+                    **entry,
+                    "scenario_archive_ref": (
+                        (progress_by_id.get(str(entry["item_id"])) or {}).get("archive_ref")
+                        or entry.get("scenario_archive_ref")
+                    ),
+                    "queue_status": "staged" if str(entry["item_id"]) in successful else "paused",
+                }
+                                    for entry in unique_entries],
+                "items_to_regenerate": [],
+                "psychometric_repair_batch_summary": {"batch_id": batch_id, "batch_total": len(unique_entries),
+                    "completed_count": len(successful), "failed_count": len(failures), "status": "paused",
+                    "remaining_count": len(failures), "concurrency": concurrency},
             },
-            "summary": (
-                f"并发返修本批 {len(failures)} 道题均未返回有效候选；"
-                "已保留原题和当前施测数据，下一轮重新诊断"
-            ),
-            "repair_attempt_count": 0,
+            "summary": pause["message"], "repair_attempt_count": 0,
         }
+
+    budget_replenished_ids = {item_id for item_id, payload in successful.items()
+                              if is_budget_replenishment(payload["active_repair"]["scenario_detection"])}
+    # Version advancement is part of the all-ready commit, not any internal rewrite.
+    for item_id, payload in successful.items():
+        replacement = (payload["active_repair"].get("scenario_detection") or {}).get("staged_design")
+        payload["candidate"]["version"] = 1 if replacement else int(item_by_id[item_id].get("version") or 0) + 1
+
+    staged_blueprint = deepcopy(state.get("blueprint") or {})
+    staged_specs = deepcopy(state.get("item_specifications") or [])
+    staged_skeletons = deepcopy(state.get("item_skeletons") or {})
+    staged_reviews = deepcopy(state.get("skeleton_review_history") or {})
+    lineage = deepcopy(state.get("item_lineage") or {})
+    replacement_dispositions = {}
+    for old_id, payload in successful.items():
+        bundle = (payload["active_repair"].get("scenario_detection") or {}).get("staged_design")
+        if not bundle:
+            continue
+        new_id = payload["candidate"]["item_id"]
+        if any(s["specification_id"] == new_id for s in staged_blueprint.get("slots", [])):
+            raise ValueError(f"replacement ID already exists: {new_id}")
+        staged_blueprint.setdefault("slots", []).append(deepcopy(bundle["slot"]))
+        cell = next(c for c in staged_blueprint["cells"] if c["cell_id"] == payload["candidate"]["blueprint_cell_id"])
+        cell["planned_generation_count"] += 1
+        staged_specs.append(deepcopy(bundle["specification"]))
+        staged_skeletons[new_id] = deepcopy(bundle["skeleton"])
+        staged_reviews[new_id] = [{"mode": "repair_reconstruction", "skeleton": deepcopy(bundle["skeleton"]),
+                                   "content_review": deepcopy(bundle["review"])}]
+        lineage[old_id] = {**lineage.get(old_id, {}), "root_item_id": bundle["root_item_id"],
+                           "status": "eliminated" if old_id in budget_replenished_ids else "replaced",
+                           "replaced_by_item_id": new_id}
+        lineage[new_id] = {"root_item_id": bundle["root_item_id"], "replaces_item_id": old_id,
+                           "replacement_number": bundle["replacement_number"]}
+        replacement_dispositions[old_id] = {"status": "eliminated", "item_version": item_by_id[old_id]["version"],
+                                             "replacement_item_id": new_id}
 
     merged_pool = []
     base_pool = state.get("item_pool") or state.get("frozen_item_bank") or []
@@ -3002,9 +2921,9 @@ async def _execute_psychometric_repair_batch(
         )
     profiles = dict(state.get("item_pattern_profiles") or {})
     for item_id, payload in successful.items():
-        profiles[item_id] = build_item_pattern_profile(
+        profiles[payload["candidate"]["item_id"]] = build_item_pattern_profile(
             payload["candidate"],
-            _psychometric_batch_item_specification(state, payload["candidate"]),
+            _psychometric_batch_item_specification({**state, "item_specifications": staged_specs}, payload["candidate"]),
         )
 
     successful_ids = set(successful)
@@ -3033,6 +2952,7 @@ async def _execute_psychometric_repair_batch(
         if isinstance(entry, Mapping) and str(entry.get("item_id")) not in successful_ids
     ]
     repair_history = deepcopy(state.get("psychometric_repair_history") or [])
+    item_history = deepcopy(state.get("item_history") or {})
     rounds = dict(state.get("psychometric_repair_rounds") or {})
     for entry in unique_entries:
         item_id = str(entry["item_id"])
@@ -3041,13 +2961,28 @@ async def _execute_psychometric_repair_batch(
         active_repair = successful[item_id]["active_repair"]
         round_number = int(entry.get("revision_round") or 1)
         rounds[item_id] = round_number
+        candidate_id = successful[item_id]["candidate"]["item_id"]
+        if candidate_id != item_id:
+            rounds[candidate_id] = 0
+            item_history.setdefault(item_id, []).append({"event": "eliminated" if item_id in budget_replenished_ids else "replaced",
+                "item": deepcopy(item_by_id[item_id]),
+                "replacement_item_id": candidate_id, "recorded_at": utc_timestamp()})
+        item_history.setdefault(candidate_id, []).append({
+            "event": ("replenished" if item_id in budget_replenished_ids else
+                      "reconstructed" if candidate_id != item_id else "revised"),
+            "source": PROTOCOL, "recorded_at": utc_timestamp(),
+            "item": deepcopy(successful[item_id]["candidate"]),
+            "previous_version": item_by_id[item_id].get("version"),
+            "scenario_archive_ref": (active_repair.get("scenario_detection") or {}).get("archive_ref"),
+        })
         repair_history.append(
             {
                 "event": "psychometric_item_repaired",
                 "recorded_at": utc_timestamp(),
                 "item_id": item_id,
                 "revision_round": round_number,
-                "action": entry.get("action") or "revise_item",
+                "action": "eliminate_replenish" if item_id in budget_replenished_ids else entry.get("action") or "revise_item",
+                "resolution": "design_budget_replenishment" if item_id in budget_replenished_ids else "repaired",
                 "baseline_metrics": deepcopy(entry.get("baseline_metrics") or {}),
                 "baseline_item": deepcopy(item_by_id[item_id]),
                 "baseline_profile": deepcopy(
@@ -3059,7 +2994,9 @@ async def _execute_psychometric_repair_batch(
                 "atomic_repair_advice": deepcopy(
                     entry.get("atomic_repair_advice")
                 ),
-                "local_retest": deepcopy(active_repair.get("local_retest")),
+                "repair_protocol": PROTOCOL,
+                "knowledge_snapshot_id": knowledge.data["snapshot"]["snapshot_id"],
+                "scenario_detection": deepcopy(active_repair.get("scenario_detection")),
                 "subagent_id": f"psychometric-repair/{item_id}",
                 "batch_id": batch_id,
             }
@@ -3072,6 +3009,15 @@ async def _execute_psychometric_repair_batch(
         if str(item_id) not in successful_ids and isinstance(statistics, Mapping)
     }
     reset_update: dict[str, Any] = {
+        "blueprint": staged_blueprint,
+        "item_specifications": staged_specs,
+        "item_skeletons": staged_skeletons,
+        "skeleton_review_history": staged_reviews,
+        "item_lineage": lineage,
+        "repair_knowledge_state": knowledge.summary(),
+        "scenario_repair_pause": None,
+        "scenario_repair_progress": progress_by_id,
+        "scenario_repair_staged": {},
         "current_item": None,
         "current_item_specification": None,
         "current_blueprint_cell": None,
@@ -3087,19 +3033,24 @@ async def _execute_psychometric_repair_batch(
         "selection_results": None,
         "selection_reasons": {},
         "item_final_dispositions": {
+            **replacement_dispositions,
+            **{
             str(item_id): deepcopy(dict(disposition))
             for item_id, disposition in (state.get("item_final_dispositions") or {}).items()
             if str(item_id) not in successful_ids and isinstance(disposition, Mapping)
+            },
         },
         "item_pool": merged_pool,
         "item_pattern_profiles": profiles,
         "candidate_bank_audit": None,
         "psychometric_repair_rounds": rounds,
         "psychometric_repair_history": repair_history,
+        "item_history": item_history,
         "psychometric_repair_batch_summary": {
             "batch_id": batch_id,
             "batch_total": len(unique_entries),
             "completed_count": len(successful),
+            "replenished_count": len(budget_replenished_ids),
             "failed_count": len(failures),
             "remaining_count": len(remaining_revise) + len(remaining_regenerate),
             "concurrency": concurrency,
@@ -3126,6 +3077,12 @@ async def _execute_psychometric_repair_batch(
     }
     if isinstance(previous_response_ref, str) and previous_response_ref:
         reset_update["previous_virtual_response_data_ref"] = previous_response_ref
+    if budget_replenished_ids:
+        reset_update["removed_items"] = [*deepcopy(state.get("removed_items") or []),
+            *(deepcopy(item_by_id[item_id]) for item_id in budget_replenished_ids)]
+        reset_update["rejected_items"] = [*deepcopy(state.get("rejected_items") or []),
+            *({"item": deepcopy(item_by_id[item_id]), "reason": "scenario_design_budget_exhausted"}
+              for item_id in budget_replenished_ids)]
     emit_progress(
         {
             "type": "psychometric_subagent_progress",
@@ -3133,6 +3090,7 @@ async def _execute_psychometric_repair_batch(
             "batch_id": batch_id,
             "batch_total": len(unique_entries),
             "completed_count": len(successful),
+            "replenished_count": len(budget_replenished_ids),
             "failed_count": len(failures),
             "remaining_count": len(remaining_revise) + len(remaining_regenerate),
             "message": (
@@ -3144,10 +3102,10 @@ async def _execute_psychometric_repair_batch(
     return {
         "state_update": reset_update,
         "summary": (
-            f"并发完成 {len(successful)} 道题的修改—单题复测闭环；"
+            f"完成 {len(successful)} 道题的情境检测与文本修改；"
             f"失败 {len(failures)} 道，之后统一对更新后的题库施测"
         ),
-        "repair_attempt_count": len(successful),
+        "repair_attempt_count": 0,
     }
 
 
@@ -3229,20 +3187,8 @@ async def execute_item_action_with_repair(
         action in {"revise_item", "regenerate_item"}
         and isinstance(active_psychometric_repair, Mapping)
         and isinstance(atomic_advice, Mapping)
-        and repair_tasks_from_advice(atomic_advice)
     ):
-        return await _execute_psychometric_repair_item(
-            action=action,
-            route=route,
-            state=state,
-            item_specification=(
-                item_specification if isinstance(item_specification, Mapping) else None
-            ),
-            active_psychometric_repair=active_psychometric_repair,
-            atomic_advice=atomic_advice,
-            diagnosis_evidence=(diagnosis_evidence or {}),
-            program_update=program_update,
-        )
+        raise ValueError("心理测量返修必须通过整批情境检测提交，不能继续旧逐题任务；请从检查点恢复。")
     model_state = (
         build_psychometric_repair_model_state(state)
         if diagnosis_evidence is not None
@@ -3452,6 +3398,10 @@ async def _execute_agent(
     state: PSJTState,
 ) -> dict:
     action = route["next_action"]
+    if action == "generate_items_batch":
+        from sjt_system.workflow.item_batch import execute_item_generation_batch
+
+        return await execute_item_generation_batch(state)
     if action == "build_blueprint":
         return await execute_fixed_blueprint(state)
     if action == "review_item":

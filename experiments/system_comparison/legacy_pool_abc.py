@@ -46,6 +46,7 @@ from sjt_system.evaluation.simulation import (
     load_neo_ffi,
 )
 from sjt_system.runtime.output_paths import output_scope
+from sjt_system.runtime.concurrency import UnlimitedConcurrency, gather_all
 from sjt_system.runtime.telemetry import read_ledger, run_context
 
 from .config import fingerprint
@@ -82,7 +83,7 @@ class LegacyABCConfig:
     legacy_project: Path = DEFAULT_LEGACY_PROJECT
     model_id: str | None = None
     neo_ffi_path: Path | None = None
-    max_concurrency: int = 5
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
     respondent_limit: int | None = None
@@ -93,8 +94,8 @@ class LegacyABCConfig:
     sampling_seed: int = 20260913
 
     def validate(self) -> None:
-        if self.max_concurrency < 1 or self.max_concurrency > 50:
-            raise ValueError("max_concurrency 必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency 必须为非负整数")
         if self.max_retries < 0 or self.max_retries > 10:
             raise ValueError("max_retries 必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -525,7 +526,7 @@ async def _run_sjt_stage(
     existing = _load_jsonl_keys(responses_path, key_fields)
     item_by_id = {str(item["item_id"]): item for item in form["items"]}
     jobs = [(rid, item) for rid in subject_ids for item in form["items"] if (rid, str(item["item_id"])) not in existing]
-    semaphore = asyncio.Semaphore(config.max_concurrency)
+    semaphore = UnlimitedConcurrency()
     timeout = config.timeout_seconds or get_model_request_timeout_seconds()
     lock = asyncio.Lock()
     completed = len(existing)
@@ -672,7 +673,7 @@ async def _run_neo_stage(
                 raise ValueError(f"NEO-FFI {rid}/{dimension['dimension_code']}存在不完整缓存")
             if not present:
                 jobs.append((rid, dimension))
-    semaphore = asyncio.Semaphore(config.max_concurrency)
+    semaphore = UnlimitedConcurrency()
     timeout = config.timeout_seconds or get_model_request_timeout_seconds()
     lock = asyncio.Lock()
     total = len(subject_ids) * len(dimensions)
@@ -1190,9 +1191,47 @@ async def run_legacy_abc(config: LegacyABCConfig) -> tuple[Path, dict[str, Any]]
     neo_records: list[dict[str, Any]] = []
     try:
         with output_scope(run_root / "runtime", telemetry=run_root / "telemetry"), run_context(run_id):
-            for method, form in forms.items():
-                all_records[method] = await _run_sjt_stage(method, form, subject_ids, profiles, summaries, sjt_runnable, model_id, run_root / method / "evaluation", config)
-            neo_records = await _run_neo_stage(dimensions, subject_ids, profiles, summaries, neo_runnable, model_id, run_root / "neo_ffi", config)
+            stage_names = [*(f"{method}/sjt" for method in forms), "neo_ffi"]
+            stage_results = await asyncio.gather(
+                *(
+                    _run_sjt_stage(
+                        method,
+                        form,
+                        subject_ids,
+                        profiles,
+                        summaries,
+                        sjt_runnable,
+                        model_id,
+                        run_root / method / "evaluation",
+                        config,
+                    )
+                    for method, form in forms.items()
+                ),
+                _run_neo_stage(
+                    dimensions,
+                    subject_ids,
+                    profiles,
+                    summaries,
+                    neo_runnable,
+                    model_id,
+                    run_root / "neo_ffi",
+                    config,
+                ),
+                return_exceptions=True,
+            )
+            errors = []
+            for stage, result in zip(stage_names, stage_results):
+                if isinstance(result, BaseException):
+                    errors.append((stage, result))
+                elif stage == "neo_ffi":
+                    neo_records = result
+                else:
+                    all_records[stage.removesuffix("/sjt")] = result
+            if errors:
+                stage, error = errors[0]
+                raise RuntimeError(
+                    f"{len(errors)}个独立作答阶段失败；首个阶段{stage}：{error}"
+                )
     except Exception as exc:
         write_json(run_root / "manifest.json", {**json.loads((run_root / "manifest.json").read_text(encoding="utf-8")), "status": "failed", "error": str(exc)})
         raise
@@ -1228,7 +1267,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--legacy-project", type=Path, default=DEFAULT_LEGACY_PROJECT)
     parser.add_argument("--model", dest="model_id", default=None)
     parser.add_argument("--neo-ffi", dest="neo_ffi_path", type=Path, default=None)
-    parser.add_argument("--max-concurrency", type=int, default=5)
+    parser.add_argument(
+        "--max-concurrency", type=int, default=0,
+        help="all independent model calls are dispatched together; legacy concurrency ignored",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--timeout", dest="timeout_seconds", type=float, default=None)
     parser.add_argument("--respondent-limit", type=int, default=None, help="联调时只取来源记录前N名；正式运行省略")

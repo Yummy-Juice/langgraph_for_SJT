@@ -43,6 +43,7 @@ from sjt_system.evaluation.simulation import (
     SJTSelectionOutput,
 )
 from sjt_system.runtime.output_paths import output_scope
+from sjt_system.runtime.concurrency import gather_all
 from sjt_system.runtime.telemetry import run_context
 
 from .config import fingerprint
@@ -570,21 +571,25 @@ async def run_current_score_profile_fivefacet(config: CurrentSystemDefectConfig)
     try:
         with output_scope(root / "runtime", telemetry=root / "telemetry"), run_context(run_id):
             for facet in DEFAULT_FACETS:
+                if facet != "extraversion_gregariousness":
+                    continue
+                facet_response_path = root / "response_cache" / facet / "responses.jsonl"
+                reusable_ids = {
+                    str(item["item_id"])
+                    for item in items_by_facet[facet]
+                }
+                reused_calls += _seed_cached_gregariousness(
+                    target_path=facet_response_path,
+                    source_path=source_cache,
+                    allowed_item_ids=reusable_ids,
+                    model_id=model_id,
+                    run_id=run_id,
+                )
+
+            async def run_facet(index: int, facet: str) -> tuple[str, list[dict[str, Any]]]:
                 facet_refs = refs_by_facet[facet]
                 facet_profiles = list(profiles_by_facet[facet].values())
                 facet_response_path = root / "response_cache" / facet / "responses.jsonl"
-                if facet == "extraversion_gregariousness":
-                    reusable_ids = {
-                        str(item["item_id"])
-                        for item in items_by_facet[facet]
-                    }
-                    reused_calls += _seed_cached_gregariousness(
-                        target_path=facet_response_path,
-                        source_path=source_cache,
-                        allowed_item_ids=reusable_ids,
-                        model_id=model_id,
-                        run_id=run_id,
-                    )
                 records = await _run_current_sjt(
                     root=root,
                     run_id=run_id,
@@ -599,8 +604,14 @@ async def run_current_score_profile_fivefacet(config: CurrentSystemDefectConfig)
                     item_order_by_respondent=item_order_by_respondent,
                     response_path_override=facet_response_path,
                 )
-                all_records.extend(records)
                 print(f"[五facet] {facet} 完成：{len(records)}条作答记录", flush=True)
+                return facet, records
+
+            facet_results = await gather_all(
+                *(run_facet(index, facet) for index, facet in enumerate(DEFAULT_FACETS, 1))
+            )
+            for _, records in facet_results:
+                all_records.extend(records)
         combined_path = root / "responses.jsonl"
         with combined_path.open("w", encoding="utf-8") as handle:
             for record in all_records:

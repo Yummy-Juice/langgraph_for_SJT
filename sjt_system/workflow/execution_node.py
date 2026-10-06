@@ -63,32 +63,6 @@ async def execute_node(state: PSJTState) -> dict:
                 },
             ],
         }
-    if state["step_count"] >= state["max_steps"]:
-        message = "测试达到最大执行步数，流程已停止"
-        return {
-            "status": "failed",
-            "errors": [
-                *state["errors"],
-                {"action": route["next_action"], "message": message},
-            ],
-            "execution_history": [
-                *state["execution_history"],
-                {
-                    "event_id": (
-                        f'{state["run_id"]}:{state["step_count"]}:'
-                        "execute:failed"
-                    ),
-                    "run_id": state["run_id"],
-                    "step": state["step_count"],
-                    "node": "execute",
-                    "action": route["next_action"],
-                    "event_type": "failed",
-                    "recorded_at": utc_timestamp(),
-                    "duration_ms": round((perf_counter() - started_at) * 1000),
-                    "error": message,
-                },
-            ],
-        }
     try:
         result = await execute_agent(route, state)
         effective_action = route["next_action"]
@@ -97,6 +71,13 @@ async def execute_node(state: PSJTState) -> dict:
                 f"Agent 返回了无效的 effective_action：{effective_action!r}"
             )
         proposed_update = result.get("state_update")
+        if effective_action == "clarify_requirements" and not isinstance(
+            proposed_update, dict
+        ):
+            # Requirement clarification supports partial model patches.  The
+            # canonicalizer merges this empty patch with the previous
+            # candidate and the current user feedback.
+            proposed_update = {}
         if not isinstance(proposed_update, dict):
             raise ValueError("Agent 输出缺少有效的 state_update")
         if effective_action == "clarify_requirements":
@@ -136,6 +117,12 @@ async def execute_node(state: PSJTState) -> dict:
                 previous_item=state.get("current_item"),
             )
         is_requirement_action = effective_action == "clarify_requirements"
+        if is_requirement_action:
+            result = {
+                **result,
+                "suggestions": result.get("suggestions") or [],
+                "questions": result.get("questions") or [],
+            }
         pending_interaction = (
             build_requirement_interaction(result)
             if is_requirement_action
@@ -178,7 +165,8 @@ async def execute_node(state: PSJTState) -> dict:
                 "当前候选规格："
                 f"测量构念（{construct_label}）、"
                 f"目标群体（{specification['target_population']}）、"
-                f"题目数量（{specification['final_item_count']}）。"
+                f"各 facet 题数（{specification.get('facet_item_counts') or '待确定'}）、"
+                f"总题数（{specification['final_item_count']}）。"
                 f"{readiness}。"
             )
         else:
@@ -208,7 +196,8 @@ async def execute_node(state: PSJTState) -> dict:
             ),
             **requirement_status_update,
             "execution_history": [
-                *state["execution_history"],
+                *(proposed_update.get("execution_history", state["execution_history"])
+                  if effective_action == "generate_items_batch" else state["execution_history"]),
                 {
                     "event_id": f'{state["run_id"]}:{state["step_count"] + 1}:execute:completed',
                     "run_id": state["run_id"],
@@ -242,7 +231,8 @@ async def execute_node(state: PSJTState) -> dict:
         }
     except Exception as exc:
         message = summarize_error_message(exc)
-        if isinstance(exc, ItemReviewProcessError):
+        from sjt_system.evaluation.virtual_content_review import is_enabled
+        if isinstance(exc, ItemReviewProcessError) and not is_enabled(state):
             # Invalid reviewer JSON is a process failure, not an item-content
             # judgment. After bounded retries, keep the latest structurally
             # valid item and let the workflow accept it without stopping.

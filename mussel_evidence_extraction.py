@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from sjt_system.runtime.concurrency import gather_all
+from sjt_system.runtime.io import write_json_atomic
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Facet 定义
@@ -865,6 +867,60 @@ async def run_stage4_cue_bank(
     )
 
 
+def _source_items_by_id(items: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    items_by_id = {str(item["item_id"]): item for item in items}
+    if len(items_by_id) != len(items):
+        raise ValueError("Mussel source items contain duplicate item_id values")
+    return items_by_id
+
+
+def _validate_source_item_unit(
+    value: Any,
+    source_item: dict[str, Any],
+) -> ItemEvidenceUnit:
+    unit = (
+        value
+        if isinstance(value, ItemEvidenceUnit)
+        else ItemEvidenceUnit.model_validate(value)
+    )
+    if unit.item_id != str(source_item["item_id"]):
+        raise ValueError(
+            f"Stage 1 cache item_id {unit.item_id!r} does not match "
+            f"source item {source_item['item_id']!r}"
+        )
+    if unit.facet != str(source_item["facet"]):
+        raise ValueError(
+            f"Stage 1 cache facet {unit.facet!r} does not match "
+            f"source facet {source_item['facet']!r}"
+        )
+    return unit
+
+
+def _load_complete_stage1_cache(
+    path: Path,
+    items: list[dict[str, Any]],
+    items_by_id: dict[str, dict[str, Any]],
+) -> list[ItemEvidenceUnit]:
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, list):
+        raise ValueError("Stage 1 aggregate cache must be a list")
+    units_by_id: dict[str, ItemEvidenceUnit] = {}
+    for row in raw:
+        unit = ItemEvidenceUnit.model_validate(row)
+        source_item = items_by_id.get(unit.item_id)
+        if source_item is None:
+            raise ValueError(f"Stage 1 aggregate contains unknown item_id {unit.item_id!r}")
+        _validate_source_item_unit(unit, source_item)
+        if unit.item_id in units_by_id:
+            raise ValueError(f"Stage 1 aggregate repeats item_id {unit.item_id!r}")
+        units_by_id[unit.item_id] = unit
+    expected = set(items_by_id)
+    if set(units_by_id) != expected:
+        missing = sorted(expected - set(units_by_id))
+        raise ValueError(f"Stage 1 aggregate is incomplete; missing item_ids: {missing}")
+    return [units_by_id[str(item["item_id"])] for item in items]
+
+
 async def process_facet(
     facet_key: str,
     output_root: Path,
@@ -879,6 +935,7 @@ async def process_facet(
     print(f"{'='*60}")
 
     items = load_mussel_items(facet_key)
+    items_by_id = _source_items_by_id(items)
     output_dir = output_root / facet_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -887,16 +944,49 @@ async def process_facet(
     stage1_path = output_dir / "stage1_per_item_evidence.json"
     if stage1_path.exists():
         print("  Stage 1: 从缓存加载...")
-        raw = json.loads(stage1_path.read_text(encoding="utf-8"))
-        evidence_units = [
-            ItemEvidenceUnit.model_validate(u) for u in raw
-        ]
+        evidence_units = _load_complete_stage1_cache(stage1_path, items, items_by_id)
     else:
-        print(f"  Stage 1: 逐题抽取 ({len(items)} 题，每题独立调用)...")
-        for idx, item in enumerate(items, 1):
-            unit = await run_stage1_single_item(facet_key, item, stage1_agent)
-            evidence_units.append(unit)
-            print(f"    [{idx}/{len(items)}] {item['item_id']} OK")
+        item_cache_dir = output_dir / "stage1_items"
+        item_cache_dir.mkdir(parents=True, exist_ok=True)
+        units_by_id: dict[str, ItemEvidenceUnit] = {}
+        missing_items = []
+        for index, item in enumerate(items):
+            item_id = str(item["item_id"])
+            item_cache_path = item_cache_dir / f"{item_id}.json"
+            if item_cache_path.exists():
+                cached = json.loads(item_cache_path.read_text(encoding="utf-8"))
+                units_by_id[item_id] = _validate_source_item_unit(cached, item)
+            else:
+                missing_items.append((index, item))
+
+        if missing_items:
+            if units_by_id:
+                print(
+                    f"  Stage 1: 恢复逐题缓存 ({len(units_by_id)}/{len(items)} 已缓存，"
+                    f"{len(missing_items)} 题待抽取)..."
+                )
+            else:
+                print(f"  Stage 1: 逐题抽取 ({len(items)} 题，每题独立调用)...")
+
+            async def extract_and_cache(item: dict[str, Any]) -> ItemEvidenceUnit:
+                unit = _validate_source_item_unit(
+                    await run_stage1_single_item(facet_key, item, stage1_agent),
+                    item,
+                )
+                item_cache_path = item_cache_dir / f"{item['item_id']}.json"
+                write_json_atomic(item_cache_path, unit.model_dump(mode="json"))
+                return unit
+
+            new_units = await gather_all(
+                *(extract_and_cache(item) for _, item in missing_items)
+            )
+            for (index, item), unit in zip(missing_items, new_units):
+                units_by_id[str(item["item_id"])] = unit
+                print(f"    [{index + 1}/{len(items)}] {item['item_id']} OK")
+        else:
+            print("  Stage 1: 从逐题缓存加载...")
+
+        evidence_units = [units_by_id[str(item["item_id"])] for item in items]
         stage1_path.write_text(
             json.dumps(
                 [u.model_dump(mode="json") for u in evidence_units],
@@ -921,18 +1011,22 @@ async def process_facet(
         )
         print(f"  Stage 2 完成: {len(library.evidence_library)} 族 -> {stage2_path}")
 
-    # Stage 3: 行为表现库
+    # Stage 3 and Stage 4 only depend on the completed Stage 2 library.
     stage3_path = output_dir / "stage3_behavior_bank.json"
     if stage3_path.exists():
         print("  Stage 3: 从缓存加载...")
     else:
         print("  Stage 3: 构建行为表现库...")
-        behavior_bank = await run_stage3_behavior_bank(facet_key, library, evidence_units, stage3_agent)
-        stage3_path.write_text(
-            json.dumps(behavior_bank.model_dump(mode="json"), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(f"  Stage 3 完成: {len(behavior_bank.manifestations)} 条 -> {stage3_path}")
+
+        async def build_stage3() -> None:
+            behavior_bank = await run_stage3_behavior_bank(
+                facet_key, library, evidence_units, stage3_agent
+            )
+            stage3_path.write_text(
+                json.dumps(behavior_bank.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"  Stage 3 完成: {len(behavior_bank.manifestations)} 条 -> {stage3_path}")
 
     # Stage 4: 特质激活线索库
     stage4_path = output_dir / "stage4_cue_bank.json"
@@ -940,12 +1034,23 @@ async def process_facet(
         print("  Stage 4: 从缓存加载...")
     else:
         print("  Stage 4: 构建线索库...")
-        cue_bank = await run_stage4_cue_bank(facet_key, library, evidence_units, stage4_agent)
-        stage4_path.write_text(
-            json.dumps(cue_bank.model_dump(mode="json"), ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        print(f"  Stage 4 完成: {len(cue_bank.cues)} 条 -> {stage4_path}")
+
+        async def build_stage4() -> None:
+            cue_bank = await run_stage4_cue_bank(
+                facet_key, library, evidence_units, stage4_agent
+            )
+            stage4_path.write_text(
+                json.dumps(cue_bank.model_dump(mode="json"), ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"  Stage 4 完成: {len(cue_bank.cues)} 条 -> {stage4_path}")
+
+    pending_libraries = []
+    if not stage3_path.exists():
+        pending_libraries.append(build_stage3())
+    if not stage4_path.exists():
+        pending_libraries.append(build_stage4())
+    await gather_all(*pending_libraries)
 
 
 async def main():
@@ -958,11 +1063,14 @@ async def main():
     stage3_agent = create_agent(STAGE3_BEHAVIOR_BANK_PROMPT, BehavioralManifestationBank, temperature=0.1)
     stage4_agent = create_agent(STAGE4_CUE_BANK_PROMPT, TraitActivatingCueBank, temperature=0.1)
 
-    for facet_key in ["开放性", "责任心", "外倾性", "宜人性", "神经质"]:
-        await process_facet(
+    facet_keys = ["开放性", "责任心", "外倾性", "宜人性", "神经质"]
+    await gather_all(*(
+        process_facet(
             facet_key, output_root,
             stage1_agent, stage2_agent, stage3_agent, stage4_agent,
         )
+        for facet_key in facet_keys
+    ))
 
     print("\n" + "=" * 60)
     print("全部完成!")

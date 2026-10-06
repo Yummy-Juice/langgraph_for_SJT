@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "database_version": "demographics-v1",
+  "synthetic": true,
+  "kind": "income",
+  "currency": "CNY",
+  "period": "month",
+  "definition": "individual_pre_tax_income",
+  "step": 100,
+  "age_multipliers": [
+    { "minimum_age": 18, "maximum_age": 24, "multiplier": 0.8 },
+    { "minimum_age": 25, "maximum_age": 39, "multiplier": 1.0 },
+    { "minimum_age": 40, "maximum_age": 60, "multiplier": 1.1 }
+  ],
+  "education_multipliers": {
+    "primary": 1.0,
+    "lower_secondary": 1.0,
+    "upper_secondary": 1.0,
+    "bachelor": 1.0,
+    "master": 1.15,
+    "doctorate": 1.3
+  },
+  "entries": [
+    { "id": "zero", "minimum": 0, "maximum": 0 },
+    { "id": "retired", "minimum": 1000, "maximum": 10000 },
+    { "id": "service", "minimum": 2000, "maximum": 9000 },
+    { "id": "technical", "minimum": 4000, "maximum": 15000 },
+    { "id": "public_service", "minimum": 5000, "maximum": 18000 },
+    { "id": "engineering", "minimum": 7000, "maximum": 30000 },
+    { "id": "professional", "minimum": 9000, "maximum": 40000 },
+    { "id": "variable", "minimum": 2000, "maximum": 60000 }
+  ]
+}

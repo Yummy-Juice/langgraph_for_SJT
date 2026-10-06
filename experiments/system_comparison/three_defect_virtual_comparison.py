@@ -46,6 +46,7 @@ from sjt_system.evaluation.simulation import (
     build_sjt_messages,
 )
 from sjt_system.runtime.output_paths import output_scope
+from sjt_system.runtime.concurrency import UnlimitedConcurrency, gather_all
 from sjt_system.runtime.telemetry import run_context
 
 from .config import fingerprint
@@ -116,7 +117,7 @@ class ThreeDefectVirtualComparisonConfig:
     neo_scores_path: Path | None = None
     model_id: str | None = None
     respondents: int = 100
-    max_concurrency: int = 30
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
     sampling_seed: int = 20260915
@@ -125,8 +126,8 @@ class ThreeDefectVirtualComparisonConfig:
     def validate(self) -> None:
         if self.respondents != 100:
             raise ValueError("当前冻结设计要求respondents恰好为100")
-        if not 1 <= self.max_concurrency <= 50:
-            raise ValueError("max_concurrency必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency必须为非负整数")
         if not 0 <= self.max_retries <= 10:
             raise ValueError("max_retries必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -577,17 +578,7 @@ async def _run_preflights(
     timeout: float,
     seed: int,
 ) -> None:
-    semaphore = asyncio.Semaphore(1)
-    await _invoke_with_retry(
-        probability_runnable,
-        build_embodied_probability_sjt_messages(embodied_persona, item),
-        semaphore=semaphore,
-        validator=_validate_choice_probabilities,
-        max_retries=0,
-        retry_delay_seconds=0,
-        request_timeout_seconds=timeout,
-        job_label="three defect embodied JSON preflight",
-    )
+    semaphore = UnlimitedConcurrency()
     score_prompt = build_persona_prompt(
         score_profile,
         persona_mode=PERSONA_MODE_SCORE_PROFILE,
@@ -601,15 +592,27 @@ async def _run_preflights(
         item_id=str(item["item_id"]),
     )
     display_ids = {chr(ord("A") + index) for index in range(len(ordered_ids))}
-    await _invoke_with_retry(
-        selection_runnable,
-        build_sjt_messages(score_prompt, item, display_option_order=ordered_ids),
-        semaphore=semaphore,
-        validator=lambda value: _validate_selection(value, display_ids),
-        max_retries=0,
-        retry_delay_seconds=0,
-        request_timeout_seconds=timeout,
-        job_label="three defect score profile JSON preflight",
+    await gather_all(
+        _invoke_with_retry(
+            probability_runnable,
+            build_embodied_probability_sjt_messages(embodied_persona, item),
+            semaphore=semaphore,
+            validator=_validate_choice_probabilities,
+            max_retries=0,
+            retry_delay_seconds=0,
+            request_timeout_seconds=timeout,
+            job_label="three defect embodied JSON preflight",
+        ),
+        _invoke_with_retry(
+            selection_runnable,
+            build_sjt_messages(score_prompt, item, display_option_order=ordered_ids),
+            semaphore=semaphore,
+            validator=lambda value: _validate_selection(value, display_ids),
+            max_retries=0,
+            retry_delay_seconds=0,
+            request_timeout_seconds=timeout,
+            job_label="three defect score profile JSON preflight",
+        ),
     )
 
 
@@ -798,23 +801,10 @@ async def run_three_defect_virtual_comparison(
                 })
                 print("[三类缺陷实验] 输出格式预检通过 2/2", flush=True)
 
-            failure_phase = "embodied_probability_responses"
-            print("[三类缺陷实验] 具身概率方法开始：100人 × 20题", flush=True)
-            embodied_records = await _run_sjt_stage(
-                "THREE_DEFECT_EMBODIED",
-                {"items": items},
-                subject_ids,
-                legacy_profiles,
-                summaries,
-                probability_runnable,
-                model_id,
-                root / "embodied_probability" / "responses",
-                legacy_run_config,
-            )
+            failure_phase = "independent_response_stages"
+            print("[三类缺陷实验] 具身概率与五facet分数提示词同时开始", flush=True)
 
-            failure_phase = "score_profile_responses"
-            score_records: list[dict[str, Any]] = []
-            for index, facet in enumerate(DEFAULT_FACETS, 1):
+            async def run_score_profile_facet(index: int, facet: str) -> list[dict[str, Any]]:
                 facet_items = [
                     item for item in items if item["target_dimension_id"] == facet
                 ]
@@ -846,7 +836,51 @@ async def run_three_defect_virtual_comparison(
                         root / "score_profile" / "response_cache" / facet / "responses.jsonl"
                     ),
                 )
-                score_records.extend(local)
+                print(
+                    f"[三类缺陷实验] 当前分数提示词 {index}/5 完成：{facet}，{len(local)}条作答记录",
+                    flush=True,
+                )
+                return local
+
+            stage_names = ["embodied_probability", *(f"score_profile/{facet}" for facet in DEFAULT_FACETS)]
+            stage_results = await asyncio.gather(
+                _run_sjt_stage(
+                    "THREE_DEFECT_EMBODIED",
+                    {"items": items},
+                    subject_ids,
+                    legacy_profiles,
+                    summaries,
+                    probability_runnable,
+                    model_id,
+                    root / "embodied_probability" / "responses",
+                    legacy_run_config,
+                ),
+                *(
+                    run_score_profile_facet(index, facet)
+                    for index, facet in enumerate(DEFAULT_FACETS, 1)
+                ),
+                return_exceptions=True,
+            )
+            errors = [
+                (name, result)
+                for name, result in zip(stage_names, stage_results)
+                if isinstance(result, BaseException)
+            ]
+            if errors:
+                write_json(root / "errors.json", {
+                    "stage": failure_phase,
+                    "errors": [f"{name}: {error}" for name, error in errors],
+                })
+                name, error = errors[0]
+                raise RuntimeError(
+                    f"{len(errors)}个独立作答阶段失败；首个阶段{name}：{error}"
+                )
+            embodied_records = stage_results[0]
+            score_records = [
+                record
+                for facet_result in stage_results[1:]
+                for record in facet_result
+            ]
 
         combined_path = root / "score_profile" / "responses.jsonl"
         combined_path.parent.mkdir(parents=True, exist_ok=True)

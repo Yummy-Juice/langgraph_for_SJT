@@ -1,5 +1,6 @@
 """Independent, form-scoped evaluation; never invokes a writer or selector."""
 from copy import deepcopy
+import json
 from pathlib import Path
 import shutil
 
@@ -29,7 +30,8 @@ def evaluation_state(store, key):
                   "virtual_sample_config": deepcopy(sample["config"])})
     state["virtual_sample_config"]["model_id"] = store.config.evaluation_model_id
     state["virtual_sample_config"]["experiment_protocol"] = {
-        "model": store.config.evaluation_model_id, "sample": "evaluation", "temperature": 1.0}
+        "model": store.config.evaluation_model_id, "sample": "evaluation",
+        "temperature": state["virtual_sample_config"]["response_temperature"]}
     state.update(build_item_bank_freeze_update(state))
     return state
 
@@ -42,8 +44,15 @@ def flatten_items(state, key):
     for item in clean.get("frozen_item_bank", []):
         statistics.setdefault(item["item_id"], {"quality_evaluation": {}, "qualification": {}})
     result = build_psychometric_round_result(clean)
-    names = {"citc_pass": "citc", "target_rho_pass": "target_rho",
-             "same_domain_vts_pass": "same_domain_vts", "cross_domain_vts_pass": "cross_domain_vts"}
+    names = {
+        "citc_pass": "citc",
+        "target_rho_pass": "target_rho",
+        "same_domain_vts_pass": "same_domain_vts",
+        "cross_domain_vts_pass": "cross_domain_vts",
+        "target_hedges_g_pass": "target_hedges_g",
+        "target_ipip_spearman_rho_pass": "target_ipip_spearman_rho",
+        "discriminant_delta_min_pass": "discriminant_delta_min",
+    }
     rows = []
     for item in result["items"]:
         row = {"method": key.split("/")[0], "round": key.split("/")[1],
@@ -116,17 +125,34 @@ async def evaluate_form(store, key, base_model=None):
     if reused_from is None:
         # Reuse only previous independent evaluation records when the core cache
         # validator accepts config, model, item content, scores and administration.
+        current_items = {
+            json.dumps(item, ensure_ascii=False, sort_keys=True)
+            for item in state["frozen_item_bank"]
+        }
+        sources = []
         for other in reversed(store.forms()):
             if other == key:
                 continue
             previous = store.read(f"{other}/evaluation/checkpoint.json", {})
             completed = store.read(f"{other}/evaluation/metrics.json", {})
             if completed.get("status") == "complete" and previous.get("virtual_response_data_ref"):
-                state["previous_virtual_response_data_ref"] = previous["virtual_response_data_ref"]
-                break
+                overlap = len(current_items.intersection(
+                    json.dumps(item, ensure_ascii=False, sort_keys=True)
+                    for item in previous.get("frozen_item_bank") or []
+                ))
+                sources.append((overlap, previous["virtual_response_data_ref"]))
+        if sources:
+            state["previous_virtual_response_data_ref"] = max(sources, key=lambda row: row[0])[1]
         if base_model is None:
             from sjt_system.agent.client import get_model
-            base_model = get_model(store.config.evaluation_model_id)
+            import os
+            thinking = os.getenv("VIRTUAL_RESPONDENT_THINKING", "enabled").strip().lower()
+            base_model = get_model(
+                store.config.evaluation_model_id,
+                temperature=state["virtual_sample_config"]["response_temperature"],
+                thinking_type=thinking,
+                reasoning_effort=(None if thinking == "disabled" else os.getenv("VIRTUAL_RESPONDENT_REASONING_EFFORT", "high")),
+            )
         with store.timer(f"{key}/evaluation"), output_scope(store.path(f"{key}/evaluation")), run_context(state["run_id"]):
             simulation = await run_virtual_response_simulation(state, base_model=base_model)
             state.update(simulation["state_update"])

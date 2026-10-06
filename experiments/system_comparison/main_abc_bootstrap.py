@@ -30,10 +30,10 @@ import pandas as pd
 from scipy import stats
 
 # Gate thresholds, matching the main system's analysis manifest.
-CITC_THRESHOLD = 0.2
-TARGET_RHO_THRESHOLD = 0.3
-SAME_DOMAIN_VTS_THRESHOLD = 0.1
-CROSS_DOMAIN_VTS_THRESHOLD = 0.2
+CITC_THRESHOLD = 0.3
+TARGET_RHO_THRESHOLD = 0.4
+SAME_DOMAIN_VTS_THRESHOLD = 0.2
+CROSS_DOMAIN_VTS_THRESHOLD = 0.3
 EXTREME_GROUP_FRACTION = 1.0 / 3.0
 
 DEFAULT_METHODS = ("A/round_01", "B/round_01", "C/round_02", "C/round_03", "C/round_04")

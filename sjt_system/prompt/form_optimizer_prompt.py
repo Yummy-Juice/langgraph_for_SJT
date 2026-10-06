@@ -27,35 +27,40 @@ authority, violates the behavior-evidence boundary, or creates a theory-level
 coverage gap. Conversely, do not discard a theoretically complementary item
 merely because its single-item statistic is not the largest.
 
-The whole-test report has one current optimization objective, two validity
-protection conditions, and two reliability/stability gates:
+Each selected facet has the same five measured quantities and its own gates:
 
 1. target-facet known-groups validity: Hedges' g between the upper and lower
    third of the matched IPIP-NEO facet;
 2. discriminant validity protection: delta_min = target IPIP Spearman rho minus
-   the largest absolute Spearman rho with the four non-target IPIP facets;
+   the largest absolute Spearman rho with the other selected IPIP facets;
 3. convergent validity protection: target-facet IPIP Spearman rho;
-4. internal consistency gate: Cronbach alpha >= .80;
-5. virtual whole-form stability gate: absolute-agreement ICC >= .80.
+4. internal consistency gate: Cronbach alpha >= .70;
+5. virtual facet-score test-retest stability gate: absolute-agreement ICC >= .70.
 
 Use construct and theoretical coverage as hard selection constraints and as
-the tie-breaking rationale. Single-item CITC, difficulty, target correlation,
-VTS, and option-gradient indicators remain item-level screening indicators;
-they are not additional whole-test objectives. Cronbach alpha, target recovery
+the tie-breaking rationale. The four single-item qualification gates are
+tracked separately, not additional whole-test objectives. The score-profile
+target correlation and both VTS metrics, difficulty and option-gradient
+indicators remain diagnostic. Target recovery
 R-squared, and the old matched-condition selectivity are descriptive
 diagnostics only and must not be optimized as if they were human reliability
 or validity.
 
-The program compares current whole forms by the following policy:
+The program compares current whole forms by the following policy, separately
+for every selected facet:
 
-1. primary: maximize target-facet IPIP Hedges' g;
-2. do not accept a candidate if delta_min decreases;
-3. do not accept a candidate if target-facet IPIP Spearman rho decreases by
-   more than .02.
+1. Cronbach alpha and ICC must each be >= .70 for every facet;
+2. each facet's target IPIP Hedges' g must strictly increase;
+3. each facet's delta_min must strictly increase;
+4. each facet's target IPIP Spearman rho must strictly increase.
+Compare to the previous completed development round, with numerical epsilon
+1e-12, not to rejected local attempts. Keep already accepted facets fixed while
+only failed facets are repaired. Do not count a historical hold as improvement.
 
-Prefer the form with the largest program-returned target Hedges' g after all
-blueprint, theory, alpha, ICC, and non-inferiority constraints pass. Do not
-combine Hedges' g and rho into an invented scalar. The old virtual construct
+The initial measurement establishes a baseline when all five quantities are
+estimable, even if reliability fails. Thereafter only all-facet success completes
+a development round. Do not combine
+facets or Hedges' g and rho into an invented decision scalar. The old virtual construct
 isolation I_g, Q, target recovery R-squared, and matched-condition selectivity
 remain descriptive or legacy diagnostics and are not optimization objectives.
 

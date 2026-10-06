@@ -27,7 +27,11 @@ def _parser() -> argparse.ArgumentParser:
     parse_command.add_argument("--source", type=Path, default=DEFAULT_IPIP_SOURCE_PATH)
     parse_command.add_argument("--output", type=Path, default=DEFAULT_CORPUS_PATH)
     build = commands.add_parser("build")
-    build.add_argument("--facet", required=True)
+    build.add_argument(
+        "--facet",
+        required=True,
+        help="Facet code, comma-separated codes, or ALL.",
+    )
     build.add_argument("--corpus", type=Path, default=DEFAULT_CORPUS_PATH)
     build.add_argument(
         "--output-root", type=Path, default=DEFAULT_OFFLINE_BEHAVIOR_ROOT
@@ -40,14 +44,31 @@ def _parser() -> argparse.ArgumentParser:
 async def _build(args: argparse.Namespace) -> int:
     corpus = load_ipip_corpus(args.corpus)
     requested = args.facet.upper()
-    codes = list(NEO_FACET_CODE_TO_ID) if requested == "ALL" else [requested]
+    requested_codes = (
+        list(NEO_FACET_CODE_TO_ID)
+        if requested == "ALL"
+        else [code.strip() for code in requested.split(",")]
+    )
+    codes = list(dict.fromkeys(requested_codes))
     unknown = [code for code in codes if code not in NEO_FACET_CODE_TO_ID]
     if unknown:
         raise ValueError("未知 facet code：" + "、".join(unknown))
-    for code in codes:
+
+    async def mine_save_print(code: str) -> None:
         bundle = await mine_behavior_evidence(code, corpus)
         path = save_behavior_evidence_bundle(bundle, args.output_root)
         print(f"{code}: evidence={len(bundle.evidence)} -> {path}")
+
+    results = await asyncio.gather(
+        *(mine_save_print(code) for code in codes),
+        return_exceptions=True,
+    )
+    first_error = next(
+        (result for result in results if isinstance(result, BaseException)),
+        None,
+    )
+    if first_error is not None:
+        raise first_error
     return 0
 
 

@@ -1,0 +1,32 @@
+{
+  "schema_version": 1,
+  "database_version": "demographics-v1",
+  "synthetic": true,
+  "kind": "nationality",
+  "entries": [
+    { "id": "CN", "label": "中国", "continent": "Asia" },
+    { "id": "JP", "label": "日本", "continent": "Asia" },
+    { "id": "KR", "label": "韩国", "continent": "Asia" },
+    { "id": "IN", "label": "印度", "continent": "Asia" },
+    { "id": "ID", "label": "印度尼西亚", "continent": "Asia" },
+    { "id": "RU", "label": "俄罗斯", "continent": "Europe" },
+    { "id": "GB", "label": "英国", "continent": "Europe" },
+    { "id": "FR", "label": "法国", "continent": "Europe" },
+    { "id": "DE", "label": "德国", "continent": "Europe" },
+    { "id": "IT", "label": "意大利", "continent": "Europe" },
+    { "id": "US", "label": "美国", "continent": "North America" },
+    { "id": "CA", "label": "加拿大", "continent": "North America" },
+    { "id": "MX", "label": "墨西哥", "continent": "North America" },
+    { "id": "BR", "label": "巴西", "continent": "South America" },
+    { "id": "AR", "label": "阿根廷", "continent": "South America" },
+    { "id": "CL", "label": "智利", "continent": "South America" },
+    { "id": "EG", "label": "埃及", "continent": "Africa" },
+    { "id": "NG", "label": "尼日利亚", "continent": "Africa" },
+    { "id": "ZA", "label": "南非", "continent": "Africa" },
+    { "id": "KE", "label": "肯尼亚", "continent": "Africa" },
+    { "id": "MA", "label": "摩洛哥", "continent": "Africa" },
+    { "id": "AU", "label": "澳大利亚", "continent": "Oceania" },
+    { "id": "NZ", "label": "新西兰", "continent": "Oceania" },
+    { "id": "FJ", "label": "斐济", "continent": "Oceania" }
+  ]
+}

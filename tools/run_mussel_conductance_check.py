@@ -19,7 +19,8 @@ target 虚拟被试（默认每组 100 人，已知 persona 分数 0-100 正态�
 
 用法：
   python tools/run_mussel_conductance_check.py [--sample-size 100]
-      [--concurrency 10] [--max-retries 2] [--seed 7] [--groups ...]
+      [--concurrency 0] [--max-retries 2] [--seed 7] [--groups ...]
+      （--concurrency 仅兼容旧参数，0 或正数均为全量并发）
 """
 
 from __future__ import annotations
@@ -59,6 +60,11 @@ from sjt_system.evaluation.simulation import (
     balanced_option_order,
     build_persona_prompt,
     build_sjt_messages,
+)
+from sjt_system.runtime.concurrency import (
+    UnlimitedConcurrency,
+    gather_all,
+    validate_max_concurrency,
 )
 from sjt_system.runtime.telemetry import run_context as telemetry_run_context
 
@@ -109,7 +115,7 @@ async def _answer_mussel_group(
     refs: list[dict[str, Any]],
     mussel_items: list[dict[str, Any]],
     sjt_model: Any,
-    semaphore: asyncio.Semaphore,
+    semaphore: UnlimitedConcurrency,
     output_path: Path,
     max_retries: int,
     retry_delay_seconds: float,
@@ -526,7 +532,7 @@ async def _main(args: argparse.Namespace) -> None:
         model,
         SJTSelectionOutput,
     )
-    semaphore = asyncio.Semaphore(args.concurrency)
+    semaphore = UnlimitedConcurrency()
     request_timeout_seconds = get_model_request_timeout_seconds()
     facet_ids = list(args.groups) if args.groups else MUSSEL_FACET_IDS
     if not facet_ids or set(facet_ids) - set(MUSSEL_FACET_IDS):
@@ -534,12 +540,10 @@ async def _main(args: argparse.Namespace) -> None:
 
     print(
         f"[run] {run_id} | {len(facet_ids)} 组 × {args.sample_size} 人 × "
-        f"{len(mussel_items)} 题 | 并发 {args.concurrency} | 模型 {getattr(model, 'model_name', '?')}"
+        f"{len(mussel_items)} 题 | 全量并发 | 模型 {getattr(model, 'model_name', '?')}"
     )
     profiles_by_group: dict[str, list[dict[str, Any]]] = {}
-    group_summaries = []
-    total_calls = 0
-    total_errors = 0
+    group_inputs = []
     for group_index, facet_id in enumerate(facet_ids):
         specs = [{"dimension_id": facet_id, "mean_score": 50.0}]
         refs, _diagnostics = generate_score_respondent_refs(
@@ -553,32 +557,59 @@ async def _main(args: argparse.Namespace) -> None:
             ref["respondent_id"] = f"{facet_id}-{ref['respondent_id']}"
             ref["respondent_index"] = index
         profiles_by_group[facet_id] = refs
+        group_inputs.append((facet_id, refs))
+
+    group_summaries: list[dict[str, Any] | None] = [None] * len(group_inputs)
+    summary_write_lock = asyncio.Lock()
+    group_locks = {
+        facet_id: asyncio.Lock() for facet_id, _refs in group_inputs
+    }
+
+    async def run_group(
+        group_index: int,
+        facet_id: str,
+        refs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         started = time.perf_counter()
-        summary = await _answer_mussel_group(
-            facet_id=facet_id,
-            refs=refs,
-            mussel_items=mussel_items,
-            sjt_model=sjt_model,
-            semaphore=semaphore,
-            output_path=response_path,
-            max_retries=args.max_retries,
-            retry_delay_seconds=1.0,
-            request_timeout_seconds=request_timeout_seconds,
-            seed=args.seed,
-            run_id=run_id,
-        )
+        # Duplicate --groups entries share respondent/item cache keys and must
+        # retain the old sequential skip-on-resume behavior.
+        async with group_locks[facet_id]:
+            summary = await _answer_mussel_group(
+                facet_id=facet_id,
+                refs=refs,
+                mussel_items=mussel_items,
+                sjt_model=sjt_model,
+                semaphore=semaphore,
+                output_path=response_path,
+                max_retries=args.max_retries,
+                retry_delay_seconds=1.0,
+                request_timeout_seconds=request_timeout_seconds,
+                seed=args.seed,
+                run_id=run_id,
+            )
         elapsed = time.perf_counter() - started
-        group_summaries.append({**summary, "elapsed_seconds": round(elapsed, 1)})
-        total_calls += summary["completed_calls"]
-        total_errors += summary["error_count"]
+        row = {**summary, "elapsed_seconds": round(elapsed, 1)}
+        group_summaries[group_index] = row
         print(
             f"[group] {facet_id}: 新增 {summary['completed_calls']} 条作答，"
             f"失败 {summary['error_count']}，耗时 {elapsed:.0f}s"
         )
-        with (output_dir / "group_summaries.json").open(
-            "w", encoding="utf-8"
-        ) as handle:
-            json.dump(group_summaries, handle, ensure_ascii=False, indent=2)
+        async with summary_write_lock:
+            ready_summaries = [row for row in group_summaries if row is not None]
+            with (output_dir / "group_summaries.json").open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(ready_summaries, handle, ensure_ascii=False, indent=2)
+        return row
+
+    group_summaries = await gather_all(
+        *(
+            run_group(index, facet_id, refs)
+            for index, (facet_id, refs) in enumerate(group_inputs)
+        )
+    )
+    total_calls = sum(summary["completed_calls"] for summary in group_summaries)
+    total_errors = sum(summary["error_count"] for summary in group_summaries)
 
     if total_errors:
         print(
@@ -629,7 +660,12 @@ async def _main(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Mussel 内部传导自检（独立实验）")
     parser.add_argument("--sample-size", type=int, default=100)
-    parser.add_argument("--concurrency", type=int, default=10)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        help="兼容旧参数；0 或正数均为全量并发，不再限制并发数",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
@@ -639,6 +675,10 @@ def main() -> None:
         help="facet_id 子集（默认全部 5 个）",
     )
     args = parser.parse_args()
+    try:
+        validate_max_concurrency(args.concurrency)
+    except ValueError as exc:
+        parser.error(str(exc))
     with telemetry_run_context(f"mussel-conductance"):
         asyncio.run(_main(args))
 

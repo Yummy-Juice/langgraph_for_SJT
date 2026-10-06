@@ -32,6 +32,7 @@ from sjt_system.evaluation.simulation import (
     _load_jsonl_records,
 )
 from sjt_system.runtime.output_paths import output_scope
+from sjt_system.runtime.concurrency import UnlimitedConcurrency
 from sjt_system.runtime.telemetry import run_context
 
 from .config import fingerprint
@@ -75,13 +76,13 @@ class LegacySummaryConfig:
     legacy_project: Path = DEFAULT_LEGACY_PROJECT
     output: Path = DEFAULT_OUTPUT
     model_id: str | None = None
-    max_concurrency: int = 5
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
 
     def validate(self) -> None:
-        if self.max_concurrency < 1 or self.max_concurrency > 50:
-            raise ValueError("max_concurrency 必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency 必须为非负整数")
         if self.max_retries < 0 or self.max_retries > 10:
             raise ValueError("max_retries 必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -355,7 +356,7 @@ async def run_legacy_summary_pool(
     )
     missing = [rid for rid in respondent_ids if rid not in cached]
     timeout = config.timeout_seconds or get_model_request_timeout_seconds()
-    semaphore = asyncio.Semaphore(config.max_concurrency)
+    semaphore = UnlimitedConcurrency()
     write_lock = asyncio.Lock()
     start = perf_counter()
     completed = len(cached)
@@ -524,7 +525,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--legacy-project", type=Path, default=DEFAULT_LEGACY_PROJECT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--model", dest="model_id", default=None)
-    parser.add_argument("--max-concurrency", type=int, default=5)
+    parser.add_argument(
+        "--max-concurrency", type=int, default=0,
+        help="all independent model calls are dispatched together; legacy concurrency ignored",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--timeout", dest="timeout_seconds", type=float, default=None)
     return parser

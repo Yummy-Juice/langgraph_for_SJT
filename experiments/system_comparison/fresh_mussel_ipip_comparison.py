@@ -43,6 +43,7 @@ from sjt_system.evaluation.simulation import (
     _invoke_with_retry,
 )
 from sjt_system.runtime.output_paths import output_scope
+from sjt_system.runtime.concurrency import UnlimitedConcurrency
 from sjt_system.runtime.telemetry import read_ledger, run_context
 
 from .legacy_pool_abc import (
@@ -105,7 +106,7 @@ class FreshComparisonConfig:
     mussel_path: Path = DEFAULT_MUSSEL
     ipip_path: Path = DEFAULT_IPIP
     model_id: str = "glm-5.3-flash"
-    max_concurrency: int = 30
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
     sampling_seed: int = 20260916
@@ -121,8 +122,8 @@ class FreshComparisonConfig:
     def validate(self) -> None:
         if self.respondents < 3:
             raise ValueError("respondents至少为3")
-        if not 1 <= self.max_concurrency <= 50:
-            raise ValueError("max_concurrency必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency必须为非负整数")
         if not 0 <= self.max_retries <= 10:
             raise ValueError("max_retries必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -415,7 +416,7 @@ async def _run_sjt_condition(
     config: FreshComparisonConfig,
     output_dir: Path,
     run_id: str,
-    semaphore: asyncio.Semaphore,
+    semaphore: Any,
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "responses.jsonl"
@@ -552,7 +553,7 @@ async def _run_ipip_condition(
     model_id: str,
     config: FreshComparisonConfig,
     output_dir: Path,
-    semaphore: asyncio.Semaphore,
+    semaphore: Any,
 ) -> list[dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / "responses.jsonl"
@@ -903,9 +904,11 @@ async def run_fresh_comparison(config: FreshComparisonConfig) -> tuple[Path, dic
     model_id = _model_id(model, config.model_id)
     sjt_records: dict[str, list[dict[str, Any]]] = {}
     ipip_records: dict[str, list[dict[str, Any]]] = {}
-    shared_semaphore = asyncio.Semaphore(config.max_concurrency)
+    shared_semaphore = UnlimitedConcurrency()
 
-    async def run_condition(condition: str) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
+    async def run_condition(
+        condition: str,
+    ) -> tuple[str, list[dict[str, Any]] | BaseException, list[dict[str, Any]] | BaseException]:
         spec = prompt_specs[condition]
         prompts = _persona_prompts(
             condition,
@@ -915,22 +918,6 @@ async def run_fresh_comparison(config: FreshComparisonConfig) -> tuple[Path, dic
             score_specs_by_condition,
             for_ipip=False,
         )
-        condition_sjt_records = await _run_sjt_condition(
-            condition=condition,
-            subject_ids=subject_ids,
-            items=items,
-            prompts=prompts,
-            participant_metadata=participant_metadata,
-            sjt_response_mode=spec.sjt_response_mode,
-            runnable=probability_runnable
-            if spec.sjt_response_mode == "choice_probability"
-            else selection_runnable,
-            model_id=model_id,
-            config=config,
-            output_dir=output / condition / "mussel",
-            run_id=run_id,
-            semaphore=shared_semaphore,
-        )
         ipip_prompts = _persona_prompts(
             condition,
             subject_ids,
@@ -939,17 +926,36 @@ async def run_fresh_comparison(config: FreshComparisonConfig) -> tuple[Path, dic
             score_specs_by_condition,
             for_ipip=True,
         )
-        condition_ipip_records = await _run_ipip_condition(
-            condition=condition,
-            subject_ids=subject_ids,
-            scales=scales,
-            prompts=ipip_prompts,
-            participant_metadata=participant_metadata,
-            runnable=ipip_runnable,
-            model_id=model_id,
-            config=config,
-            output_dir=output / condition / "ipip",
-            semaphore=shared_semaphore,
+        condition_sjt_records, condition_ipip_records = await asyncio.gather(
+            _run_sjt_condition(
+                condition=condition,
+                subject_ids=subject_ids,
+                items=items,
+                prompts=prompts,
+                participant_metadata=participant_metadata,
+                sjt_response_mode=spec.sjt_response_mode,
+                runnable=probability_runnable
+                if spec.sjt_response_mode == "choice_probability"
+                else selection_runnable,
+                model_id=model_id,
+                config=config,
+                output_dir=output / condition / "mussel",
+                run_id=run_id,
+                semaphore=shared_semaphore,
+            ),
+            _run_ipip_condition(
+                condition=condition,
+                subject_ids=subject_ids,
+                scales=scales,
+                prompts=ipip_prompts,
+                participant_metadata=participant_metadata,
+                runnable=ipip_runnable,
+                model_id=model_id,
+                config=config,
+                output_dir=output / condition / "ipip",
+                semaphore=shared_semaphore,
+            ),
+            return_exceptions=True,
         )
         return condition, condition_sjt_records, condition_ipip_records
 
@@ -959,15 +965,25 @@ async def run_fresh_comparison(config: FreshComparisonConfig) -> tuple[Path, dic
                 *(run_condition(condition) for condition in prompt_ids),
                 return_exceptions=True,
             )
-            errors = [result for result in results if isinstance(result, Exception)]
-            if errors:
-                raise RuntimeError(
-                    f"并发提示词实验有{len(errors)}个条件失败；首个错误：{errors[0]}"
-                )
+            errors: list[tuple[str, BaseException]] = []
             for result in results:
+                if isinstance(result, BaseException):
+                    errors.append(("condition_setup", result))
+                    continue
                 condition, condition_sjt_records, condition_ipip_records = result
-                sjt_records[condition] = condition_sjt_records
-                ipip_records[condition] = condition_ipip_records
+                if isinstance(condition_sjt_records, BaseException):
+                    errors.append((f"{condition}/mussel", condition_sjt_records))
+                else:
+                    sjt_records[condition] = condition_sjt_records
+                if isinstance(condition_ipip_records, BaseException):
+                    errors.append((f"{condition}/ipip", condition_ipip_records))
+                else:
+                    ipip_records[condition] = condition_ipip_records
+            if errors:
+                name, error = errors[0]
+                raise RuntimeError(
+                    f"fresh-mussel-ipip有{len(errors)}个独立阶段失败；首个阶段{name}：{error}"
+                )
     except Exception as exc:
         write_json(manifest_path, {**manifest, "status": "failed", "error": str(exc)})
         raise
@@ -1056,7 +1072,10 @@ def build_parser() -> Any:
     parser.add_argument("--mussel", dest="mussel_path", type=Path, default=DEFAULT_MUSSEL)
     parser.add_argument("--ipip", dest="ipip_path", type=Path, default=DEFAULT_IPIP)
     parser.add_argument("--model", dest="model_id", default="glm-5.3-flash")
-    parser.add_argument("--max-concurrency", type=int, default=30)
+    parser.add_argument(
+        "--max-concurrency", type=int, default=0,
+        help="all independent model calls are dispatched together; legacy concurrency ignored",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--timeout", dest="timeout_seconds", type=float, default=None)
     parser.add_argument("--sampling-seed", type=int, default=20260916)

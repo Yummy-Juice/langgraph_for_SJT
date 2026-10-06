@@ -17,8 +17,13 @@ import json
 import re
 from typing import Any, Mapping
 
+from sjt_system.evaluation.psychometrics import (
+    ITEM_ITERATION_GATE_FIELDS,
+    OPTION_CHOICE_DIAGNOSTICS_VERSION,
+)
 
-CITC_DIAGNOSIS_THRESHOLD = 0.20
+
+CITC_DIAGNOSIS_THRESHOLD = 0.30
 DIFFICULTY_LOWER_BOUND = 0.20
 DIFFICULTY_UPPER_BOUND = 0.80
 MINIMUM_EFFECTIVE_OPTION_COUNT = 3
@@ -40,9 +45,9 @@ _ALL_COMPONENTS = (
 )
 _LEVEL_RANK = {"low": 0, "medium_low": 1, "medium_high": 2, "high": 3}
 _VTS_OBSERVATION_IDS = {"OBS:SAME_DOMAIN_VTS", "OBS:CROSS_DOMAIN_VTS"}
-_FORCED_VTS_GRADIENT_OBSERVATION_IDS = {
-    "OBS:SAME_DOMAIN_VTS_OPTION_MEAN_GRADIENT",
-    "OBS:CROSS_DOMAIN_VTS_OPTION_MEAN_GRADIENT",
+_NON_TARGET_DIAGNOSTIC_IDS = {
+    "OBS:SAME_DOMAIN_MAX_NON_TARGET_RHO",
+    "OBS:CROSS_DOMAIN_MAX_NON_TARGET_RHO",
 }
 _VTS_CATEGORIES = ("same_domain", "cross_domain")
 _TARGET_GRADIENT_REQUIRED_OBSERVATION_ID = (
@@ -60,130 +65,12 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
-def _failed_vts_categories(observations: Any) -> set[str]:
-    failed: set[str] = set()
-    observation_to_category = {
-        "OBS:SAME_DOMAIN_VTS": "same_domain",
-        "OBS:CROSS_DOMAIN_VTS": "cross_domain",
-    }
-    for row in observations or []:
-        if not isinstance(row, Mapping):
-            continue
-        category = observation_to_category.get(str(row.get("observation_id") or ""))
-        if category is None:
-            continue
-        value = _number(row.get("value"))
-        threshold = _number(row.get("threshold"))
-        if (
-            row.get("passes") is False
-            or value is None
-            or (threshold is not None and value < threshold)
-        ):
-            failed.add(category)
-    return failed
-
-
 def derive_forced_vts_gradient_repairs(
     evidence: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
-    """Derive deterministic endpoint-repair triggers from failed VTS means.
+    """Retain the legacy API without allowing profile VTS to trigger repair."""
 
-    The trigger is intentionally strict: all four scoring levels must be
-    present exactly once, all corresponding non-target means must be finite,
-    and the means must increase strictly from score 1 through score 4.
-    """
-
-    existing = evidence.get("forced_vts_gradient_repairs")
-    if isinstance(existing, list):
-        return [
-            deepcopy(dict(row))
-            for row in existing
-            if isinstance(row, Mapping)
-        ]
-    raw_diagnostics = evidence.get("option_choice_diagnostics") or {}
-    paired = (
-        raw_diagnostics.get("option_score_comparisons")
-        if isinstance(raw_diagnostics, Mapping)
-        else None
-    ) or evidence.get("option_score_comparisons") or []
-    failed_categories = _failed_vts_categories(evidence.get("observations"))
-    repairs: list[dict[str, Any]] = []
-    for category in _VTS_CATEGORIES:
-        if category not in failed_categories:
-            continue
-        mean_key = f"{category}_mean_score"
-        rows_by_score: dict[int, dict[str, Any]] = {}
-        duplicate_score = False
-        for row in paired:
-            if not isinstance(row, Mapping):
-                continue
-            score = _number(row.get("score"))
-            option_id = _text(row.get("option_id"))
-            mean = _number(row.get(mean_key))
-            if (
-                score is None
-                or score not in {1.0, 2.0, 3.0, 4.0}
-                or not option_id
-                or mean is None
-            ):
-                continue
-            score_int = int(score)
-            if score_int in rows_by_score:
-                duplicate_score = True
-                break
-            rows_by_score[score_int] = {
-                "option_id": option_id,
-                "target_mean_score": _number(row.get("target_mean_score")),
-                "non_target_mean_score": mean,
-            }
-        if duplicate_score or set(rows_by_score) != {1, 2, 3, 4}:
-            continue
-        non_target_means = [
-            rows_by_score[score]["non_target_mean_score"]
-            for score in range(1, 5)
-        ]
-        if not all(
-            current > previous
-            for previous, current in zip(non_target_means, non_target_means[1:])
-        ):
-            continue
-        target_means = [
-            rows_by_score[score]["target_mean_score"]
-            for score in range(1, 5)
-        ]
-        observation_id = (
-            "OBS:SAME_DOMAIN_VTS_OPTION_MEAN_GRADIENT"
-            if category == "same_domain"
-            else "OBS:CROSS_DOMAIN_VTS_OPTION_MEAN_GRADIENT"
-        )
-        repairs.append(
-            {
-                "vts_category": category,
-                "observation_id": observation_id,
-                "vts_observation_id": (
-                    "OBS:SAME_DOMAIN_VTS"
-                    if category == "same_domain"
-                    else "OBS:CROSS_DOMAIN_VTS"
-                ),
-                "option_ids_by_score": {
-                    str(score): rows_by_score[score]["option_id"]
-                    for score in range(1, 5)
-                },
-                "endpoint_option_ids": [
-                    rows_by_score[1]["option_id"],
-                    rows_by_score[4]["option_id"],
-                ],
-                "target_means_by_score": {
-                    str(score): rows_by_score[score]["target_mean_score"]
-                    for score in range(1, 5)
-                },
-                "non_target_means_by_score": {
-                    str(score): rows_by_score[score]["non_target_mean_score"]
-                    for score in range(1, 5)
-                },
-            }
-        )
-    return repairs
+    return []
 
 
 def _forced_vts_gradient_repair_ids(
@@ -222,23 +109,15 @@ def _has_direct_item_quote(value: Any, evidence: Mapping[str, Any]) -> bool:
     )
 
 
-def _references_vts(candidate: Mapping[str, Any]) -> bool:
-    return bool(
-        _VTS_OBSERVATION_IDS
-        & {str(value) for value in candidate.get("observation_refs") or []}
-    )
-
-
 def _has_direct_contaminant_expression(
     candidate: Mapping[str, Any],
     evidence: Mapping[str, Any],
 ) -> bool:
     """Accept quoted wording that directly expresses a supplied contaminant.
 
-    Construct contamination can co-measure a non-target facet without
-    contradicting the target facet.  For a VTS repair we therefore require a
-    current-item quote plus an explicit supplied NON_TARGET constraint, rather
-    than a target-construct contradiction.
+    Non-target profile evidence is only usable after the item Delta_min gate
+    fails. It requires a current-item quote and its supplied NON_TARGET
+    constraint; profile target rho/VTS never authorizes a repair.
     """
 
     observation_refs = {
@@ -247,19 +126,20 @@ def _has_direct_contaminant_expression(
     constraint_refs = {
         str(value) for value in candidate.get("constraint_refs") or []
     }
-    has_matching_constraint = True
-    if "OBS:SAME_DOMAIN_VTS" in observation_refs:
-        has_matching_constraint = has_matching_constraint and any(
-            value.startswith("NON_TARGET_SAME_DOMAIN:")
-            for value in constraint_refs
-        )
-    if "OBS:CROSS_DOMAIN_VTS" in observation_refs:
-        has_matching_constraint = has_matching_constraint and any(
-            value.startswith("NON_TARGET_CROSS_DOMAIN:")
-            for value in constraint_refs
-        )
+    if _VTS_OBSERVATION_IDS & observation_refs:
+        return False
+    category_prefixes = set()
+    if "OBS:SAME_DOMAIN_MAX_NON_TARGET_RHO" in observation_refs:
+        category_prefixes.add("NON_TARGET_SAME_DOMAIN:")
+    if "OBS:CROSS_DOMAIN_MAX_NON_TARGET_RHO" in observation_refs:
+        category_prefixes.add("NON_TARGET_CROSS_DOMAIN:")
+    has_matching_constraint = bool(category_prefixes) and all(
+        any(value.startswith(prefix) for value in constraint_refs)
+        for prefix in category_prefixes
+    )
     return bool(
-        _references_vts(candidate)
+        "OBS:ITEM_DELTA_MIN" in observation_refs
+        and _ipip_delta_failed(evidence.get("observations"))
         and has_matching_constraint
         and _has_direct_item_quote(candidate.get("textual_evidence"), evidence)
     )
@@ -317,7 +197,14 @@ def _repair_has_allowed_text_evidence(
         in {str(value) for value in candidate.get("observation_refs") or []}
     ):
         return True
-    if _references_vts(candidate):
+    candidate_observation_refs = {
+        str(value) for value in candidate.get("observation_refs") or []
+    }
+    if "OBS:TARGET_RHO" in candidate_observation_refs:
+        return False
+    if _VTS_OBSERVATION_IDS & candidate_observation_refs:
+        return False
+    if _NON_TARGET_DIAGNOSTIC_IDS & candidate_observation_refs:
         return _has_direct_contaminant_expression(candidate, evidence)
     return _has_direct_item_quote(candidate.get("textual_evidence"), evidence)
 
@@ -371,37 +258,30 @@ def build_deterministic_defer_advice(
         for row in evidence.get("observations") or []
         if isinstance(row, Mapping)
     ]
-    failed_vts_categories = _failed_vts_categories(observations)
+    actionable_observation_ids = {
+        "OBS:CITC",
+        "OBS:ITEM_TARGET_HEDGES_G",
+        "OBS:ITEM_TARGET_IPIP_RHO",
+        "OBS:ITEM_DELTA_MIN",
+        "OBS:TARGET_OPTION_GRADIENT",
+        _TARGET_GRADIENT_REQUIRED_OBSERVATION_ID,
+    }
     failed_observation = next(
         (
             row
             for row in observations
-            if str(row.get("observation_id") or "") in _VTS_OBSERVATION_IDS
+            if str(row.get("observation_id") or "") in actionable_observation_ids
             and (
                 row.get("passes") is False
-                or _number(row.get("value")) is None
                 or (
-                    _number(row.get("threshold")) is not None
+                    _number(row.get("value")) is not None
+                    and _number(row.get("threshold")) is not None
                     and _number(row.get("value")) < _number(row.get("threshold"))
                 )
             )
         ),
         None,
     )
-    if failed_observation is None:
-        failed_observation = next(
-            (
-                row
-                for row in observations
-                if row.get("passes") is False
-                or (
-                    _number(row.get("value")) is not None
-                    and _number(row.get("threshold")) is not None
-                    and _number(row.get("value")) < _number(row.get("threshold"))
-                )
-            ),
-            None,
-        )
     if not isinstance(failed_observation, Mapping):
         return None
 
@@ -414,23 +294,8 @@ def build_deterministic_defer_advice(
         for row in evidence.get("normal_constraints") or []
         if isinstance(row, Mapping) and _text(row.get("constraint_id"))
     ]
-    if failed_vts_categories:
-        prefixes = {
-            (
-                "NON_TARGET_SAME_DOMAIN:"
-                if category == "same_domain"
-                else "NON_TARGET_CROSS_DOMAIN:"
-            )
-            for category in failed_vts_categories
-        }
-        matching_constraint_ids = [
-            value
-            for value in constraint_ids
-            if any(value.startswith(prefix) for prefix in prefixes)
-        ]
-    else:
-        matching_constraint_ids = []
-    candidate_constraint_ids = matching_constraint_ids or constraint_ids[:1]
+    matching_constraint_ids: list[str] = []
+    candidate_constraint_ids = constraint_ids[:1]
     if not candidate_constraint_ids:
         return None
 
@@ -1130,7 +995,7 @@ def _semantic_constraint(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _semantic_observation(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Strip routing/group metadata while preserving diagnostic evidence."""
+    """Strip routing metadata while preserving the selected contaminant facet."""
 
     result: dict[str, Any] = {}
     for key in (
@@ -1138,6 +1003,7 @@ def _semantic_observation(row: Mapping[str, Any]) -> dict[str, Any]:
         "role", "filtering_authority", "failed_adjacent_pairs", "vts_category",
         "vts_observation_id", "endpoint_option_ids", "option_ids_by_score",
         "target_means_by_score", "non_target_means_by_score",
+        "dimension_id", "facet_name", "signed_rho",
     ):
         if row.get(key) is not None:
             result[key] = deepcopy(row[key])
@@ -1256,15 +1122,76 @@ def _effective_option_count(statistics: Mapping[str, Any]) -> int | None:
     return None
 
 
+def _item_iteration_gate_results(statistics: Mapping[str, Any]) -> dict[str, bool]:
+    quality = statistics.get("quality_evaluation") or {}
+    qualification = statistics.get("qualification") or {}
+    if isinstance(qualification, Mapping) and any(
+        field in qualification for field in ITEM_ITERATION_GATE_FIELDS
+    ):
+        return {
+            field: qualification.get(field) is True
+            for field in ITEM_ITERATION_GATE_FIELDS
+        }
+
+    metrics = statistics.get("virtual_screening_metrics") or {}
+    ipip = (
+        (quality.get("single_item_ipip_metrics") if isinstance(quality, Mapping) else None)
+        or (metrics.get("item_ipip_metrics") if isinstance(metrics, Mapping) else None)
+        or {}
+    )
+    citc = (
+        quality.get("facet_citc")
+        if isinstance(quality, Mapping)
+        else None
+    ) or (metrics.get("facet_citc") if isinstance(metrics, Mapping) else None) or {}
+    citc_pass = citc.get("passes")
+    if citc_pass is None:
+        citc_value = _number(citc.get("r"))
+        citc_pass = citc_value is not None and citc_value >= CITC_DIAGNOSIS_THRESHOLD
+    return {
+        "citc_pass": citc_pass is True,
+        "target_hedges_g_pass": (
+            (ipip.get("target_hedges_g") or {}).get("passes") is True
+        ),
+        "target_ipip_spearman_rho_pass": (
+            (ipip.get("target_ipip_spearman_rho") or {}).get("passes") is True
+        ),
+        "discriminant_delta_min_pass": (
+            (ipip.get("discriminant_delta_min") or {}).get("passes") is True
+        ),
+    }
+
+
+def _ipip_delta_failed(observations: Any) -> bool:
+    for row in observations or []:
+        if not isinstance(row, Mapping) or row.get("observation_id") != "OBS:ITEM_DELTA_MIN":
+            continue
+        value = _number(row.get("value"))
+        threshold = _number(row.get("threshold"))
+        return row.get("passes") is False or (
+            value is not None and threshold is not None and value < threshold
+        )
+    return False
+
+
 def item_requires_psychometric_diagnosis(statistics: Mapping[str, Any]) -> bool:
     """Return whether current deterministic evidence triggers LLM diagnosis."""
 
     quality = statistics.get("quality_evaluation") or {}
-    if isinstance(quality, Mapping) and (
-        "facet_citc" in quality or "virtual_target_specificity" in quality
+    qualification = statistics.get("qualification") or {}
+    metrics = statistics.get("virtual_screening_metrics") or {}
+    if (
+        isinstance(quality, Mapping)
+        and ("facet_citc" in quality or "virtual_target_specificity" in quality)
+    ) or (
+        isinstance(qualification, Mapping)
+        and any(field in qualification for field in ITEM_ITERATION_GATE_FIELDS)
+    ) or (
+        isinstance(metrics, Mapping)
+        and "item_ipip_metrics" in metrics
     ):
-        # Only the four matched-arm qualification gates place an item in the queue.
-        return str(quality.get("recommendation") or "revise") != "retain"
+        # Profile rho/VTS are diagnostic only; only the four item gates queue diagnosis.
+        return not all(_item_iteration_gate_results(statistics).values())
 
     citc = _citc_value(statistics)
     difficulty = _number(statistics.get("difficulty"))
@@ -1537,6 +1464,20 @@ def build_construct_diagnosis_evidence(
         target = specificity.get("rho_target") or specificity.get("target_spearman") or {}
         same_domain = specificity.get("same_domain_non_target") or {}
         cross_domain = specificity.get("cross_domain_non_target") or {}
+        single_item_ipip = (
+            quality.get("single_item_ipip_metrics")
+            or (statistics.get("virtual_screening_metrics") or {}).get("item_ipip_metrics")
+            or {}
+        )
+        item_hedges = single_item_ipip.get("target_hedges_g") or {}
+        item_ipip_rho = single_item_ipip.get("target_ipip_spearman_rho") or {}
+        item_delta = single_item_ipip.get("discriminant_delta_min") or {}
+        delta_failed = (
+            item_delta.get("passes") is False
+            or (statistics.get("qualification") or {}).get(
+                "discriminant_delta_min_pass"
+            ) is False
+        )
         observations.extend(
             [
                 {
@@ -1550,10 +1491,13 @@ def build_construct_diagnosis_evidence(
                     "observation_id": "OBS:TARGET_RHO",
                     "metric": "target_condition_score_spearman_rho",
                     "value": _number(target.get("rho")),
-                    "threshold": specificity.get("target_rho_threshold"),
-                    "role": "iteration_gate",
+                    "threshold": None,
+                    "passes": None,
+                    "role": "diagnostic_only",
+                    "diagnostic_only": True,
+                    "filtering_authority": False,
                     "correlation_method": "ordinary_spearman",
-                    "conditioning_variable": "condition_id",
+                    "conditioning_variable": specificity.get("conditioning_variable") or "condition_id",
                 },
                 {
                     "observation_id": "OBS:SAME_DOMAIN_MAX_NON_TARGET_RHO",
@@ -1566,16 +1510,23 @@ def build_construct_diagnosis_evidence(
                     "value": _number(same_domain.get("max_non_target_rho") if same_domain.get("max_non_target_rho") is not None else same_domain.get("largest_non_target_rho")),
                     "signed_rho": _number(same_domain.get("max_non_target_rho") if same_domain.get("max_non_target_rho") is not None else same_domain.get("largest_non_target_rho")),
                     "non_target_spearman": deepcopy(same_domain.get("non_target_spearman") or []),
-                    "role": "iteration_gate_component",
+                    "threshold": None,
+                    "passes": None,
+                    "role": "diagnostic_only",
+                    "diagnostic_only": True,
+                    "filtering_authority": False,
                     "correlation_method": "ordinary_spearman",
-                    "conditioning_variable": "condition_id",
+                    "conditioning_variable": specificity.get("conditioning_variable") or "condition_id",
                 },
                 {
                     "observation_id": "OBS:SAME_DOMAIN_VTS",
                     "metric": "target_minus_max_signed_same_domain_rho",
                     "value": _number(same_domain.get("specificity_margin")),
-                    "threshold": same_domain.get("margin_threshold"),
-                    "role": "iteration_gate",
+                    "threshold": None,
+                    "passes": None,
+                    "role": "diagnostic_only",
+                    "diagnostic_only": True,
+                    "filtering_authority": False,
                 },
                 {
                     "observation_id": "OBS:CROSS_DOMAIN_MAX_NON_TARGET_RHO",
@@ -1588,16 +1539,50 @@ def build_construct_diagnosis_evidence(
                     "value": _number(cross_domain.get("max_non_target_rho") if cross_domain.get("max_non_target_rho") is not None else cross_domain.get("largest_non_target_rho")),
                     "signed_rho": _number(cross_domain.get("max_non_target_rho") if cross_domain.get("max_non_target_rho") is not None else cross_domain.get("largest_non_target_rho")),
                     "non_target_spearman": deepcopy(cross_domain.get("non_target_spearman") or []),
-                    "role": "iteration_gate_component",
+                    "threshold": None,
+                    "passes": None,
+                    "role": "diagnostic_only",
+                    "diagnostic_only": True,
+                    "filtering_authority": False,
                     "correlation_method": "ordinary_spearman",
-                    "conditioning_variable": "condition_id",
+                    "conditioning_variable": specificity.get("conditioning_variable") or "condition_id",
                 },
                 {
                     "observation_id": "OBS:CROSS_DOMAIN_VTS",
                     "metric": "target_minus_max_signed_cross_domain_rho",
                     "value": _number(cross_domain.get("specificity_margin")),
-                    "threshold": cross_domain.get("margin_threshold"),
+                    "threshold": None,
+                    "passes": None,
+                    "role": "diagnostic_only",
+                    "diagnostic_only": True,
+                    "filtering_authority": False,
+                },
+                {
+                    "observation_id": "OBS:ITEM_TARGET_HEDGES_G",
+                    "metric": "single_item_target_ipip_hedges_g",
+                    "value": _number(item_hedges.get("standardized_effect")),
+                    "threshold": item_hedges.get("threshold"),
+                    "passes": item_hedges.get("passes"),
                     "role": "iteration_gate",
+                    "filtering_authority": True,
+                },
+                {
+                    "observation_id": "OBS:ITEM_TARGET_IPIP_RHO",
+                    "metric": "single_item_target_ipip_spearman_rho",
+                    "value": _number(item_ipip_rho.get("rho")),
+                    "threshold": item_ipip_rho.get("threshold"),
+                    "passes": item_ipip_rho.get("passes"),
+                    "role": "iteration_gate",
+                    "filtering_authority": True,
+                },
+                {
+                    "observation_id": "OBS:ITEM_DELTA_MIN",
+                    "metric": "single_item_ipip_discriminant_delta_min",
+                    "value": _number(item_delta.get("delta_min")),
+                    "threshold": item_delta.get("threshold"),
+                    "passes": item_delta.get("passes"),
+                    "role": "iteration_gate",
+                    "filtering_authority": True,
                 },
             ]
         )
@@ -1605,7 +1590,7 @@ def build_construct_diagnosis_evidence(
             ("SAME_DOMAIN", same_domain),
             ("CROSS_DOMAIN", cross_domain),
         ):
-            if group.get("passes") is not False:
+            if not delta_failed:
                 continue
             competitor = group.get("largest_non_target_facet") or group
             if not isinstance(competitor, Mapping):
@@ -1711,22 +1696,27 @@ def build_construct_diagnosis_evidence(
             }
         )
     raw_choice_diagnostics = statistics.get("option_choice_diagnostics") or {}
+    if (
+        specificity.get("correlation_scope") == "complete_matched_profile"
+        and raw_choice_diagnostics.get("version") != OPTION_CHOICE_DIAGNOSTICS_VERSION
+    ):
+        raise ValueError("完整profile的选项诊断仍是旧版本；请先从原始作答刷新诊断后再返修")
     qualification = statistics.get("qualification") or {}
     allowed_condition_ids = {"target"}
-    failed_vts_arms = set()
-    if qualification.get("same_domain_vts_pass") is not True:
-        failed_vts_arms.add("same_domain")
-    if qualification.get("cross_domain_vts_pass") is not True:
-        failed_vts_arms.add("cross_domain")
+    diagnostic_non_target_arms = (
+        set(_VTS_CATEGORIES) if delta_failed else set()
+    )
     vts_option_choice_diagnostics = {
         "version": raw_choice_diagnostics.get("version"),
         "filtering_authority": False,
         "diagnostic_use": "localization_only",
         "interpretation": (
-            "选择频率和匹配实验臂差异只用于定位需要核查的选项；VTS返修要求"
+            "选项均值按同域/跨域最大带符号相关facet计算，"
+            "与该选项的目标均值使用同批被试；profile rho/VTS不触发诊断或返修。"
+            "只有单题IPIP Delta_min失败时，非目标组证据可作定位线索；选择频率仅用于定位。"
+            "任何修改仍须"
             "引用题面或选项原文，并说明该措辞直接表达所给污染facet的定义、"
             "高低行为边界，或使高分行为依赖该污染构念。污染不必与目标构念矛盾。"
-            "若出现严格非目标组均值梯度观察，则按强制端点返修规则处理。"
         ),
         "aggregate": deepcopy(raw_choice_diagnostics.get("aggregate") or raw_choice_diagnostics.get("all") or {}),
         "by_condition": [
@@ -1735,8 +1725,8 @@ def build_construct_diagnosis_evidence(
             if isinstance(row, Mapping)
             and (
                 row.get("condition_id") in allowed_condition_ids
-                or row.get("arm_id") in failed_vts_arms
-                or str(row.get("condition_id") or "").split("__", 1)[0] in failed_vts_arms
+                or row.get("arm_id") in diagnostic_non_target_arms
+                or str(row.get("condition_id") or "").split("__", 1)[0] in diagnostic_non_target_arms
             )
         ],
         "target_option_gradient": deepcopy(gradient),
@@ -1752,8 +1742,8 @@ def build_construct_diagnosis_evidence(
                 if isinstance(row, Mapping)
                 and (
                     row.get("comparator_condition_id") in allowed_condition_ids
-                    or row.get("comparator_arm_id") in failed_vts_arms
-                    or str(row.get("comparator_condition_id") or "").split("__", 1)[0] in failed_vts_arms
+                    or row.get("comparator_arm_id") in diagnostic_non_target_arms
+                    or str(row.get("comparator_condition_id") or "").split("__", 1)[0] in diagnostic_non_target_arms
                 )
             ],
         },
@@ -1823,36 +1813,68 @@ def build_construct_diagnosis_evidence(
     }
 
 
+def build_scenario_repair_entry(
+    state: Mapping[str, Any], item: Mapping[str, Any], *, revision_round: int,
+) -> dict[str, Any]:
+    """Plan from formal gates, never from the legacy atomic-advice model."""
+    from sjt_system.evaluation.scenario_detection import PROTOCOL, archive_path
+
+    try:
+        evidence = build_construct_diagnosis_evidence(
+            state, str(item["item_id"]), revision_round=revision_round,
+        )
+        evidence.pop("forced_vts_gradient_repairs", None)
+        evidence["observations"] = [
+            row for row in evidence.get("observations", [])
+            if row.get("role") not in {"mandatory_repair_preflight", "forced_repair_trigger"}
+        ]
+        diagnostics = evidence.get("option_choice_diagnostics") or {}
+        diagnostics.pop("interpretation", None)
+        specification = _find_specification(state, item)
+        evidence["fixed_skeleton"] = deepcopy(_find_skeleton(state, specification))
+        profile = (state.get("blueprint") or {}).get("construct_profile_snapshot") or {}
+        evidence["construct_version"] = str(profile.get("inventory_version") or profile.get("version") or profile.get("schema_version") or "definition-v1")
+    except (KeyError, TypeError, ValueError) as exc:
+        # Missing construct material is an archived pause, not a defer/replacement.
+        evidence = {"current_item": deepcopy(dict(item)), "planning_error": str(exc)}
+    return {
+        "item_id": item["item_id"], "blueprint_cell_id": item.get("blueprint_cell_id"),
+        "target_dimension_id": item.get("target_dimension_id"),
+        "action": "revise_item", "revision_round": revision_round,
+        "repair_protocol": PROTOCOL, "queue_status": "diagnosed",
+        "scenario_archive_ref": str(archive_path(state, item, revision_round)),
+        "diagnosis_status": "scenario_detection_planned",
+        "baseline_metrics": deepcopy((state.get("item_statistics") or {}).get(str(item["item_id"])) or {}),
+        "diagnosis_evidence": evidence,
+        "atomic_repair_advice": {
+            "protocol": PROTOCOL, "decision": "repair", "repair_tasks": [],
+            "summary": "正式指标失败：先检测情境；通过后按情境是否修改选择选项修改范围。",
+        },
+    }
+
+
 def build_psychometric_agent_input(evidence: Mapping[str, Any]) -> dict[str, Any]:
     """Return the compact evidence packet shown to psychometric agents.
 
     Workflow identifiers and raw selection counts are routing/audit metadata,
-    not diagnosis evidence.  Keep the item wording and construct constraints,
-    while exposing only the failed VTS-aligned option mean comparisons.
+    not diagnosis evidence. Keep conditional profile metrics diagnostic-only;
+    non-target option comparisons are exposed only after the item Delta_min gate fails.
     """
 
     observations = []
-    failed_vts = set()
+    delta_failed = _ipip_delta_failed(evidence.get("observations"))
     for row in evidence.get("observations") or []:
         if not isinstance(row, Mapping):
             continue
         observation_id = str(row.get("observation_id") or "")
-        if observation_id in _VTS_OBSERVATION_IDS:
-            threshold = _number(row.get("threshold"))
-            value = _number(row.get("value"))
-            # An unestimable required VTS is a failed gate as well.  Keep the
-            # paired comparison context available so the diagnosis agent can
-            # see the same evidence in both numeric and missing-value cases.
-            if value is None or (threshold is not None and value < threshold):
-                failed_vts.add(
-                    "same_domain" if observation_id.startswith("OBS:SAME") else "cross_domain"
-                )
         if observation_id in {
             "OBS:CITC",
             "OBS:TARGET_RHO",
+            "OBS:ITEM_TARGET_HEDGES_G",
+            "OBS:ITEM_TARGET_IPIP_RHO",
+            "OBS:ITEM_DELTA_MIN",
             "OBS:TARGET_OPTION_GRADIENT",
             _TARGET_GRADIENT_REQUIRED_OBSERVATION_ID,
-            *_FORCED_VTS_GRADIENT_OBSERVATION_IDS,
         }:
             observations.append(_semantic_observation(row))
         elif observation_id in {
@@ -1865,19 +1887,40 @@ def build_psychometric_agent_input(evidence: Mapping[str, Any]) -> dict[str, Any
 
     raw_diagnostics = evidence.get("option_choice_diagnostics") or {}
     paired = raw_diagnostics.get("option_score_comparisons") or []
+    selected_facets = {
+        category: next(
+            (
+                row for row in evidence.get("observations") or []
+                if isinstance(row, Mapping)
+                and row.get("observation_id") == f"OBS:{category.upper()}_MAX_NON_TARGET_RHO"
+            ),
+            {},
+        )
+        for category in ("same_domain", "cross_domain")
+    }
     comparison_rows: list[dict[str, Any]] = []
     for category in ("same_domain", "cross_domain"):
-        if category not in failed_vts:
+        if not delta_failed:
             continue
         for row in paired:
             if not isinstance(row, Mapping):
                 continue
+            selected = selected_facets[category]
+            selected_id = selected.get("dimension_id")
+            row_id = row.get(f"{category}_dimension_id")
+            if raw_diagnostics.get("version") == OPTION_CHOICE_DIAGNOSTICS_VERSION and selected_id and row_id != selected_id:
+                raise ValueError(f"{category} 选项均值所属facet与诊断用最大带符号rho facet不一致")
             comparison_rows.append(
                 {
                     "vts_category": category,
                     "option_id": row.get("option_id"),
                     "score": row.get("score"),
                     "target_mean_score": row.get("target_mean_score"),
+                    "target_n": row.get("target_n"),
+                    "non_target_n": row.get(f"{category}_n"),
+                    "non_target_dimension_id": selected_id,
+                    "non_target_facet_name": selected.get("facet_name"),
+                    "non_target_signed_rho": selected.get("signed_rho"),
                     f"{category}_mean_score": row.get(f"{category}_mean_score"),
                 }
             )
@@ -1919,10 +1962,10 @@ def build_psychometric_agent_input(evidence: Mapping[str, Any]) -> dict[str, Any
         "SKELETON:OPTION:",
     )
     allowed_constraint_prefixes = set(core_constraint_prefixes)
-    if "same_domain" in failed_vts:
-        allowed_constraint_prefixes.add("NON_TARGET_SAME_DOMAIN:")
-    if "cross_domain" in failed_vts:
-        allowed_constraint_prefixes.add("NON_TARGET_CROSS_DOMAIN:")
+    if delta_failed:
+        allowed_constraint_prefixes.update(
+            {"NON_TARGET_SAME_DOMAIN:", "NON_TARGET_CROSS_DOMAIN:"}
+        )
     compact_constraints = [
         _semantic_constraint(row)
         for row in evidence.get("normal_constraints") or []
@@ -2296,7 +2339,7 @@ def validate_atomic_repair_advice(
             for task in repair_tasks
         )
     ):
-        raise ValueError("0<=CITC<.20 must preserve the scenario")
+        raise ValueError("0<=CITC<.30 must preserve the scenario")
     seen_scopes: set[tuple[str, tuple[str, ...]]] = set()
     seen_option_ids: set[str] = set()
     forced_endpoint_task_found = False

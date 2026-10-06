@@ -214,12 +214,12 @@ async def run_audit(
     run_id = f"embodied-prompt-audit-{uuid4().hex}"
     records: list[dict[str, Any]] = []
     with output_scope(output / "runtime", telemetry=output / "telemetry"), run_context(run_id):
-        for item_id in item_ids:
+        async def one(item_id: str) -> dict[str, Any]:
             item = item_by_id[item_id]
             messages = _audit_messages(persona_prompt, item)
             raw = await asyncio.wait_for(runnable.ainvoke(messages), timeout=timeout)
             validated = _validate_output(raw)
-            record = {
+            return {
                 "respondent_id": respondent_id,
                 "model_id": model_id,
                 "item_id": item_id,
@@ -229,8 +229,19 @@ async def run_audit(
                 "structured_output_method": structured_method,
                 **validated,
             }
-            records.append(record)
-            write_json(output / f"{item_id}.json", record)
+
+        outcomes = await asyncio.gather(
+            *(one(item_id) for item_id in item_ids), return_exceptions=True
+        )
+        failures = []
+        for item_id, outcome in zip(item_ids, outcomes):
+            if isinstance(outcome, BaseException):
+                failures.append(outcome)
+                continue
+            records.append(outcome)
+            write_json(output / f"{item_id}.json", outcome)
+        if failures:
+            raise failures[0]
     result = {
         "status": "complete",
         "model_id": model_id,

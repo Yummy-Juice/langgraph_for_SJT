@@ -5,6 +5,7 @@ from langgraph.graph import END, START, StateGraph
 
 from sjt_system.state import PSJTState
 from sjt_system.workflow.execution_node import execute_node
+from sjt_system.workflow.executor import prepare_repair_knowledge_review
 from sjt_system.workflow.interaction_nodes import (
     approval_node,
     automatic_approval_node,
@@ -15,6 +16,8 @@ from sjt_system.workflow.interaction_nodes import (
     stop_node,
     post_virtual_response_decision_node,
     psychometric_repair_confirmation_node,
+    scenario_repair_pause_node,
+    repair_knowledge_selection_node,
     virtual_sample_selection_node,
 )
 from sjt_system.workflow.item_nodes import (
@@ -43,6 +46,10 @@ def build_sjt_graph(checkpointer=None, *, interrupt_before=None):
     builder = StateGraph(PSJTState)
     builder.add_node("router", router_node)
     builder.add_node("execute", execute_node)
+    builder.add_node("scenario_repair_pause", scenario_repair_pause_node)
+    builder.add_node("repair_knowledge_selection", repair_knowledge_selection_node)
+    builder.add_node("repair_knowledge_review", prepare_repair_knowledge_review)
+    builder.add_edge("repair_knowledge_review", "router")
     builder.add_node(
         "item_development_mode_selection",
         item_development_mode_selection_node,
@@ -72,7 +79,8 @@ def build_sjt_graph(checkpointer=None, *, interrupt_before=None):
     builder.add_node("prepare_item_revision", prepare_item_revision_node)
     builder.add_node("accept_item", accept_item_node)
     builder.add_node("abandon_item", abandon_item_node)
-    builder.add_edge(START, "router")
+    builder.add_edge(START, "repair_knowledge_selection")
+    builder.add_edge("repair_knowledge_selection", "router")
     builder.add_conditional_edges(
         "router",
         route_after_router,
@@ -82,6 +90,9 @@ def build_sjt_graph(checkpointer=None, *, interrupt_before=None):
             ),
             "select_virtual_sample": "virtual_sample_selection",
             "confirm_psychometric_repair": "psychometric_repair_confirmation",
+            "scenario_repair_pause": "scenario_repair_pause",
+            "repair_knowledge_selection": "repair_knowledge_selection",
+            "repair_knowledge_review": "repair_knowledge_review",
             "plateau_gap_decision": "plateau_gap_decision",
             "execute": "execute",
             "end": END,
@@ -122,6 +133,7 @@ def build_sjt_graph(checkpointer=None, *, interrupt_before=None):
             "revise": "prepare_item_revision",
             "abandon": "abandon_item",
             "post_simulation_review": "post_virtual_response_decision",
+            "scenario_repair_pause": "scenario_repair_pause",
         },
     )
     builder.add_conditional_edges(
@@ -131,6 +143,11 @@ def build_sjt_graph(checkpointer=None, *, interrupt_before=None):
     )
     builder.add_conditional_edges(
         "psychometric_repair_confirmation",
+        route_after_psychometric_repair_confirmation,
+        {"router": "router", "end": END},
+    )
+    builder.add_conditional_edges(
+        "scenario_repair_pause",
         route_after_psychometric_repair_confirmation,
         {"router": "router", "end": END},
     )
@@ -157,7 +174,11 @@ def build_sjt_graph(checkpointer=None, *, interrupt_before=None):
     )
     builder.add_edge("prepare_regeneration", "execute")
     builder.add_edge("stop", END)
-    return builder.compile(checkpointer=checkpointer or InMemorySaver(), interrupt_before=interrupt_before)
+    # Workflow completion, user decisions, and existing per-stage budgets govern exit.
+    return builder.compile(
+        checkpointer=checkpointer or InMemorySaver(),
+        interrupt_before=interrupt_before,
+    ).with_config(recursion_limit=float("inf"))
 
 
 graph = build_sjt_graph()

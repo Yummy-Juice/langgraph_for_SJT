@@ -12,6 +12,7 @@ from sjt_system.evaluation.respondents import (
     generate_matched_condition_respondent_refs, build_matched_condition_sample_config,
     MATCHED_CONDITION_ROLES,
 )
+from sjt_system.evaluation.demographics import DEFAULT_RESPONSE_TEMPERATURE
 
 
 class ExperimentConfig(BaseModel):
@@ -25,7 +26,13 @@ class ExperimentConfig(BaseModel):
     seed: int = Field(default=7, ge=0, strict=True)
     mean: float = 50.0
     sd: float = Field(default=15.0, gt=0)
-    max_concurrency: int = Field(default=5, ge=1, le=20, strict=True)
+    target_mean: float = 60.0
+    target_sd: float = Field(default=15.0, gt=0)
+    same_domain_mean: float = 50.0
+    same_domain_sd: float = Field(default=15.0, gt=0)
+    cross_domain_mean: float = 50.0
+    cross_domain_sd: float = Field(default=15.0, gt=0)
+    max_concurrency: int = Field(default=0, ge=0, strict=True)
     max_repair_rounds: int = Field(default=3, ge=1, le=20, strict=True)
     plateau_patience: int = Field(default=2, ge=1, strict=True)
     plateau_min_delta: float = Field(default=0.01, ge=0)
@@ -37,6 +44,7 @@ class ExperimentConfig(BaseModel):
     model_id: str | None = None
     virtual_respondent_model_id: str | None = None
     evaluation_model_id: str | None = None
+    response_temperature: float = Field(default=DEFAULT_RESPONSE_TEMPERATURE, ge=1.5, le=1.5)
     input_price_per_million: float | None = Field(default=None, ge=0)
     cached_input_price_per_million: float | None = Field(default=None, ge=0)
     output_price_per_million: float | None = Field(default=None, ge=0)
@@ -67,8 +75,14 @@ class ExperimentConfig(BaseModel):
 
 
 def conditions_for(config):
+    distributions = {
+        "target": {"family": "normal", "mean": config.target_mean, "sd": config.target_sd},
+        "same_domain": {"family": "normal", "mean": config.same_domain_mean, "sd": config.same_domain_sd},
+        "cross_domain": {"family": "normal", "mean": config.cross_domain_mean, "sd": config.cross_domain_sd},
+    }
     return normalize_matched_conditions(
-        [{"condition_id": arm, "role": MATCHED_CONDITION_ROLES[arm], "dimension_id": facet}
+        [{"condition_id": arm, "role": MATCHED_CONDITION_ROLES[arm], "dimension_id": facet,
+          "score_distribution": distributions[arm]}
          for arm, facet in zip(("target", "same_domain", "cross_domain"),
                                (config.target_facet, config.same_domain_facet, config.cross_domain_facet))],
         dimension_catalog=build_score_dimension_catalog(construct_selection_catalog()),
@@ -90,7 +104,7 @@ def make_participants(config, role):
     sample_config = build_matched_condition_sample_config(
         config.sample_size, conditions=conditions, generation_diagnostics=diagnostics,
         mean_score=config.mean, standard_deviation=config.sd, seed=seed,
-        max_concurrency=config.max_concurrency)
+        max_concurrency=config.max_concurrency, response_temperature=config.response_temperature)
     sample_config["experiment_sample_role"] = role
     sample_config["reference_questionnaires_enabled"] = False
     return {"role": role, "config": sample_config, "respondents": refs}

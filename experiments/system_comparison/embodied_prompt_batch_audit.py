@@ -51,7 +51,7 @@ class EmbodiedBatchAuditConfig:
     experiment: Path
     respondents: int = 30
     items: int = 4
-    max_concurrency: int = 10
+    max_concurrency: int = 0
     model_id: str = "glm-5.3-flash"
     summary_pool: Path = DEFAULT_SUMMARY_POOL
     source_pool: Path = DEFAULT_SOURCE_POOL
@@ -63,8 +63,8 @@ class EmbodiedBatchAuditConfig:
             raise ValueError("respondents至少为3")
         if isinstance(self.items, bool) or self.items < 1:
             raise ValueError("items至少为1")
-        if not 1 <= self.max_concurrency <= 50:
-            raise ValueError("max_concurrency必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency必须为非负整数")
         if not self.model_id.strip():
             raise ValueError("model_id不能为空")
         if isinstance(self.seed, bool) or not isinstance(self.seed, int):
@@ -385,7 +385,6 @@ async def run_embodied_batch_audit(config: EmbodiedBatchAuditConfig) -> tuple[Pa
         | RunnableLambda(parse_model_json_response)
         | RunnableLambda(EmbodiedPromptAuditOutput.model_validate)
     )
-    semaphore = asyncio.Semaphore(config.max_concurrency)
     timeout = get_model_request_timeout_seconds()
     jobs = [
         (participant, item)
@@ -406,8 +405,7 @@ async def run_embodied_batch_audit(config: EmbodiedBatchAuditConfig) -> tuple[Pa
                 {}, str(participant["summary"]), persona_mode="summary_embodied_probability"
             )
             messages = _audit_messages(persona, dict(item))
-            async with semaphore:
-                raw = await asyncio.wait_for(runnable.ainvoke(messages), timeout=timeout)
+            raw = await asyncio.wait_for(runnable.ainvoke(messages), timeout=timeout)
             validated = _validate_output(raw)
             result = {
                 "status": "success",
@@ -473,7 +471,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--experiment", type=Path, required=True)
     parser.add_argument("--respondents", type=int, default=30)
     parser.add_argument("--items", type=int, default=4)
-    parser.add_argument("--max-concurrency", type=int, default=10)
+    parser.add_argument(
+        "--max-concurrency", type=int, default=0,
+        help="all independent model calls are dispatched together; legacy concurrency ignored",
+    )
     parser.add_argument("--model", dest="model_id", default="glm-5.3-flash")
     parser.add_argument("--summary-pool", type=Path, default=DEFAULT_SUMMARY_POOL)
     parser.add_argument("--source-pool", type=Path, default=DEFAULT_SOURCE_POOL)

@@ -54,6 +54,17 @@ def prepare_item_review_node(state: PSJTState) -> dict:
     if route is None:
         raise ValueError("题目审查准备节点缺少 Route")
     committed_action = route["next_action"]
+    from sjt_system.evaluation.virtual_content_review import is_enabled
+    if is_enabled(state) and committed_action == "generate_item" and not state.get("active_psychometric_repair"):
+        if int(state.get("psychometric_analysis_round") or 0) != 0:
+            raise ValueError("虚拟内容复审协议不允许在已施测后自动追加初始候选题")
+        update = record_committed_item_output(state, committed_action)
+        update.update(initial_candidate_admission=True, current_item_review=None,
+                      review_process_status="not_started", item_content_status="not_evaluated")
+        return _item_transition_result(
+            state, node="prepare_item_review", action="admit_initial_candidate",
+            reason="初始候选仅经结构校验入库，先虚拟施测再开展内容调查", update=update,
+        )
     repaired_from_blocking_review = (
         committed_action in {"revise_item", "regenerate_item"}
         and bool(state.get("current_item_repair_attempted"))
@@ -219,7 +230,8 @@ def accept_item_node(state: PSJTState) -> dict:
         state,
         node="accept_item",
         action="accept_item",
-        reason="题目通过审查并进入 item_pool",
+        reason=("结构合法的初始候选进入 item_pool，内容尚未审查"
+                if state.get("initial_candidate_admission") else "题目通过审查并进入 item_pool"),
         update=update,
     )
 

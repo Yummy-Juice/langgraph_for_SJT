@@ -33,7 +33,6 @@ DEVELOPMENTAL_OVERRIDE_NOTICE = (
     "这些题目可用于继续开发与人工复核，不应视为已通过正式测量质量门槛。"
 )
 
-
 def _resolve_items(
     state: Mapping[str, Any],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -263,6 +262,9 @@ def _validate_quality(
     effective: dict[str, str] = {}
     warning_item_ids: list[str] = []
     provisional_fill_item_ids: list[str] = []
+    from sjt_system.evaluation.facet_iteration import is_enabled as fixed_iteration_enabled
+    controller = state.get("facet_iteration_state") or {}
+    completed_facets = controller.get("baseline_facets") or {}
     for item in items:
         item_id = str(item.get("item_id") or "")
         disposition = final_dispositions.get(item_id)
@@ -271,10 +273,13 @@ def _validate_quality(
             if isinstance(disposition, Mapping)
             else None
         )
-        if disposition_status not in {
-            "qualified_locked",
-            "provisional_plateau_fill",
-        }:
+        if disposition_status == "facet_form_retained":
+            facet = completed_facets.get(str(item.get("target_dimension_id"))) or {}
+            if (not fixed_iteration_enabled(state) or controller.get("status") != "complete"
+                    or controller.get("completed_rounds") != 3
+                    or (facet.get("item_snapshots") or {}).get(item_id) != item):
+                raise ValueError(f"题目 {item_id} 未绑定已完成的facet组卷快照")
+        elif disposition_status not in {"qualified_locked", "provisional_plateau_fill"}:
             raise ValueError(f"题目 {item_id} 缺少可入卷的最终状态")
         if disposition_status == "provisional_plateau_fill":
             provisional_fill_item_ids.append(item_id)
@@ -300,14 +305,8 @@ def _validate_quality(
         if isinstance(state_flags.get(item_id), Mapping)
     }
     return {
-        "mode": (
-            "developmental_override"
-            if provisional_fill_item_ids
-            else "final_disposition"
-        ),
-        "provisional": bool(
-            provisional_fill_item_ids or warning_item_ids
-        ),
+        "mode": "developmental_override" if provisional_fill_item_ids else "final_disposition",
+        "provisional": bool(provisional_fill_item_ids or warning_item_ids),
         "non_retained_item_ids": [],
         "warning_item_ids": warning_item_ids,
         "provisional_item_flags": fill_flags,

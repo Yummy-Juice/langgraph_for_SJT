@@ -35,6 +35,7 @@ from sjt_system.authoring.construct_registry import construct_selection_catalog
 from sjt_system.evaluation.respondents import build_score_dimension_catalog
 from sjt_system.evaluation.simulation import _invoke_with_retry
 from sjt_system.runtime.output_paths import output_scope
+from sjt_system.runtime.concurrency import UnlimitedConcurrency
 from sjt_system.runtime.telemetry import run_context
 
 from .config import fingerprint
@@ -87,7 +88,7 @@ class DefectClassifierConfig:
     stimuli_path: Path = DEFAULT_STIMULI
     model_id: str | None = None
     repeats: int = 3
-    max_concurrency: int = 10
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
     seed: int = 20260915
@@ -96,8 +97,8 @@ class DefectClassifierConfig:
     def validate(self) -> None:
         if not 1 <= self.repeats <= 10:
             raise ValueError("repeats必须在1至10之间")
-        if not 1 <= self.max_concurrency <= 30:
-            raise ValueError("max_concurrency必须在1至30之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency必须为非负整数")
         if not 0 <= self.max_retries <= 10:
             raise ValueError("max_retries必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -499,7 +500,7 @@ async def run_defect_classifier(config: DefectClassifierConfig) -> tuple[Path, d
         for repeat in range(1, config.repeats + 1)
         if (str(item["blind_id"]), repeat) not in existing
     ]
-    semaphore = asyncio.Semaphore(config.max_concurrency)
+    semaphore = UnlimitedConcurrency()
     lock = asyncio.Lock()
     timeout = config.timeout_seconds or get_model_request_timeout_seconds()
     completed = len(existing)
@@ -551,49 +552,46 @@ async def run_defect_classifier(config: DefectClassifierConfig) -> tuple[Path, d
             if completed == total or completed % max(1, total // 10) == 0:
                 print(f"[盲态分类] {completed}/{total} ({completed / total:.0%})", flush=True)
 
-    failure_phase = "single_item_output_preflight"
-    bulk_started = False
+    failure_phase = "bulk_classification"
+    bulk_started = bool(jobs)
     try:
         with output_scope(root / "runtime", telemetry=root / "telemetry"), run_context(run_id):
-            remaining_jobs = list(jobs)
-            # A fresh run first proves that the selected provider/model obeys
-            # the JSON contract.  This prevents one formatting incompatibility
-            # from consuming the entire balanced classification batch.
-            if not existing and remaining_jobs:
-                preflight_item, preflight_repeat = remaining_jobs.pop(0)
-                print("[盲态分类] JSON输出格式预检 1/1", flush=True)
-                try:
-                    await one(
-                        preflight_item,
-                        preflight_repeat,
-                        max_retries_override=0,
-                    )
-                except Exception as exc:
-                    write_json(root / "errors.json", {
-                        "phase": failure_phase,
-                        "bulk_started": False,
-                        "errors": [str(exc)],
-                    })
-                    raise RuntimeError(
-                        "盲态分类JSON输出预检失败，批量任务未启动："
-                        f"{exc}"
-                    ) from exc
-                print("[盲态分类] JSON输出格式预检通过，开始批量分类", flush=True)
-
-            failure_phase = "bulk_classification"
-            bulk_started = bool(remaining_jobs)
+            print(f"[盲态分类] 开始批量分类 {len(jobs)} 个待完成调用", flush=True)
             results = await asyncio.gather(
-                *(one(item, repeat) for item, repeat in remaining_jobs),
+                *(
+                    one(
+                        item,
+                        repeat,
+                        max_retries_override=(
+                            0 if not existing and index == 0 else None
+                        ),
+                    )
+                    for index, (item, repeat) in enumerate(jobs)
+                ),
                 return_exceptions=True,
             )
-        errors = [result for result in results if isinstance(result, Exception)]
+        errors = [
+            {
+                "blind_id": item["blind_id"],
+                "repeat": repeat,
+                "error": str(result),
+            }
+            for (item, repeat), result in zip(jobs, results)
+            if isinstance(result, BaseException)
+        ]
         if errors:
             write_json(root / "errors.json", {
                 "phase": failure_phase,
                 "bulk_started": bulk_started,
-                "errors": [str(error) for error in errors],
+                "attempted_calls": len(jobs),
+                "completed_calls": completed,
+                "total_calls": total,
+                "missing_calls": max(0, total - completed),
+                "errors": errors,
             })
-            raise RuntimeError(f"盲态分类有{len(errors)}次失败；首个错误：{errors[0]}")
+            raise RuntimeError(
+                f"盲态分类有{len(errors)}次失败；首个错误：{errors[0]['error']}"
+            )
         failure_phase = "analysis_and_report"
         records = _load_jsonl(response_path)
         item_rows, summary, confusion_rows = analyze_predictions(
@@ -625,6 +623,8 @@ async def run_defect_classifier(config: DefectClassifierConfig) -> tuple[Path, d
             **manifest,
             "status": "complete",
             "completed_at": datetime.now(timezone.utc).isoformat(),
+            "completed_calls": completed,
+            "total_calls": total,
             "summary": summary,
             "report": str(report),
         }
@@ -637,6 +637,9 @@ async def run_defect_classifier(config: DefectClassifierConfig) -> tuple[Path, d
             "failed_at": datetime.now(timezone.utc).isoformat(),
             "failure_phase": failure_phase,
             "bulk_started": bulk_started,
+            "completed_calls": completed,
+            "total_calls": total,
+            "missing_calls": max(0, total - completed),
             "error": str(exc),
         })
         raise

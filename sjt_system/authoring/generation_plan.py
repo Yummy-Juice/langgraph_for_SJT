@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from copy import deepcopy
+from collections import Counter
 from typing import Any
 
 from sjt_system.authoring.situation_space import (
     BlueprintAgentOutput,
+    BlueprintRowDraft,
     INCREMENTAL_CANDIDATES_PER_CELL,
     FacetExpansion,
     expansion_cache_path,
@@ -28,6 +30,59 @@ def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
 
 
+def resolve_facet_item_counts(
+    specification: Mapping[str, Any],
+    profile: Mapping[str, Any],
+) -> dict[str, int]:
+    """Resolve explicit retained-item quotas for the selected facets.
+
+    The explicit mapping is the normal path.  A quotient/remainder fallback is
+    retained only for older checkpoints that predate ``facet_item_counts``;
+    new requirement runs always persist the mapping.
+    """
+
+    facet_ids = [
+        str(facet["facet_id"])
+        for facet in profile.get("facets") or []
+        if isinstance(facet, Mapping) and facet.get("facet_id")
+    ]
+    if not facet_ids:
+        raise ValueError("当前构念没有可用 facet")
+    final_item_count = specification.get("final_item_count")
+    if not _positive_int(final_item_count):
+        raise ValueError("final_item_count 必须是正整数")
+    raw = specification.get("facet_item_counts")
+    if isinstance(raw, Mapping):
+        counts = {
+            str(key): int(value)
+            for key, value in raw.items()
+            if (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+            )
+        }
+        if len(counts) != len(raw):
+            counts = {}
+        if (
+            set(counts) == set(facet_ids)
+            and all(value > 0 for value in counts.values())
+            and sum(counts.values()) == int(final_item_count)
+        ):
+            return {facet_id: counts[facet_id] for facet_id in facet_ids}
+    if len(facet_ids) == 1:
+        return {facet_ids[0]: int(final_item_count)}
+    if int(final_item_count) >= len(facet_ids):
+        base, remainder = divmod(int(final_item_count), len(facet_ids))
+        return {
+            facet_id: base + (1 if index < remainder else 0)
+            for index, facet_id in enumerate(facet_ids)
+        }
+    raise ValueError(
+        "缺少有效的 facet_item_counts；多 facet 测验必须逐一指定题数，"
+        "且各 facet 题数之和等于 final_item_count"
+    )
+
+
 def construct_profile_reference(profile: Mapping[str, Any]) -> dict[str, Any]:
     return {
         "inventory_id": str(profile["inventory_id"]),
@@ -36,6 +91,10 @@ def construct_profile_reference(profile: Mapping[str, Any]) -> dict[str, Any]:
         "review_status": str(profile["review_status"]),
         "selection_level": str(profile["selection_level"]),
         "domain_id": str(profile["domain_id"]),
+        "domain_ids": [
+            str(domain_id)
+            for domain_id in profile.get("domain_ids") or []
+        ],
         "domain_name": str(profile["domain_name"]),
         "selected_facet_ids": [
             str(facet["facet_id"]) for facet in profile["facets"]
@@ -53,6 +112,158 @@ def required_generation_total(final_item_count: int) -> int:
 def required_expansion_situation_total(final_item_count: int) -> int:
     """Return the fixed situation-pool size before blueprint selection."""
     return required_generation_total(final_item_count) + EXPANSION_SITUATION_BUFFER
+
+
+def repair_blueprint_proposal(
+    proposal: BlueprintAgentOutput | Mapping[str, Any],
+    profile: Mapping[str, Any],
+    expansions: list[FacetExpansion],
+    facet_retention_quotas: Mapping[str, int],
+) -> BlueprintAgentOutput:
+    """Repair reference bookkeeping without changing construct content.
+
+    Blueprint generation is an LLM selection problem, but the references are
+    program-owned IDs.  A long multi-facet response can omit a row or copy a
+    reference from a neighboring behavior.  Preserve rows that are valid and
+    complete each facet from its own expansion pool, allocating references only
+    within the same ``facet_id``/``behavior_id`` measurement unit.
+    """
+
+    result = (
+        proposal
+        if isinstance(proposal, BlueprintAgentOutput)
+        else BlueprintAgentOutput.model_validate(proposal)
+    )
+    facet_order = [
+        str(facet["facet_id"])
+        for facet in profile.get("facets") or []
+        if isinstance(facet, Mapping) and facet.get("facet_id")
+    ]
+    pools: dict[tuple[str, str], list[tuple[str, str]]] = {}
+    for expansion in expansions:
+        for behavior in expansion.behavior_expansions:
+            key = (str(expansion.facet_id), str(behavior.behavior_id))
+            refs = []
+            for mechanism in behavior.mechanisms:
+                refs.extend(
+                    (str(mechanism.mechanism_id), str(situation.situation_id))
+                    for situation in mechanism.situations
+                )
+            pools[key] = refs
+
+    accepted: dict[str, list[Any]] = {facet_id: [] for facet_id in facet_order}
+    used: set[tuple[str, str, str, str]] = set()
+    seen_rows: set[tuple[str, str, str, str]] = set()
+
+    for row in result.rows:
+        facet_id = str(row.facet_id)
+        behavior_id = str(row.behavior_id)
+        quota = int(facet_retention_quotas.get(facet_id, 0))
+        pool = set(pools.get((facet_id, behavior_id), ()))
+        raw_refs = [
+            (str(reference.mechanism_id), str(reference.situation_id))
+            for reference in row.candidate_references
+        ]
+        keys = [(facet_id, behavior_id, mechanism, situation) for mechanism, situation in raw_refs]
+        valid = (
+            facet_id in accepted
+            and len(accepted[facet_id]) < quota
+            and len(raw_refs) == INCREMENTAL_CANDIDATES_PER_CELL
+            and len(set(raw_refs)) == len(raw_refs)
+            and all(reference in pool for reference in raw_refs)
+            and all(key not in used for key in keys)
+            and (facet_id, behavior_id, *raw_refs[0]) not in seen_rows
+        )
+        if not valid:
+            continue
+        accepted[facet_id].append(row)
+        used.update(keys)
+        seen_rows.add((facet_id, behavior_id, *raw_refs[0]))
+
+    def remaining_capacity(facet_id: str, rows: list[Any]) -> int:
+        consumed: dict[tuple[str, str], int] = {}
+        for row in rows:
+            key = (facet_id, str(row.behavior_id))
+            consumed[key] = consumed.get(key, 0) + INCREMENTAL_CANDIDATES_PER_CELL
+        capacity = 0
+        for key, pool in pools.items():
+            if key[0] != facet_id:
+                continue
+            capacity += max(
+                0,
+                (len(pool) - consumed.get(key, 0))
+                // INCREMENTAL_CANDIDATES_PER_CELL,
+            )
+        return capacity
+
+    # Drop only as many preserved rows as needed to make the remaining pool
+    # usable; this keeps valid model-selected rows whenever possible.
+    for facet_id in facet_order:
+        quota = int(facet_retention_quotas[facet_id])
+        rows = accepted[facet_id]
+        while len(rows) + remaining_capacity(facet_id, rows) < quota:
+            if not rows:
+                break
+            row = rows.pop()
+            first_reference = row.candidate_references[0]
+            seen_rows.discard(
+                (
+                    facet_id,
+                    str(row.behavior_id),
+                    str(first_reference.mechanism_id),
+                    str(first_reference.situation_id),
+                )
+            )
+            for reference in row.candidate_references:
+                used.discard(
+                    (
+                        facet_id,
+                        str(row.behavior_id),
+                        str(reference.mechanism_id),
+                        str(reference.situation_id),
+                    )
+                )
+
+        for (pool_facet, behavior_id), pool in sorted(pools.items()):
+            if pool_facet != facet_id or len(rows) >= quota:
+                continue
+            available = [
+                reference
+                for reference in pool
+                if (facet_id, behavior_id, *reference) not in used
+            ]
+            index = 0
+            while (len(rows) < quota
+                   and index + INCREMENTAL_CANDIDATES_PER_CELL <= len(available)):
+                references = available[index:index + INCREMENTAL_CANDIDATES_PER_CELL]
+                index += INCREMENTAL_CANDIDATES_PER_CELL
+                first = references[0]
+                primary_key = (facet_id, behavior_id, *first)
+                if primary_key in seen_rows:
+                    continue
+                rows.append(
+                    BlueprintRowDraft(
+                        facet_id=facet_id,
+                        behavior_id=behavior_id,
+                        candidate_references=[
+                            {"mechanism_id": mechanism, "situation_id": situation}
+                            for mechanism, situation in references
+                        ],
+                    )
+                )
+                used.update(
+                    (facet_id, behavior_id, *reference)
+                    for reference in references
+                )
+                seen_rows.add(primary_key)
+        if len(rows) != quota:
+            raise ValueError(
+                f"facet={facet_id} 的情境引用无法组成 {quota} 个完整测量单元"
+            )
+
+    return BlueprintAgentOutput(
+        rows=[row for facet_id in facet_order for row in accepted[facet_id]]
+    )
 
 
 def _reference_index(
@@ -126,6 +337,14 @@ def build_generation_blueprint(
         raise ValueError(
             "rows: 细目表必须返回"
             f" {row_total} 个唯一组合，实际为 {len(result.rows)} 个"
+        )
+    facet_ids = [str(facet["facet_id"]) for facet in profile.get("facets") or []]
+    expected_facet_counts = resolve_facet_item_counts(specification, profile)
+    actual_facet_counts = Counter(str(row.facet_id) for row in result.rows)
+    if actual_facet_counts != expected_facet_counts:
+        raise ValueError(
+            "rows: 每个 facet 的保留题数必须符合 facet_item_counts；"
+            f"期望 {expected_facet_counts}，实际 {dict(actual_facet_counts)}"
         )
     generation_counts = [INCREMENTAL_CANDIDATES_PER_CELL] * row_total
     retention_counts = [1] * row_total
@@ -378,6 +597,33 @@ def validate_generation_blueprint(
         errors["expansion_refs"] = str(exc)
         return errors
     profile = blueprint.get("construct_profile_snapshot") or {}
+    profile_facet_ids = [
+        str(row.get("facet_id"))
+        for row in profile.get("facets") or []
+        if isinstance(row, Mapping) and row.get("facet_id")
+    ]
+    if specification is not None and profile_facet_ids:
+        final_count = specification.get("final_item_count")
+        if _positive_int(final_count):
+            try:
+                expected = resolve_facet_item_counts(
+                    specification,
+                    profile,
+                )
+            except ValueError as exc:
+                errors["retention_facet_quotas"] = str(exc)
+                expected = {}
+            actual = Counter()
+            for cell in cells:
+                if isinstance(cell, Mapping):
+                    actual[str(cell.get("facet_id"))] += int(
+                        cell.get("planned_retention_count") or 0
+                    )
+            if expected and actual != expected:
+                errors["retention_facet_quotas"] = (
+                    "每个 facet 的保留题数配额不一致："
+                    f"期望 {expected}，实际 {dict(actual)}"
+                )
     refs = blueprint.get("expansion_refs")
     if not isinstance(refs, list):
         errors["expansion_refs"] = "必须是列表"

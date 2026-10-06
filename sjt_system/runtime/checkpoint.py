@@ -17,14 +17,19 @@ from sjt_system.authoring.blueprint import (
 from sjt_system.authoring.construct_registry import (
     construct_selection_from_profile,
     resolve_construct_profile,
+    resolve_construct_selection,
 )
 from sjt_system.config import DEFAULT_OUTPUT_LANGUAGE
 from sjt_system.runtime.trace import utc_timestamp
 from sjt_system.workflow.constants import PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS
+from sjt_system.workflow.replacement_policy import normalize_replacement_policy
 
 
-CHECKPOINT_SCHEMA_VERSION = 20
-CHECKPOINT_REPLACE_ATTEMPTS = 5
+CHECKPOINT_SCHEMA_VERSION = 22
+# Checkpoint files are large and may be read by a status monitor while a save
+# is in flight.  Keep the atomic replace retry bounded but long enough for a
+# concurrent read handle to close on Windows.
+CHECKPOINT_REPLACE_ATTEMPTS = 30
 CHECKPOINT_REPLACE_BACKOFF_SECONDS = 0.05
 _SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS = {
     1,
@@ -46,12 +51,15 @@ _SUPPORTED_CHECKPOINT_SCHEMA_VERSIONS = {
     17,
     18,
     19,
+    20,
+    21,
     CHECKPOINT_SCHEMA_VERSION,
 }
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHECKPOINT_ROOT = PROJECT_ROOT / "outputs" / "run_checkpoints"
 TERMINAL_STATUSES = {"completed", "stopped"}
 _REMOVED_STATE_FIELDS = {
+    "max_steps",
     "psychometric_defer_batch_eliminate",
     "current_expert_review_results",
     "current_review_results",
@@ -127,6 +135,12 @@ def _has_revised_event(state: Mapping[str, Any]) -> bool:
 
 def _strip_removed_state_fields(state: Mapping[str, Any]) -> dict[str, Any]:
     migrated = deepcopy(dict(state))
+    migrated.setdefault("scenario_repair_pause", None)
+    migrated.setdefault("scenario_repair_progress", {})
+    migrated.setdefault("scenario_repair_staged", {})
+    migrated.setdefault("repair_knowledge_config", None)
+    migrated.setdefault("repair_knowledge_state", {})
+    migrated.setdefault("frozen_reference_questionnaire_ref", None)
     if (
         migrated.get("pending_action") == "clarify_requirements"
         and not isinstance(migrated.get("pending_interaction"), Mapping)
@@ -205,9 +219,13 @@ def _migrate_v1_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     state.setdefault("current_item_rewrite_count", 0)
     state.setdefault("current_item_replacement_count", 0)
     state.setdefault("current_skeleton_repair_required", False)
-    state.setdefault("max_item_replacement_attempts", 2)
+    normalize_replacement_policy(state)
     state.setdefault("max_item_revision_attempts", 3)
     state.setdefault("max_item_rewrite_rounds", 3)
+    # The replacement policy is global for new and resumed runs: a failed-call
+    # or deferred item is never admitted as a temporary quality pass.
+    state["failure_call_replenishment"] = True
+    state.setdefault("deferred_replacement_measurement_pending", False)
     state = _strip_removed_state_fields(state)
     return {
         **deepcopy(dict(payload)),
@@ -841,6 +859,7 @@ def _migrate_v11_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             "provisional_item_flags": {},
             "virtual_response_data_ref": None,
             "previous_virtual_response_data_ref": None,
+            "frozen_reference_questionnaire_ref": None,
             "virtual_response_summary": None,
             "virtual_response_item_bank_id": None,
             "virtual_response_item_bank_version": None,
@@ -959,16 +978,27 @@ def _migrate_v13_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _virtual_sample_protocol_is_current(state: Mapping[str, Any]) -> bool:
-    """Return whether resumable virtual evidence uses the score protocol."""
+def _virtual_sample_setup_is_current(state: Mapping[str, Any]) -> bool:
+    """Return whether the saved respondent setup uses the active sample protocol."""
 
     from sjt_system.evaluation.respondents import matched_condition_sample_is_current
+
+    return matched_condition_sample_is_current(
+        state.get("virtual_sample_config"),
+        state.get("virtual_respondents"),
+    )
+
+
+def _virtual_sample_protocol_is_current(state: Mapping[str, Any]) -> bool:
+    """Return whether both the respondent setup and response evidence are current."""
+
+    if not _virtual_sample_setup_is_current(state):
+        return False
+
     from sjt_system.evaluation.simulation import VIRTUAL_RESPONSE_PROMPT_VERSION
 
     config = state.get("virtual_sample_config")
-    respondents = state.get("virtual_respondents")
-    if not matched_condition_sample_is_current(config, respondents):
-        return False
+    respondents = state.get("virtual_respondents") or []
     response_ref = state.get("virtual_response_data_ref")
     if response_ref is None:
         return True
@@ -983,18 +1013,77 @@ def _virtual_sample_protocol_is_current(state: Mapping[str, Any]) -> bool:
     from sjt_system.evaluation.respondents import MATCHED_CONDITION_SCHEMA_VERSION
     if response_manifest.get("schema_version") != MATCHED_CONDITION_SCHEMA_VERSION:
         return False
-    if config.get("migrated_from_equal_score_tiers") is True:
-        return bool(
-            response_manifest.get("persona_modes") == ["score_profile"]
-            and response_manifest.get("sample_size") == len(respondents)
-        )
     return bool(
         response_manifest.get("prompt_version") == VIRTUAL_RESPONSE_PROMPT_VERSION
         and response_manifest.get("score_prompt_version")
         == config.get("prompt_version")
         and response_manifest.get("generator_version")
         == config.get("generator_version")
+        and response_manifest.get("score_noise_method") == "fixed_scores_temperature_sampling"
+        and response_manifest.get("response_temperature") == config.get("response_temperature")
+        and response_manifest.get("demographics_version") == config.get("demographics_version")
+        and all(
+            (response_manifest.get("virtual_sample_config") or {}).get(key) == config.get(key)
+            for key in ("demographics_snapshot", "demographics_seed", "score_specs")
+        )
     )
+
+
+def _invalidate_stale_virtual_responses(
+    state: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Discard stale response evidence while preserving approved sample setup."""
+
+    migrated = deepcopy(dict(state))
+    migrated.update(
+        {
+            "virtual_response_data_ref": None,
+            "previous_virtual_response_data_ref": None,
+            "virtual_response_summary": None,
+            "virtual_response_item_bank_id": None,
+            "virtual_response_item_bank_version": None,
+            "item_statistics": {},
+            "psychometric_round_result": None,
+            "test_statistics": None,
+            "factor_results": None,
+            "irt_results": None,
+            "dif_results": None,
+            "selected_items": [],
+            "reserve_items": [],
+            "selection_reasons": {},
+            "selection_results": None,
+            "psychometric_selection_history": [],
+            "locked_retained_item_versions": {},
+            "best_assembly_candidate": None,
+            "item_final_dispositions": {},
+            "assembled_test": None,
+            "test_review_result": None,
+            "final_test": None,
+            "item_database_ref": None,
+            "technical_report": None,
+            "virtual_respondent_report": None,
+            "completion_checks": {},
+            "unmet_completion_conditions": [],
+            "psychometric_iteration_history": [],
+            "psychometric_plateau_status": None,
+            "psychometric_repair_confirmation": None,
+            "virtual_sample_reconfiguration_reason": None,
+            "virtual_analysis_reconfiguration_reason": (
+                "上一轮虚拟作答提示版本已更新；已保留通过校验的被试配置，"
+                "清除旧作答与派生指标，并在后续返修轮自动生成新批次。"
+            ),
+            "virtual_sample_migration_events": [
+                *deepcopy(migrated.get("virtual_sample_migration_events") or []),
+                {
+                    "event": "stale_virtual_responses_invalidated_setup_preserved",
+                    "recorded_at": utc_timestamp(),
+                    "approved_sample_setup_preserved": True,
+                    "repair_queue_preserved": True,
+                },
+            ],
+        }
+    )
+    return migrated
 
 
 def _migrate_equal_legacy_score_sample(
@@ -1166,7 +1255,13 @@ def _clear_legacy_analysis_state(state: Mapping[str, Any]) -> dict[str, Any]:
 def _migrate_matched_form_retest_protocol(
     state: Mapping[str, Any],
 ) -> dict[str, Any] | None:
-    """Upgrade matched v6 samples while preserving item-development history."""
+    """Legacy matched samples must be regenerated under the complete-profile schema."""
+
+    # The new protocol changes the estimand: every virtual subject carries all
+    # facets, with one shared distribution and independently ranked vectors.
+    # Older matched samples only contain arm-local vectors and therefore cannot
+    # be upgraded without silently changing the virtual population.
+    return None
 
     from sjt_system.evaluation.respondents import (
         DEFAULT_TARGET_FORM_ADMINISTRATION_COUNT,
@@ -1211,6 +1306,7 @@ def _migrate_matched_form_retest_protocol(
             "virtual_sample_config": upgraded_config,
             "virtual_response_data_ref": None,
             "previous_virtual_response_data_ref": None,
+            "frozen_reference_questionnaire_ref": None,
             "virtual_response_summary": None,
             "virtual_response_item_bank_id": None,
             "virtual_response_item_bank_version": None,
@@ -1349,7 +1445,10 @@ def _invalidate_legacy_virtual_screening(
     if not has_virtual_state:
         migrated.setdefault("virtual_sample_reconfiguration_reason", None)
         return migrated
-    if _virtual_sample_protocol_is_current(migrated):
+    if _virtual_sample_setup_is_current(migrated):
+        if not _virtual_sample_protocol_is_current(migrated):
+            return _invalidate_stale_virtual_responses(migrated)
+
         from sjt_system.evaluation.psychometrics import (
             MEASUREMENT_EVALUATION_VERSION,
             PSYCHOMETRIC_FORMULA_VERSION,
@@ -1395,12 +1494,13 @@ def _invalidate_legacy_virtual_screening(
             "virtual_respondents": [],
             "virtual_response_data_ref": None,
             "previous_virtual_response_data_ref": None,
+            "frozen_reference_questionnaire_ref": None,
             "virtual_response_summary": None,
             "virtual_response_item_bank_id": None,
             "virtual_response_item_bank_version": None,
             "virtual_sample_reconfiguration_reason": (
-                "此检查点使用旧 tier/重复作答协议；必须重新选择目标、同域和跨域 facet，"
-                "并配置共享正态分布的均值与SD。旧文件保留但不会静默复用。"
+                "此检查点缺少新协议的固定人口学资料、facet 构念定义或 temperature=1.5，"
+                "必须重新配置虚拟被试。旧检查点和结果文件保留，不会静默复用。"
             ),
             "item_statistics": {},
             "psychometric_round_result": None,
@@ -1443,6 +1543,84 @@ def _invalidate_legacy_virtual_screening(
     if isinstance(frozen, list) and frozen:
         migrated["item_pool"] = deepcopy(frozen)
     return migrated
+
+
+def _restore_approved_virtual_sample_setup(
+    state: Mapping[str, Any],
+    *,
+    checkpoint_root: Path,
+) -> dict[str, Any]:
+    """Restore only a valid setup from a preserved checkpoint of this run."""
+
+    from sjt_system.evaluation.respondents import matched_condition_sample_is_current
+
+    if _virtual_sample_setup_is_current(state) or not state.get(
+        "virtual_sample_reconfiguration_reason"
+    ):
+        return deepcopy(dict(state))
+
+    run_id = state.get("run_id")
+    bank_id = state.get("item_bank_id")
+    bank_version = state.get("item_bank_version")
+    source_items = state.get("frozen_item_bank") or state.get("item_pool") or []
+    target_ids = {
+        str(item.get("target_dimension_id"))
+        for item in source_items
+        if isinstance(item, Mapping) and item.get("target_dimension_id")
+    }
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or not bank_id
+        or bank_version is None
+        or not target_ids
+    ):
+        return deepcopy(dict(state))
+
+    candidates = sorted(
+        Path(checkpoint_root).glob(f"{run_id}*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    for candidate in candidates:
+        if candidate.name == f"{run_id}.json":
+            continue
+        try:
+            saved = load_run_checkpoint(candidate)["state"]
+        except (OSError, ValueError, KeyError):
+            continue
+        config = saved.get("virtual_sample_config")
+        respondents = saved.get("virtual_respondents")
+        saved_targets = (
+            {str(value) for value in config.get("target_dimension_ids") or []}
+            if isinstance(config, Mapping)
+            else set()
+        )
+        if (
+            saved.get("run_id") != run_id
+            or saved.get("item_bank_id") != bank_id
+            or saved.get("item_bank_version") != bank_version
+            or not matched_condition_sample_is_current(config, respondents)
+            or saved_targets != target_ids
+        ):
+            continue
+
+        restored = deepcopy(dict(state))
+        restored["virtual_sample_config"] = deepcopy(dict(config))
+        restored["virtual_respondents"] = deepcopy(respondents)
+        restored["virtual_sample_reconfiguration_reason"] = None
+        restored["virtual_sample_migration_events"] = [
+            *deepcopy(restored.get("virtual_sample_migration_events") or []),
+            {
+                "event": "approved_virtual_sample_setup_restored",
+                "recorded_at": utc_timestamp(),
+                "source_checkpoint": candidate.name,
+                "item_bank_id": bank_id,
+                "item_bank_version": bank_version,
+            },
+        ]
+        return restored
+    return deepcopy(dict(state))
 
 
 def _migrate_v14_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -1530,9 +1708,118 @@ def _migrate_v19_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     state.setdefault("psychometric_plateau_min_delta", 0.01)
     return {
         **deepcopy(dict(payload)),
-        "schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "schema_version": 20,
         "state": _strip_removed_state_fields(state),
     }
+
+
+def _migrate_v20_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Add explicit per-facet retained-item quotas to old specifications."""
+
+    state = deepcopy(dict(payload["state"]))
+    specification = state.get("test_specification")
+    if isinstance(specification, Mapping):
+        specification = dict(specification)
+        selection = specification.get("construct_selection")
+        facet_ids: list[str] = []
+        if isinstance(selection, Mapping):
+            try:
+                profile = resolve_construct_selection(selection)
+                facet_ids = [
+                    str(facet["facet_id"])
+                    for facet in profile.get("facets") or []
+                ]
+            except ValueError:
+                facet_ids = [
+                    str(facet_id)
+                    for facet_id in (selection.get("facet_ids") or [])
+                    if isinstance(facet_id, str) and facet_id
+                ]
+        raw_counts = specification.get("facet_item_counts")
+        counts = (
+            {
+                str(facet_id): int(value)
+                for facet_id, value in raw_counts.items()
+                if isinstance(facet_id, str)
+                and isinstance(value, int)
+                and not isinstance(value, bool)
+                and value > 0
+            }
+            if isinstance(raw_counts, Mapping)
+            else {}
+        )
+        final_count = specification.get("final_item_count")
+        if set(counts) != set(facet_ids):
+            counts = {}
+            if (
+                isinstance(final_count, int)
+                and not isinstance(final_count, bool)
+                and final_count > 0
+                and len(facet_ids) == 1
+            ):
+                counts = {facet_ids[0]: int(final_count)}
+            elif (
+                isinstance(final_count, int)
+                and not isinstance(final_count, bool)
+                and final_count > 0
+                and facet_ids
+                and final_count >= len(facet_ids)
+            ):
+                per_facet, remainder = divmod(final_count, len(facet_ids))
+                counts = {
+                    facet_id: per_facet + (1 if index < remainder else 0)
+                    for index, facet_id in enumerate(facet_ids)
+                }
+        specification["facet_item_counts"] = counts
+        state["test_specification"] = specification
+        sources = state.get("specification_sources")
+        if isinstance(sources, Mapping):
+            migrated_sources = dict(sources)
+            migrated_sources.setdefault(
+                "facet_item_counts",
+                "inferred" if counts else "user",
+            )
+            state["specification_sources"] = migrated_sources
+    return {
+        **deepcopy(dict(payload)),
+        "schema_version": 21,
+        "state": _strip_removed_state_fields(state),
+    }
+
+
+def _migrate_v21_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """Preserve old measurements without counting them as fixed-cohort rounds."""
+    from sjt_system.evaluation.facet_iteration import prepare_resume
+
+    state = deepcopy(dict(payload["state"]))
+    if "facet_iteration_state" not in state:
+        state["facet_iteration_state"] = prepare_resume(state)
+    return {**deepcopy(dict(payload)), "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "state": _strip_removed_state_fields(state)}
+
+
+def _preserve_legacy_virtual_checkpoint(target: Path) -> None:
+    if not target.is_file():
+        return
+    from sjt_system.evaluation.respondents import matched_condition_sample_is_current
+
+    original = target.read_bytes()
+    previous = json.loads(original)
+    previous_state = previous.get("state") if isinstance(previous, Mapping) else None
+    if not isinstance(previous_state, Mapping):
+        return
+    has_virtual_evidence = any(previous_state.get(key) for key in (
+        "virtual_sample_config", "virtual_respondents", "virtual_response_data_ref", "test_statistics",
+    ))
+    if not has_virtual_evidence or matched_condition_sample_is_current(
+        previous_state.get("virtual_sample_config"), previous_state.get("virtual_respondents"),
+    ):
+        return
+    archive = target.parent / "legacy_virtual_protocol"
+    archive.mkdir(parents=True, exist_ok=True)
+    preserved = archive / f"{target.stem}-{uuid4().hex}.json"
+    with preserved.open("xb") as handle:
+        handle.write(original)
 
 
 def save_run_checkpoint(
@@ -1545,30 +1832,90 @@ def save_run_checkpoint(
     run_id = state.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("运行状态缺少有效 run_id")
-    root = Path(checkpoint_root)
+    # Normalize junction/symlink aliases before constructing the temporary and
+    # destination paths.  On Windows, mixing the workspace alias with the
+    # resolved project path can make an otherwise same-volume atomic replace
+    # appear to target two different files and raise WinError 5.
+    root = Path(checkpoint_root).resolve()
     root.mkdir(parents=True, exist_ok=True)
     target = root / f"{run_id}.json"
     temporary = root / f".{run_id}.{uuid4().hex}.json.tmp"
+    canonical_state = normalize_replacement_policy(deepcopy(dict(state)))
     payload = {
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
         "run_id": run_id,
         "saved_at": utc_timestamp(),
-        "is_terminal": state.get("status") in TERMINAL_STATUSES,
-        "state": _strip_removed_state_fields(state),
+        "is_terminal": canonical_state.get("status") in TERMINAL_STATUSES,
+        "state": _strip_removed_state_fields(canonical_state),
     }
-    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    temporary.write_text(serialized, encoding="utf-8")
+    _preserve_legacy_virtual_checkpoint(target)
+    # Stream the large checkpoint instead of materializing the complete JSON
+    # document in one contiguous string.  Long repair histories can make the
+    # serialized state hundreds of megabytes; ``json.dumps(...).encode`` may
+    # otherwise raise MemoryError even though the state itself is still
+    # recoverable.
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    replace_error: PermissionError | None = None
     for attempt in range(CHECKPOINT_REPLACE_ATTEMPTS):
         try:
             temporary.replace(target)
             return target
         except PermissionError as exc:
+            replace_error = exc
             if attempt + 1 >= CHECKPOINT_REPLACE_ATTEMPTS:
-                raise PermissionError(
-                    f"checkpoint 被其他进程占用；最新状态保留在 {temporary}"
-                ) from exc
+                break
             sleep(CHECKPOINT_REPLACE_BACKOFF_SECONDS * (attempt + 1))
-    return target
+
+    # A Windows junction/monitor can keep the canonical target open even after
+    # all workflow processes have exited.  Keep the committed state usable by
+    # publishing a sidecar checkpoint instead of failing the whole workflow.
+    # Resume code prefers the newest valid sidecar over the stale canonical
+    # target, so no measurement batch is lost and no duplicate run is needed.
+    fallback = root / f"{run_id}.recovery.json"
+    for attempt in range(CHECKPOINT_REPLACE_ATTEMPTS):
+        try:
+            temporary.replace(fallback)
+            return fallback
+        except PermissionError as exc:
+            replace_error = exc
+            if attempt + 1 >= CHECKPOINT_REPLACE_ATTEMPTS:
+                break
+            sleep(CHECKPOINT_REPLACE_BACKOFF_SECONDS * (attempt + 1))
+
+    # If a status reader has the stable sidecar open as well, use a unique
+    # valid JSON path.  It is still discoverable by the run-id resolver below.
+    unique_fallback = root / f"{run_id}.recovery-{uuid4().hex}.json"
+    try:
+        temporary.replace(unique_fallback)
+        return unique_fallback
+    except PermissionError as exc:
+        raise PermissionError(
+            f"checkpoint 被其他进程占用；最新状态保留在 {temporary}"
+        ) from (replace_error or exc)
+
+
+def resolve_run_checkpoint_path(
+    run_id: str,
+    checkpoint_root: Path = DEFAULT_CHECKPOINT_ROOT,
+) -> Path:
+    """Select the newest committed checkpoint path for one run, including sidecars.
+
+    Validation is deliberately deferred to ``load_run_checkpoint``.  A full
+    virtual-response checkpoint can be hundreds of megabytes; parsing it just
+    to discover the path would double peak memory before the caller loads the
+    state that it actually needs.
+    """
+
+    root = Path(checkpoint_root)
+    candidates = [
+        path
+        for path in root.glob(f"{run_id}*.json")
+        if path.is_file() and path.stat().st_size > 0
+    ]
+    candidates.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+    return candidates[0] if candidates else root / f"{run_id}.json"
 
 
 def load_run_checkpoint(path: Path) -> dict[str, Any]:
@@ -1641,19 +1988,52 @@ def load_run_checkpoint(path: Path) -> dict[str, Any]:
         payload = _migrate_v18_payload(payload)
     if payload["schema_version"] == 19:
         payload = _migrate_v19_payload(payload)
+    if payload["schema_version"] == 20:
+        payload = _migrate_v20_payload(payload)
+    if payload["schema_version"] == 21:
+        payload = _migrate_v21_payload(payload)
     canonical_payload = deepcopy(dict(payload))
     canonical_state = deepcopy(dict(payload["state"]))
+    normalize_replacement_policy(canonical_state)
     canonical_state.setdefault("psychometric_plateau_status", None)
     canonical_state.setdefault("psychometric_plateau_patience", 2)
     canonical_state.setdefault("psychometric_plateau_min_delta", 0.01)
-    canonical_payload["state"] = _strip_removed_state_fields(canonical_state)
+    canonical_specification = canonical_state.get("test_specification")
+    if isinstance(canonical_specification, Mapping):
+        canonical_specification = dict(canonical_specification)
+        selection = canonical_specification.get("construct_selection")
+        if isinstance(selection, Mapping):
+            try:
+                canonical_specification["construct_selection"] = (
+                    construct_selection_from_profile(
+                        resolve_construct_selection(selection)
+                    )
+                )
+            except ValueError:
+                # Preserve an invalid legacy selection so the normal
+                # requirement-reopening path can explain and repair it.
+                pass
+        canonical_specification.setdefault("facet_item_counts", {})
+        canonical_state["test_specification"] = canonical_specification
+        canonical_sources = canonical_state.get("specification_sources")
+        if isinstance(canonical_sources, Mapping):
+            canonical_sources = dict(canonical_sources)
+            canonical_sources.setdefault("facet_item_counts", "inferred")
+            canonical_state["specification_sources"] = canonical_sources
+    from sjt_system.evaluation.psychometrics import refresh_saved_option_diagnostics
+
+    canonical_payload["state"] = _strip_removed_state_fields(
+        refresh_saved_option_diagnostics(canonical_state)
+    )
     return canonical_payload
 
 
 def find_latest_resumable_checkpoint(
     checkpoint_root: Path = DEFAULT_CHECKPOINT_ROOT,
+    *,
+    include_stopped_repair: bool = False,
 ) -> dict[str, Any] | None:
-    """Return the newest validated nonterminal run checkpoint."""
+    """Return the newest active run, optionally including a stopped repair queue."""
 
     root = Path(checkpoint_root)
     if not root.exists():
@@ -1672,7 +2052,17 @@ def find_latest_resumable_checkpoint(
             invalid_paths.append(path)
             continue
         valid_checkpoint_count += 1
-        if not checkpoint["is_terminal"]:
+        state = checkpoint["state"]
+        stopped_repair = (
+            include_stopped_repair
+            and state.get("status") == "stopped"
+            and (
+                (isinstance(state.get("scenario_repair_pause"), Mapping)
+                 and bool([*(state.get("items_to_revise") or []), *(state.get("items_to_regenerate") or [])]))
+                or (state.get("facet_iteration_state") or {}).get("status") == "paused"
+            )
+        )
+        if not checkpoint["is_terminal"] or stopped_repair:
             return checkpoint
     if invalid_paths and valid_checkpoint_count == 0:
         names = ", ".join(path.name for path in invalid_paths[:3])
@@ -1685,15 +2075,181 @@ def find_latest_resumable_checkpoint(
 
 def prepare_resumed_state(
     state: Mapping[str, Any],
+    *,
+    checkpoint_root: Path = DEFAULT_CHECKPOINT_ROOT,
 ) -> dict[str, Any]:
     """Reset transient control fields while preserving committed work."""
 
-    resumed = _invalidate_legacy_virtual_screening(state)
+    from sjt_system.evaluation.facet_iteration import (
+        is_enabled,
+        prepare_resume,
+        refresh_repair_queue_for_thaw_policy,
+    )
+    resumed_policy_state = normalize_replacement_policy(deepcopy(dict(state)))
+    if is_enabled(resumed_policy_state) or (
+        resumed_policy_state.get("virtual_content_review_protocol") == "mte_cosmin_virtual_content_review_v1"
+        and (int(resumed_policy_state.get("psychometric_analysis_round") or 0)
+             or resumed_policy_state.get("psychometric_iteration_history"))
+    ):
+        # Fixed-cohort raw data and immutable historical measurements must survive
+        # a decision-policy upgrade; legacy histories require an explicit new run.
+        resumed = resumed_policy_state
+        was_local_budget_pause = (
+            isinstance(resumed.get("facet_iteration_state"), Mapping)
+            and resumed["facet_iteration_state"].get("status") == "paused"
+            and resumed["facet_iteration_state"].get("paused_reason")
+            == "Five local repairs exhausted without all facet gates passing"
+        )
+        resumed["facet_iteration_state"] = prepare_resume(resumed)
+        resumed = refresh_repair_queue_for_thaw_policy(resumed)
+        if (
+            was_local_budget_pause
+            and resumed["facet_iteration_state"].get("status") == "awaiting_repair"
+            and (resumed.get("selection_results") or {}).get("status")
+            == "facet_iteration_paused"
+        ):
+            # The old finite-budget stop wrote a terminal selection marker.
+            # Clear only that transient marker so the fixed-facet selector can
+            # plan the next unlimited repair batch from the committed ledger.
+            resumed["selection_results"] = None
+        resumed["psychometric_plateau_status"] = None
+        resumed["status"] = "stopped" if resumed["facet_iteration_state"]["status"] == "paused" else "running"
+        for field in _RESUME_RESET_FIELDS:
+            resumed[field] = None
+        if resumed.get("scenario_repair_pause") and resumed.get("items_to_revise"):
+            resumed["scenario_repair_pause"] = None
+        return resumed
+
+    recoverable = _restore_approved_virtual_sample_setup(
+        resumed_policy_state,
+        checkpoint_root=Path(checkpoint_root),
+    )
+    resumed = _invalidate_legacy_virtual_screening(recoverable)
+    normalize_replacement_policy(resumed)
+    pending_repair = [*(resumed.get("items_to_revise") or []),
+                      *(resumed.get("items_to_regenerate") or [])]
+    progress = state.get("scenario_repair_progress") or {}
+    archive_refs = [row.get("scenario_archive_ref") for row in pending_repair
+                    if isinstance(row, Mapping)]
+    archive_refs.extend(row.get("archive_ref") for row in progress.values()
+                        if isinstance(row, Mapping))
+    archived_repair = (
+        bool(pending_repair)
+        and bool(state.get("scenario_repair_pause") or state.get("scenario_repair_progress")
+                 or state.get("scenario_repair_staged"))
+        and all(isinstance(row, Mapping) and row.get("item_id")
+                and isinstance(row.get("diagnosis_evidence"), Mapping) for row in pending_repair)
+        and any(isinstance(ref, str) and ref for ref in archive_refs)
+    )
+    if archived_repair and not (resumed.get("items_to_revise") or resumed.get("items_to_regenerate")):
+        # The sample migration invalidates formal evidence. Keep only the frozen
+        # textual repair queue and its journals; subsequent simulation must be new.
+        for field in ("items_to_revise", "items_to_regenerate", "scenario_repair_pause",
+                      "scenario_repair_progress", "scenario_repair_staged", "repair_knowledge_state",
+                      "item_pool", "item_pattern_profiles"):
+            resumed[field] = deepcopy(state.get(field))
+        resumed["virtual_sample_migration_events"] = [
+            *deepcopy(resumed.get("virtual_sample_migration_events") or []),
+            {"event": "archived_repair_queue_preserved", "recorded_at": utc_timestamp()},
+        ]
+    history = resumed.get("psychometric_iteration_history")
+    statistics = resumed.get("test_statistics") or {}
+    if isinstance(history, list) and history and isinstance(statistics, Mapping):
+        latest = max(
+            (row for row in history if isinstance(row, Mapping)),
+            key=lambda row: int(row.get("analysis_round") or 0),
+            default=None,
+        )
+        if (
+            isinstance(latest, Mapping)
+            and (latest.get("form_metrics") or {}).get("metric_framework")
+            == "virtual_form_response_transmission_v3"
+            and int(statistics.get("psychometric_analysis_round") or 0)
+            == int(latest.get("analysis_round") or 0)
+            and latest.get("form_item_ids")
+        ):
+            from sjt_system.evaluation.form_metrics import (
+                CURRENT_FORM_METRIC_FRAMEWORK,
+                assess_form_plateau,
+                build_provisional_form_metrics,
+                form_quality_summary,
+            )
+
+            refreshed = build_provisional_form_metrics(resumed, latest["form_item_ids"])
+            if (
+                refreshed.get("metric_framework") == CURRENT_FORM_METRIC_FRAMEWORK
+                and refreshed.get("status") == "complete"
+            ):
+                updated_history = [dict(row) for row in history]
+                index = history.index(latest)
+                updated_history[index]["form_metrics"] = refreshed
+                updated_history[index]["previous_metric_framework"] = "virtual_form_response_transmission_v3"
+                plateau = assess_form_plateau(
+                    updated_history,
+                    patience=int(resumed.get("psychometric_plateau_patience") or 2),
+                    min_delta=float(
+                        resumed["psychometric_plateau_min_delta"]
+                        if resumed.get("psychometric_plateau_min_delta") is not None
+                        else 0.01
+                    ),
+                )
+                summary = form_quality_summary(refreshed)
+                updated_history[index].update({
+                    "candidate_form_quality": summary.get("candidate_form_quality"),
+                    "best_so_far_form_quality": plateau.get("best_form_quality"),
+                    "accepted_as_best": bool((plateau.get("trajectory") or [{}])[-1].get("accepted_as_best")),
+                    "eligible_for_best_so_far": summary.get("eligible_for_best_so_far"),
+                    "plateau_status": plateau,
+                })
+                resumed["psychometric_iteration_history"] = updated_history
+                resumed["psychometric_plateau_status"] = plateau
+    history = resumed.get("psychometric_iteration_history")
+    if isinstance(history, list) and any(
+        isinstance(row, Mapping)
+        and (row.get("form_metrics") or {}).get("metric_framework")
+        == "virtual_form_response_transmission_v4"
+        for row in history
+    ):
+        from sjt_system.evaluation.form_metrics import assess_form_plateau
+
+        plateau = assess_form_plateau(
+            history,
+            patience=int(resumed.get("psychometric_plateau_patience") or 2),
+            min_delta=float(
+                resumed["psychometric_plateau_min_delta"]
+                if resumed.get("psychometric_plateau_min_delta") is not None
+                else 0.01
+            ),
+        )
+        trajectory = {
+            int(row.get("analysis_round") or 0): row
+            for row in plateau.get("trajectory") or []
+        }
+        refreshed_history = []
+        for entry in history:
+            if not isinstance(entry, Mapping):
+                continue
+            updated = dict(entry)
+            if (updated.get("form_metrics") or {}).get("metric_framework") != "virtual_form_response_transmission_v4":
+                refreshed_history.append(updated)
+                continue
+            progress = trajectory.get(int(entry.get("analysis_round") or 0)) or {}
+            updated["accepted_as_best"] = bool(progress.get("accepted_as_best"))
+            updated["eligible_for_best_so_far"] = bool(progress.get("eligible_for_best_so_far"))
+            updated["best_so_far_form_quality"] = progress.get("best_so_far_form_quality")
+            if int(entry.get("analysis_round") or 0) == plateau.get("current_round"):
+                updated["plateau_status"] = plateau
+            refreshed_history.append(updated)
+        resumed["psychometric_iteration_history"] = refreshed_history
+        resumed["psychometric_plateau_status"] = plateau
     resumed.pop("psychometric_defer_batch_eliminate", None)
     run_id = resumed.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("恢复状态缺少有效 run_id")
     resumed["status"] = "running"
+    if (resumed.get("scenario_repair_pause")
+            and [*(resumed.get("items_to_revise") or []), *(resumed.get("items_to_regenerate") or [])]):
+        resumed["scenario_repair_pause"] = None
     resumed.setdefault(
         "psychometric_repair_defer_after_rounds",
         PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS,
@@ -1704,6 +2260,8 @@ def prepare_resumed_state(
         "max_psychometric_repair_rounds",
         PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS,
     )
+    resumed["failure_call_replenishment"] = True
+    resumed.setdefault("deferred_replacement_measurement_pending", False)
     for field in _RESUME_RESET_FIELDS:
         resumed[field] = None
     if isinstance(resumed.get("active_psychometric_repair"), Mapping):
@@ -1730,9 +2288,9 @@ def prepare_retry_state(
     run_id = current_state.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise ValueError("重试状态缺少有效 run_id")
-    saved_path = Path(checkpoint_root) / f"{run_id}.json"
+    saved_path = resolve_run_checkpoint_path(run_id, checkpoint_root)
     source_state: Mapping[str, Any] = current_state
     if saved_path.exists():
         checkpoint = load_run_checkpoint(saved_path)
         source_state = checkpoint["state"]
-    return prepare_resumed_state(source_state)
+    return prepare_resumed_state(source_state, checkpoint_root=checkpoint_root)

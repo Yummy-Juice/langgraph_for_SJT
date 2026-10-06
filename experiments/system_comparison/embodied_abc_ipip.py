@@ -61,7 +61,7 @@ class EmbodiedABCIPIPConfig:
     ipip_result: Path
     model_id: str = "glm-5.3-flash"
     summary_pool: Path = DEFAULT_IMPORTED_SUMMARY_POOL
-    max_concurrency: int = 10
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
     bootstrap_replications: int = 5000
@@ -70,8 +70,8 @@ class EmbodiedABCIPIPConfig:
     output: Path | None = None
 
     def validate(self) -> None:
-        if not 1 <= self.max_concurrency <= 50:
-            raise ValueError("max_concurrency必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency必须为非负整数")
         if not 0 <= self.max_retries <= 10:
             raise ValueError("max_retries必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -505,18 +505,29 @@ async def run_embodied_abc_ipip(
                     run_config,
                 )
                 print("[预检] 通过，开始A/B/C正式作答", flush=True)
-            for method in ("A", "B", "C"):
-                raw_records[method] = await _run_sjt_stage(
-                    method,
-                    forms[method],
-                    subject_ids,
-                    profiles,
-                    summaries,
-                    runnable,
-                    model_id,
-                    output / method / "raw",
-                    run_config,
+            method_results = await asyncio.gather(
+                *(
+                    _run_sjt_stage(
+                        method,
+                        forms[method],
+                        subject_ids,
+                        profiles,
+                        summaries,
+                        runnable,
+                        model_id,
+                        output / method / "raw",
+                        run_config,
+                    )
+                    for method in ("A", "B", "C")
+                ),
+                return_exceptions=True,
+            )
+            errors = [result for result in method_results if isinstance(result, BaseException)]
+            if errors:
+                raise RuntimeError(
+                    f"A/B/C具身作答有{len(errors)}个表单失败；首个错误：{errors[0]}"
                 )
+            raw_records = dict(zip(("A", "B", "C"), method_results))
     except Exception as exc:
         write_json(output / "manifest.json", {**manifest, "status": "failed", "error": str(exc)})
         raise
@@ -601,7 +612,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ipip-result", type=Path, required=True)
     parser.add_argument("--model", dest="model_id", default="glm-5.3-flash")
     parser.add_argument("--summary-pool", type=Path, default=DEFAULT_IMPORTED_SUMMARY_POOL)
-    parser.add_argument("--max-concurrency", type=int, default=10)
+    parser.add_argument(
+        "--max-concurrency", type=int, default=0,
+        help="all independent model calls are dispatched together; legacy concurrency ignored",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--timeout", dest="timeout_seconds", type=float, default=None)
     parser.add_argument("--bootstrap-replications", type=int, default=5000)

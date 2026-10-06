@@ -7,6 +7,8 @@ from typing import Any
 from langchain_core.runnables import RunnableLambda
 from langchain_openai import ChatOpenAI
 from dotenv import load_dotenv
+from httpx import Limits
+from openai import DefaultAsyncHttpxClient, DefaultHttpxClient
 from pydantic import TypeAdapter, ValidationError as PydanticValidationError
 from sjt_system.agent.json_parsing import parse_model_json_response
 from sjt_system.runtime.telemetry import HANDLER as TELEMETRY_HANDLER
@@ -72,6 +74,13 @@ def get_model(
         ),
         timeout=get_model_request_timeout_seconds(),
         max_retries=0,
+        # Bound idle keep-alive sockets, not active requests in a model batch.
+        http_client=DefaultHttpxClient(
+            limits=Limits(max_connections=None, max_keepalive_connections=20),
+        ),
+        http_async_client=DefaultAsyncHttpxClient(
+            limits=Limits(max_connections=None, max_keepalive_connections=20),
+        ),
         # Observation-only telemetry: token usage and latency per model call.
         callbacks=[TELEMETRY_HANDLER],
     )
@@ -83,7 +92,7 @@ SUPPORTED_STRUCTURED_OUTPUT_METHODS = {
     "json_schema",
     "plain_json",
 }
-DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 300.0
+DEFAULT_MODEL_REQUEST_TIMEOUT_SECONDS = 600.0
 DEFAULT_MODEL_REQUEST_MAX_ATTEMPTS = 2
 
 

@@ -248,7 +248,7 @@ def test_report_charts_abc_aggregate_item_metric_changes_using_final_c_only(tmp_
     assert "C 均值: 0.400" in html
     assert "C 中位数: 0.400" in html
     assert "C 均值: 0.990" not in html
-    assert "四门槛通过率" in html
+    assert "七项门槛通过率" in html
     assert "A→B→C整卷指标" in html
     assert "目标Hedges’ g" in html
     assert "Δmin区分效度" in html
@@ -314,7 +314,7 @@ class RespondentModel:
         return RunnableLambda(respond)
 
 
-def test_real_evaluator_exports_four_gates_and_reuses_only_raw_evaluation(tmp_path, monkeypatch):
+def test_real_evaluator_exports_seven_gates_and_reuses_only_raw_evaluation(tmp_path, monkeypatch):
     from experiments.system_comparison.config import ExperimentConfig
     from experiments.system_comparison.storage import ExperimentStore
     from experiments.system_comparison.evaluation import evaluate_form

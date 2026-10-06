@@ -18,7 +18,8 @@
 
 用法：
   python tools/run_same_domain_arms.py --bank mussel --dir outputs/mussel_conductance/<run>
-      [--sample-size 100] [--concurrency 20]
+      [--sample-size 100] [--concurrency 0]
+      （--concurrency 仅兼容旧参数，0 或正数均为全量并发）
 """
 
 from __future__ import annotations
@@ -41,6 +42,11 @@ from sjt_system.agent.client import (
 )
 from sjt_system.evaluation.respondents import generate_score_respondent_refs
 from sjt_system.evaluation.simulation import SJTSelectionOutput
+from sjt_system.runtime.concurrency import (
+    UnlimitedConcurrency,
+    gather_all,
+    validate_max_concurrency,
+)
 from tools.run_mussel_conductance_check import _answer_mussel_group
 from tools.run_cibol_conductance_check import load_cibol_items
 from sjt_system.runtime.telemetry import run_context as telemetry_run_context
@@ -78,14 +84,14 @@ async def _main(args: argparse.Namespace) -> None:
 
     model = get_model()
     sjt_model, _method = with_compatible_structured_output(model, SJTSelectionOutput)
-    semaphore = asyncio.Semaphore(args.concurrency)
+    semaphore = UnlimitedConcurrency()
     request_timeout_seconds = get_model_request_timeout_seconds()
 
     print(
         f"[same-domain] {args.bank} | {len(mapping)} 组 × {args.sample_size} 人 × "
-        f"{len(items)} 题 | 并发 {args.concurrency}"
+        f"{len(items)} 题 | 全量并发"
     )
-    summary_rows = []
+    group_inputs = []
     for group_index, (target, same_facet) in enumerate(mapping.items()):
         refs, _diag = generate_score_respondent_refs(
             args.sample_size,
@@ -95,6 +101,17 @@ async def _main(args: argparse.Namespace) -> None:
         for index, ref in enumerate(refs):
             ref["respondent_id"] = f"{same_facet}-{ref['respondent_id']}"
             ref["respondent_index"] = index
+        group_inputs.append((target, same_facet, refs))
+
+    summary_rows: list[dict[str, Any] | None] = [None] * len(group_inputs)
+    summary_write_lock = asyncio.Lock()
+
+    async def run_group(
+        group_index: int,
+        target: str,
+        same_facet: str,
+        refs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         started = time.perf_counter()
         summary = await _answer_mussel_group(
             facet_id=same_facet,
@@ -109,22 +126,31 @@ async def _main(args: argparse.Namespace) -> None:
             seed=args.seed,
             run_id=f"{suffix}-same-domain",
         )
-        summary_rows.append(
-            {
-                "target": target,
-                "same_domain_facet": same_facet,
-                **summary,
-                "elapsed_seconds": round(time.perf_counter() - started, 1),
-            }
-        )
+        row = {
+            "target": target,
+            "same_domain_facet": same_facet,
+            **summary,
+            "elapsed_seconds": round(time.perf_counter() - started, 1),
+        }
+        summary_rows[group_index] = row
         print(
             f"[group] {target} <- {same_facet}: 新增 {summary['completed_calls']} 条，"
             f"失败 {summary['error_count']}"
         )
-        (run_dir / "same_domain_summaries.json").write_text(
-            json.dumps(summary_rows, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        async with summary_write_lock:
+            ready_rows = [row for row in summary_rows if row is not None]
+            (run_dir / "same_domain_summaries.json").write_text(
+                json.dumps(ready_rows, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return row
+
+    await gather_all(
+        *(
+            run_group(index, target, same_facet, refs)
+            for index, (target, same_facet, refs) in enumerate(group_inputs)
         )
+    )
     print(f"[done] same_domain 作答已写入 {output_path}")
 
 
@@ -133,10 +159,19 @@ def main() -> None:
     parser.add_argument("--bank", choices=["mussel", "cibol"], required=True)
     parser.add_argument("--dir", required=True, help="传导实验输出目录")
     parser.add_argument("--sample-size", type=int, default=100)
-    parser.add_argument("--concurrency", type=int, default=20)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        help="兼容旧参数；0 或正数均为全量并发，不再限制并发数",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--seed", type=int, default=7)
     args = parser.parse_args()
+    try:
+        validate_max_concurrency(args.concurrency)
+    except ValueError as exc:
+        parser.error(str(exc))
     with telemetry_run_context(f"{args.bank}-same-domain"):
         asyncio.run(_main(args))
 

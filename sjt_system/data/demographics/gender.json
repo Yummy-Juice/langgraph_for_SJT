@@ -1,0 +1,10 @@
+{
+  "schema_version": 1,
+  "database_version": "demographics-v1",
+  "synthetic": true,
+  "kind": "gender",
+  "entries": [
+    { "id": "male", "label": "男" },
+    { "id": "female", "label": "女" }
+  ]
+}

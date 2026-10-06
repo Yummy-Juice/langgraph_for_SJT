@@ -51,6 +51,7 @@ _VIRTUAL_RESPONSE_FIELDS = {
     "virtual_sample_config",
     "virtual_respondents",
     "virtual_response_data_ref",
+    "frozen_reference_questionnaire_ref",
     "virtual_response_summary",
     "virtual_response_item_bank_id",
     "virtual_response_item_bank_version",
@@ -79,6 +80,8 @@ def build_item_bank_freeze_update(
         raise ValueError("冻结题库时发现无效题目记录")
 
     items = deepcopy([dict(item) for item in raw_items])
+    from sjt_system.evaluation.virtual_content_review import is_enabled
+    previous_items = {row["item_id"]: row for row in state.get("frozen_item_bank") or []}
     for item in items:
         if not isinstance(item.get("item_id"), str) or not item["item_id"].strip():
             raise ValueError("冻结题库时发现缺少 item_id 的题目")
@@ -87,6 +90,10 @@ def build_item_bank_freeze_update(
             raise ValueError(
                 f"冻结题库时发现无效题目版本：{item['item_id']!r}"
             )
+        previous = previous_items.get(item["item_id"])
+        if is_enabled(state) and previous is not None:
+            if version < previous["version"] or (item != previous and version == previous["version"]):
+                raise ValueError("题文发生变化必须升级版本；禁止覆盖原版本测量证据")
 
     fingerprint = _fingerprint(items)
     previous_fingerprint = state.get("item_bank_fingerprint")
@@ -141,6 +148,7 @@ def audit_candidate_item_bank(
     前不会进入下一次正式虚拟施测。
     """
 
+    from sjt_system.evaluation.virtual_content_review import is_enabled
     raw_items = state.get("item_pool")
     if not isinstance(raw_items, list) or not raw_items:
         raise ValueError("候选题库审计前必须存在 item_pool")
@@ -222,7 +230,7 @@ def audit_candidate_item_bank(
             warnings.append(
                 {
                     "item_id": item_id,
-                    "message": "题目保留非阻断污染风险，已由逐题审题放行；不作为程序过滤条件。",
+                    "message": "题目保留非阻断污染风险；结构审计不作语义内容合格判断。",
                 }
             )
 
@@ -245,8 +253,8 @@ def audit_candidate_item_bank(
             }),
         },
         "construct_purity_check": {
-            "status": "passed_by_item_review",
-            "authority": "逐题审题；程序仅阻断明确标记的 blocking 污染风险",
+            "status": "not_evaluated_by_structural_audit" if is_enabled(state) else "passed_by_item_review",
+            "authority": "程序仅阻断明确标记的 blocking 污染风险；不能替代虚拟审题和访谈",
         },
         "warnings": warnings,
     }
@@ -301,7 +309,20 @@ def build_virtual_response_context(
         respondent_items.append(
             {
                 "item_id": raw_item.get("item_id"),
-                "item_version": raw_item.get("version"),
+                # The response runner historically consumed ``version`` while
+                # the frozen-bank projection exposed ``item_version``.  Keep
+                # both names in the runtime context so resumed runs and new
+                # runs use the same canonical item identity.
+                "version": (
+                    raw_item.get("version")
+                    if raw_item.get("version") is not None
+                    else raw_item.get("item_version")
+                ),
+                "item_version": (
+                    raw_item.get("version")
+                    if raw_item.get("version") is not None
+                    else raw_item.get("item_version")
+                ),
                 "context_category": raw_item.get("context_category"),
                 "scenario": raw_item.get("scenario"),
                 "response_instruction": raw_item.get("response_instruction"),

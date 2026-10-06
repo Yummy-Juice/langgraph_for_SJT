@@ -16,6 +16,16 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from sjt_system.runtime.concurrency import validate_max_concurrency
+from sjt_system.evaluation.demographics import (
+    DEMOGRAPHICS_VERSION,
+    demographic_settings,
+    generate_demographics,
+    load_demographics_snapshot,
+    validate_demographics,
+    validate_demographics_config,
+)
+
 
 DEFAULT_POOL_PATH = (
     Path(__file__).resolve().parents[1]
@@ -23,20 +33,20 @@ DEFAULT_POOL_PATH = (
     / "virtual_respondents.json"
 )
 DEFAULT_SELECTION_SEED = 7
-DEFAULT_MAX_CONCURRENCY = 5
-MAX_ALLOWED_CONCURRENCY = 20
-DEFAULT_MAX_RETRIES = 2
+DEFAULT_MAX_CONCURRENCY = 0
+MAX_ALLOWED_CONCURRENCY = 20  # Deprecated compatibility constant.
+DEFAULT_MAX_RETRIES = 4
 MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE = 30
-MAX_VIRTUAL_SAMPLE_SIZE = 500
+MAX_VIRTUAL_SAMPLE_SIZE = 1000
 PERSONA_MODE_SUMMARY_PLUS_ITEMS = "summary_plus_items"
 PERSONA_MODE_SCORE_PROFILE = "score_profile"
 SUPPORTED_PERSONA_MODES = (PERSONA_MODE_SCORE_PROFILE,)
 DEFAULT_PERSONA_MODES = SUPPORTED_PERSONA_MODES
-SCORE_PROFILE_GENERATOR_VERSION = "tiered-symmetric-quantile-v3"
-SCORE_PROFILE_PROMPT_VERSION = "score-tier-sjt-v3"
-MATCHED_CONDITION_GENERATOR_VERSION = "matched-normal-shared-sequence-v3"
-MATCHED_CONDITION_PROMPT_VERSION = "matched-facet-grouped-score-v2"
-MATCHED_CONDITION_SCHEMA_VERSION = 7
+SCORE_PROFILE_GENERATOR_VERSION = "tiered-symmetric-quantile-demographics-v4"
+SCORE_PROFILE_PROMPT_VERSION = "defined-facet-demographics-tier-v4"
+MATCHED_CONDITION_GENERATOR_VERSION = "complete-profile-independent-facet-demographics-v2"
+MATCHED_CONDITION_PROMPT_VERSION = "defined-facet-demographics-batch-v2"
+MATCHED_CONDITION_SCHEMA_VERSION = 12
 DEFAULT_TARGET_FORM_ADMINISTRATION_COUNT = 2
 MATCHED_CONDITION_IDS = ("target", "same_domain", "cross_domain")
 MATCHED_CONDITION_ROLES = {
@@ -168,13 +178,25 @@ def recommend_virtual_sample_size(available_count: int) -> int:
 
 def build_virtual_sample_recommendations(
     available_count: int,
+    *,
+    minimum_sample_size: int = MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
 ) -> list[dict[str, Any]]:
     """提供快速、平衡和全量三个不重复的样本量档位。"""
 
-    recommended = recommend_virtual_sample_size(available_count)
+    if (
+        not isinstance(minimum_sample_size, int)
+        or isinstance(minimum_sample_size, bool)
+        or minimum_sample_size < MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE
+        or minimum_sample_size > available_count
+    ):
+        raise ValueError("minimum_sample_size 必须在可用人数范围内")
+    recommended = max(
+        minimum_sample_size,
+        recommend_virtual_sample_size(available_count),
+    )
     candidates = [
         (
-            min(30, available_count),
+            min(minimum_sample_size, available_count),
             "quick",
             "最低开发样本",
             (
@@ -183,7 +205,7 @@ def build_virtual_sample_recommendations(
             ),
         ),
         (
-            min(100, available_count),
+            min(max(100, minimum_sample_size), available_count),
             "balanced",
             "平衡开发",
             "兼顾调用成本与初步分布检查，仍可能有明显抽样波动。",
@@ -194,7 +216,7 @@ def build_virtual_sample_recommendations(
             "全量样本",
             (
                 "使用当前被试池的全部人格档案，避免额外的子样本选择波动；"
-                "当前池容量不大于300人时推荐使用。"
+                "当前池容量不大于1000人时推荐使用。"
             ),
         ),
     ]
@@ -479,19 +501,26 @@ def normalize_score_tiers(
         for row in base_specs
         if str(row.get("dimension_id")) in target_id_set
     }
+    anchor_target = targets.get(target_ids[0]) if target_ids else None
+    anchor_domain = (
+        str(anchor_target.get("domain_id"))
+        if isinstance(anchor_target, Mapping)
+        else None
+    )
     for target_id, target in targets.items():
         if target.get("level") != "facet":
             raise ValueError(f"目标 {target_id} 必须是 facet，才能拆分同域与跨域VTS")
         same_domain = [
             spec for spec in base_specs
             if spec.get("level") == "facet"
-            and spec.get("dimension_id") != target_id
-            and spec.get("domain_id") == target.get("domain_id")
+            and spec.get("dimension_id") != target_ids[0]
+            and spec.get("domain_id") == anchor_domain
         ]
         cross_domain = [
             spec for spec in base_specs
             if spec.get("level") == "facet"
-            and spec.get("domain_id") != target.get("domain_id")
+            and spec.get("dimension_id") != target_ids[0]
+            and spec.get("domain_id") != anchor_domain
         ]
         if not same_domain or not cross_domain:
             raise ValueError(
@@ -567,6 +596,67 @@ def _orthogonal_rank_orders(
             best_orders = orders.copy()
         if maximum <= maximum_absolute_correlation + 1e-12:
             return orders
+    if best_orders is not None:
+        # QR gives nearly orthogonal continuous columns, but ranking those
+        # columns can leave a few pairs just above .10 for compact samples
+        # (notably N=50 with the full 30-facet profile).  A deterministic,
+        # bounded swap search improves the discrete rank design without
+        # changing any marginal score distribution.
+        def objective(matrix: np.ndarray) -> tuple[float, float, float]:
+            correlations = np.corrcoef(matrix, rowvar=False)
+            values = np.abs(
+                correlations[np.triu_indices(dimension_count, k=1)]
+            )
+            return (
+                float(values.max()) if len(values) else 0.0,
+                float(np.maximum(values - maximum_absolute_correlation, 0.0).dot(
+                    np.maximum(values - maximum_absolute_correlation, 0.0)
+                )),
+                float(np.sum(values**4)),
+            )
+
+        # A single hill-climb can settle just above .10 for compact profiles.
+        # Re-start from the same best QR candidate with deterministic streams;
+        # this keeps generation reproducible without forcing a larger sample.
+        for restart in range(8):
+            rng_seed = int.from_bytes(
+                sha256(
+                    f"{seed}:rank-order-local-search:{restart}".encode("utf-8")
+                ).digest()[:8],
+                "big",
+            )
+            rng = np.random.default_rng(rng_seed)
+            candidate = best_orders.copy()
+            current_objective = objective(candidate)
+            for _ in range(5000):
+                column = int(rng.integers(dimension_count))
+                left, right = rng.choice(sample_size, size=2, replace=False)
+                candidate[left, column], candidate[right, column] = (
+                    candidate[right, column],
+                    candidate[left, column],
+                )
+                proposed = objective(candidate)
+                accepted = (
+                    proposed[0] < current_objective[0]
+                    or (
+                        proposed[0] <= current_objective[0] + 0.005
+                        and proposed[1] < current_objective[1]
+                    )
+                    or (
+                        proposed[0] <= current_objective[0] + 0.005
+                        and proposed[1] <= current_objective[1] + 1e-12
+                        and proposed[2] < current_objective[2]
+                    )
+                )
+                if accepted:
+                    current_objective = proposed
+                    if proposed[0] <= maximum_absolute_correlation + 1e-12:
+                        return candidate
+                else:
+                    candidate[left, column], candidate[right, column] = (
+                        candidate[right, column],
+                        candidate[left, column],
+                    )
     raise ValueError(
         "无法在当前样本量下把输入维度间的最大绝对秩相关控制在"
         f"{maximum_absolute_correlation:.2f}以内（最佳={best_maximum:.3f}）；"
@@ -638,6 +728,11 @@ def generate_score_respondent_refs(
         }
         for index in range(sample_size)
     ]
+    demographics_snapshot = load_demographics_snapshot()
+    for reference in refs:
+        reference["demographics"] = generate_demographics(
+            f"{seed}:{reference['respondent_id']}", demographics_snapshot,
+        )
     actual_correlations = np.corrcoef(rank_orders, rowvar=False)
     correlation_rows = []
     for left in range(len(specs)):
@@ -650,6 +745,8 @@ def generate_score_respondent_refs(
                 }
             )
     diagnostics = {
+        "demographics_version": DEMOGRAPHICS_VERSION,
+        "demographics_snapshot": demographics_snapshot,
         "generator_version": SCORE_PROFILE_GENERATOR_VERSION,
         "sample_size": sample_size,
         "seed": seed,
@@ -749,6 +846,8 @@ def generate_tiered_score_respondent_refs(
                     }
                 )
     return all_refs, {
+        "demographics_version": DEMOGRAPHICS_VERSION,
+        "demographics_snapshot": tier_diagnostics[0]["demographics_snapshot"],
         "generator_version": SCORE_PROFILE_GENERATOR_VERSION,
         "sample_size_per_tier": sample_size_per_tier,
         "tier_count": len(score_tiers),
@@ -770,15 +869,41 @@ def normalize_matched_conditions(
     raw_conditions: object,
     *,
     dimension_catalog: Sequence[Mapping[str, Any]],
-    target_dimension_id: str,
+    target_dimension_id: str | Sequence[str],
+    shared_score_distribution: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Normalize three fixed arms, allowing multiple independently matched groups per arm.
 
     The target arm has exactly one group. Same-domain and cross-domain arms may
     contain any number of facet groups; each group receives its own condition ID
     so its rho is estimated independently before the arm-level MAX is taken.
+    A compact mapping with target IDs and one shared distribution is also
+    accepted and expanded to the complete facet catalog automatically.
     """
 
+    if isinstance(raw_conditions, Mapping):
+        embedded_conditions = raw_conditions.get("conditions")
+        if isinstance(embedded_conditions, list):
+            raw_conditions = embedded_conditions
+        else:
+            embedded_targets = raw_conditions.get("target_dimension_ids")
+            embedded_distribution = raw_conditions.get("score_distribution")
+            if embedded_targets is not None:
+                target_dimension_id = embedded_targets
+            if shared_score_distribution is None and isinstance(
+                embedded_distribution, Mapping
+            ):
+                shared_score_distribution = embedded_distribution
+            raw_conditions = build_automatic_matched_conditions(
+                dimension_catalog,
+                target_dimension_id=target_dimension_id,
+                mean_score=float(
+                    (shared_score_distribution or {}).get("mean", 50.0)
+                ),
+                standard_deviation=float(
+                    (shared_score_distribution or {}).get("sd", 15.0)
+                ),
+            )
     if not isinstance(raw_conditions, list) or len(raw_conditions) != 3:
         raise ValueError("conditions 必须恰好包含 target、same_domain、cross_domain 三组")
     catalog = {
@@ -786,12 +911,25 @@ def normalize_matched_conditions(
         for row in dimension_catalog
         if isinstance(row, Mapping) and row.get("dimension_id")
     }
-    target_id = str(target_dimension_id or "")
-    target = catalog.get(target_id)
-    if not target or target.get("level") != "facet":
+    if isinstance(target_dimension_id, str):
+        target_ids = [target_dimension_id]
+    else:
+        target_ids = [str(value) for value in target_dimension_id]
+    target_ids = list(dict.fromkeys(value for value in target_ids if value))
+    if not target_ids:
+        raise ValueError("target_dimension_id 必须至少包含一个 facet")
+    target_rows = [catalog.get(value) for value in target_ids]
+    if any(not row or row.get("level") != "facet" for row in target_rows):
         raise ValueError("target_dimension_id 必须是构念注册表中的 facet")
+    target_anchor = target_rows[0]
+    target_anchor_id = str(target_anchor.get("dimension_id"))
+    shared_distribution = (
+        _coerce_shared_score_distribution(shared_score_distribution)
+        if shared_score_distribution is not None
+        else None
+    )
     normalized: list[dict[str, Any]] = []
-    seen_dimensions: set[str] = set()
+    seen_non_target_groups: set[tuple[str, str, str]] = set()
     seen_group_ids: set[str] = set()
     for expected_id in MATCHED_CONDITION_IDS:
         matches = [
@@ -813,7 +951,7 @@ def normalize_matched_conditions(
         if not isinstance(raw_groups, list) or not raw_groups:
             raise ValueError(f"{condition_id} 至少需要一个 facet group")
         if expected_id == "target" and len(raw_groups) != 1:
-            raise ValueError("target 臂必须只有一个 facet group")
+            raise ValueError("target 臂只需一个主 facet group；其余目标 facet 放入 target_dimension_ids")
         groups: list[dict[str, Any]] = []
         for index, raw_group in enumerate(raw_groups, start=1):
             if not isinstance(raw_group, Mapping):
@@ -827,17 +965,45 @@ def normalize_matched_conditions(
             dimension = catalog.get(dimension_id)
             if not dimension or dimension.get("level") != "facet":
                 raise ValueError(f"{condition_id} 必须选择有效的 facet")
-            if dimension_id in seen_dimensions:
-                raise ValueError("同一个 facet 不能重复配置到多个 matched group")
-            if expected_id == "target" and dimension_id != target_id:
+            if expected_id == "target" and dimension_id not in target_ids:
                 raise ValueError("target 条件必须使用题目目标 facet")
-            if expected_id != "target" and dimension_id == target_id:
-                raise ValueError("非目标条件不能重复使用目标 facet")
-            if expected_id == "same_domain" and dimension.get("domain_id") != target.get("domain_id"):
-                raise ValueError("same_domain facet 必须与目标 facet 属于同一 domain")
-            if expected_id == "cross_domain" and dimension.get("domain_id") == target.get("domain_id"):
-                raise ValueError("cross_domain facet 必须来自不同 domain")
-            condition_group_id = "target" if expected_id == "target" else f"{expected_id}__{group_id}"
+            comparison_target_id = str(
+                raw_group.get("comparison_target_dimension_id")
+                or target_anchor_id
+            )
+            comparison_target = catalog.get(comparison_target_id)
+            if not comparison_target or comparison_target.get("level") != "facet":
+                raise ValueError(
+                    f"{condition_id} group 缺少有效 comparison_target_dimension_id"
+                )
+            if expected_id != "target":
+                group_key = (expected_id, comparison_target_id, dimension_id)
+                if group_key in seen_non_target_groups:
+                    raise ValueError(
+                        "同一个目标 facet 下不能重复配置同一个非目标 facet"
+                    )
+                if dimension_id == comparison_target_id:
+                    raise ValueError("非目标条件不能重复使用对应的 target facet")
+                target_domain = str(comparison_target.get("domain_id") or "")
+                dimension_domain = str(dimension.get("domain_id") or "")
+                if expected_id == "same_domain" and dimension_domain != target_domain:
+                    raise ValueError(
+                        "same_domain facet 必须与对应 comparison target 属于同一 domain"
+                    )
+                if expected_id == "cross_domain" and dimension_domain == target_domain:
+                    raise ValueError(
+                        "cross_domain facet 必须来自对应 comparison target 之外的 domain"
+                    )
+                seen_non_target_groups.add(group_key)
+            condition_group_id = (
+                "target"
+                if expected_id == "target"
+                else (
+                    group_id
+                    if group_id.startswith(f"{expected_id}__")
+                    else f"{expected_id}__{group_id}"
+                )
+            )
             groups.append({
                 "group_id": group_id,
                 "condition_id": condition_group_id,
@@ -852,8 +1018,8 @@ def normalize_matched_conditions(
                 "definition": dimension.get("definition"),
                 "high_behavior": dimension.get("high_behavior"),
                 "low_behavior": dimension.get("low_behavior"),
+                "comparison_target_dimension_id": comparison_target_id,
             })
-            seen_dimensions.add(dimension_id)
             seen_group_ids.add(group_id)
         arm = {
             "condition_id": expected_id,
@@ -869,7 +1035,30 @@ def normalize_matched_conditions(
                 "facet_name", "facet_name_en", "definition", "high_behavior",
                 "low_behavior",
             )})
+        if expected_id == "target":
+            arm["target_dimension_ids"] = list(target_ids)
+            arm["target_score_specs"] = [deepcopy(dict(row)) for row in target_rows]
+        raw_distribution = row.get("score_distribution")
+        distribution = _coerce_shared_score_distribution(raw_distribution)
+        if shared_distribution is not None:
+            if (
+                distribution["mean"] != shared_distribution["mean"]
+                or distribution["sd"] != shared_distribution["sd"]
+            ) and raw_distribution is not None:
+                raise ValueError("三条臂必须共享同一个 facet 均值和 SD")
+            distribution = deepcopy(shared_distribution)
+        arm["score_distribution"] = distribution
         normalized.append(arm)
+    if shared_distribution is None:
+        distributions = {
+            (
+                float(row["score_distribution"]["mean"]),
+                float(row["score_distribution"]["sd"]),
+            )
+            for row in normalized
+        }
+        if len(distributions) != 1:
+            raise ValueError("三条臂必须共享同一个 facet 均值和 SD")
     return normalized
 
 
@@ -908,6 +1097,174 @@ def flatten_matched_condition_groups(
             )
             flattened.append(row)
     return flattened
+
+
+def matched_score_specs(conditions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Freeze complete construct metadata without disclosing arm roles."""
+
+    specs: dict[str, dict[str, Any]] = {}
+    target_arm = next((row for row in conditions if row.get("condition_id") == "target"), {})
+    for row in [*flatten_matched_condition_groups(conditions), *(target_arm.get("target_score_specs") or [])]:
+        dimension_id = str(row.get("dimension_id") or "")
+        if dimension_id and dimension_id not in specs:
+            specs[dimension_id] = {
+                key: deepcopy(row.get(key)) for key in (
+                    "dimension_id", "domain_id", "domain_name", "domain_name_en",
+                    "facet_name", "facet_name_en", "definition", "high_behavior", "low_behavior",
+                )
+            } | {"level": "facet"}
+    missing = set(target_arm.get("target_dimension_ids") or []) - set(specs)
+    if missing:
+        raise ValueError("目标 facet 缺少冻结的构念定义：" + "、".join(sorted(missing)))
+    validate_score_definitions(list(specs.values()))
+    return list(specs.values())
+
+
+def validate_score_definitions(score_specs: Sequence[Mapping[str, Any]]) -> None:
+    if not isinstance(score_specs, (list, tuple)) or not score_specs:
+        raise ValueError("虚拟被试缺少冻结的 facet 构念定义")
+    seen: set[str] = set()
+    for spec in score_specs:
+        dimension_id = spec.get("dimension_id") if isinstance(spec, Mapping) else None
+        if not isinstance(dimension_id, str) or not dimension_id or dimension_id in seen:
+            raise ValueError("虚拟被试的 facet 定义必须具有唯一的 dimension_id")
+        seen.add(dimension_id)
+        definition = spec.get("definition") if isinstance(spec, Mapping) else None
+        if not isinstance(definition, str) or not definition.strip():
+            dimension_id = spec.get("dimension_id") if isinstance(spec, Mapping) else None
+            raise ValueError(f"facet {dimension_id} 缺少构念定义，请重新配置；不能由作答模型补造")
+
+
+def _coerce_shared_score_distribution(
+    raw_distribution: Mapping[str, Any] | None = None,
+    *,
+    mean_score: float = 50.0,
+    standard_deviation: float = 15.0,
+) -> dict[str, float | str]:
+    """Validate the one normal distribution shared by every facet."""
+
+    distribution = raw_distribution or {
+        "family": "normal",
+        "mean": mean_score,
+        "sd": standard_deviation,
+    }
+    if not isinstance(distribution, Mapping):
+        raise ValueError("score_distribution 必须是对象")
+    family = str(distribution.get("family") or "normal")
+    try:
+        mean = float(distribution.get("mean", mean_score))
+        standard_deviation_value = float(
+            distribution.get("sd", standard_deviation)
+        )
+    except (TypeError, ValueError) as exc:
+        raise ValueError("score_distribution 必须包含数值 mean/sd") from exc
+    if (
+        family != "normal"
+        or not math.isfinite(mean)
+        or not 0.0 < mean < 100.0
+        or not math.isfinite(standard_deviation_value)
+        or standard_deviation_value <= 0
+    ):
+        raise ValueError(
+            "所有 facet 必须使用 normal 分布；均值须在0-100内且 SD 必须为正数"
+        )
+    return {"family": "normal", "mean": mean, "sd": standard_deviation_value}
+
+
+def build_automatic_matched_conditions(
+    dimension_catalog: Sequence[Mapping[str, Any]],
+    *,
+    target_dimension_id: str | Sequence[str],
+    mean_score: float = 50.0,
+    standard_deviation: float = 15.0,
+) -> list[dict[str, Any]]:
+    """Build the three arms from one target and the complete facet catalog.
+
+    The target arm contains one target profile group.  For every target facet
+    in the item bank, the same-domain arm gets a separate five-facet group set
+    and the cross-domain arm gets a separate 24-facet group set.  Group IDs
+    carry the target facet so downstream metrics can select the matching set
+    per item instead of using the first target facet as a global anchor.
+    """
+
+    catalog = {
+        str(row.get("dimension_id")): dict(row)
+        for row in dimension_catalog
+        if isinstance(row, Mapping)
+        and row.get("dimension_id")
+        and row.get("level") == "facet"
+    }
+    if isinstance(target_dimension_id, str):
+        target_ids = [target_dimension_id]
+    else:
+        target_ids = [str(value) for value in target_dimension_id]
+    target_ids = list(dict.fromkeys(value for value in target_ids if value))
+    if not target_ids or any(value not in catalog for value in target_ids):
+        raise ValueError("target_dimension_id 必须是构念注册表中的 facet")
+    shared_distribution = _coerce_shared_score_distribution(
+        mean_score=mean_score,
+        standard_deviation=standard_deviation,
+    )
+
+    def group_row(dimension_id: str, group_id: str, role: str) -> dict[str, Any]:
+        row = dict(catalog[dimension_id])
+        row.update({"group_id": group_id, "role": role, "dimension_id": dimension_id})
+        return row
+
+    same_groups: list[dict[str, Any]] = []
+    cross_groups: list[dict[str, Any]] = []
+    for target_id in target_ids:
+        target_domain = str(catalog[target_id].get("domain_id") or "")
+        same_ids = [
+            dimension_id
+            for dimension_id, row in catalog.items()
+            if dimension_id != target_id
+            and str(row.get("domain_id") or "") == target_domain
+        ]
+        cross_ids = [
+            dimension_id
+            for dimension_id, row in catalog.items()
+            if dimension_id != target_id
+            and str(row.get("domain_id") or "") != target_domain
+        ]
+        if not same_ids or not cross_ids:
+            raise ValueError(
+                f"目标 facet {target_id} 必须同时包含同域和跨域非目标 facet"
+            )
+        same_groups.extend(
+            group_row(dimension_id, f"same_domain__{target_id}__{dimension_id}", "same_domain_non_target")
+            | {"comparison_target_dimension_id": target_id}
+            for dimension_id in same_ids
+        )
+        cross_groups.extend(
+            group_row(dimension_id, f"cross_domain__{target_id}__{dimension_id}", "cross_domain_non_target")
+            | {"comparison_target_dimension_id": target_id}
+            for dimension_id in cross_ids
+        )
+    return [
+        {
+            "condition_id": "target",
+            "role": "target",
+            "target_dimension_ids": target_ids,
+            "score_distribution": deepcopy(shared_distribution),
+            "groups": [
+                group_row(target_ids[0], "target", "target")
+                | {"comparison_target_dimension_id": target_ids[0]}
+            ],
+        },
+        {
+            "condition_id": "same_domain",
+            "role": "same_domain_non_target",
+            "score_distribution": deepcopy(shared_distribution),
+            "groups": same_groups,
+        },
+        {
+            "condition_id": "cross_domain",
+            "role": "cross_domain_non_target",
+            "score_distribution": deepcopy(shared_distribution),
+            "groups": cross_groups,
+        },
+    ]
 
 
 def _matched_normal_scores(
@@ -963,11 +1320,19 @@ def generate_matched_condition_respondent_refs(
     sample_size_per_condition: int,
     conditions: Sequence[Mapping[str, Any]],
     *,
-    mean_score: float = 50.0,
-    standard_deviation: float = 15.0,
+    mean_score: float | None = None,
+    standard_deviation: float | None = None,
+    generation_round: int = 1,
     seed: int = DEFAULT_SELECTION_SEED,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Generate fixed arms whose individual facet groups share one score sequence."""
+    """Generate one complete profile per matched subject.
+
+    The three arms/groups remain metadata for facet classification.  They are
+    not separate respondent administrations: a profile is answered once and
+    carries every configured facet score so target, same-domain, and
+    cross-domain correlations can all be estimated from the same response
+    matrix.
+    """
 
     if len(conditions) != 3:
         raise ValueError("conditions 必须包含三个固定臂")
@@ -979,58 +1344,155 @@ def generate_matched_condition_respondent_refs(
         raise ValueError("conditions 缺少 target facet group")
     if sum(row.get("arm_id") == "target" for row in groups) != 1:
         raise ValueError("target 臂必须只有一个 facet group")
-    z_values = _matched_normal_scores(
-        sample_size_per_condition,
-        mean_score=float(mean_score),
-        standard_deviation=float(standard_deviation),
-        seed=seed,
+    if not isinstance(generation_round, int) or isinstance(generation_round, bool) or generation_round < 1:
+        raise ValueError("generation_round 必须是正整数")
+    # Generate one independent vector per configured facet.  The same complete
+    # profile is then attached to each arm so item-level comparisons remain
+    # matched without forcing false inter-facet correlations.
+    distributions: dict[str, tuple[float, float]] = {}
+    arm_distributions: set[tuple[float, float]] = set()
+    for arm in conditions:
+        arm_distribution = arm.get("score_distribution") if isinstance(arm, Mapping) else None
+        if not isinstance(arm_distribution, Mapping):
+            arm_distribution = {"mean": 50.0 if mean_score is None else mean_score,
+                                "sd": 15.0 if standard_deviation is None else standard_deviation}
+        shared = _coerce_shared_score_distribution(arm_distribution)
+        arm_distributions.add((float(shared["mean"]), float(shared["sd"])))
+        for row in flatten_matched_condition_groups([arm]):
+            dimension_id = str(row.get("dimension_id") or "")
+            if dimension_id and dimension_id not in distributions:
+                distributions[dimension_id] = (
+                    float(shared["mean"]),
+                    float(shared["sd"]),
+                )
+        for dimension_id in arm.get("target_dimension_ids") or []:
+            distributions.setdefault(
+                str(dimension_id),
+                (float(shared["mean"]), float(shared["sd"])),
+            )
+    if len(arm_distributions) != 1:
+        raise ValueError("三条臂必须共享同一个 facet 均值和 SD")
+    shared_mean, shared_sd = next(iter(arm_distributions))
+    # Use independent rank orders for the complete facet profile.  This keeps
+    # every facet's marginal distribution intact while enforcing the same
+    # merged |Spearman rho| <= .10 guard used by the score-profile generator.
+    ordered_distributions = sorted(distributions.items())
+    minimum_profile_sample_size = max(
+        MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
+        len(ordered_distributions) + 2,
     )
+    if sample_size_per_condition < minimum_profile_sample_size:
+        raise ValueError(
+            "完整 facet 分数向量的独立性约束要求每组至少 "
+            f"{minimum_profile_sample_size} 名虚拟被试"
+        )
+    rank_orders = _orthogonal_rank_orders(
+        sample_size_per_condition,
+        len(ordered_distributions),
+        seed=seed + 100003 * generation_round,
+    )
+    score_vectors: dict[str, np.ndarray] = {}
+    for index, (dimension_id, (mean, sd)) in enumerate(ordered_distributions):
+        base = _matched_normal_scores(
+            sample_size_per_condition,
+            mean_score=mean,
+            standard_deviation=sd,
+            seed=seed + 1009 * (index + 1) + 100003 * generation_round,
+        )
+        score_vectors[dimension_id] = base[rank_orders[:, index]]
+    all_dimension_ids = sorted(score_vectors)
+    dimension_diagnostics = [
+        {
+            "dimension_id": dimension_id,
+            "requested_mean": float(distributions[dimension_id][0]),
+            "requested_sd": float(distributions[dimension_id][1]),
+            "actual_mean": float(score_vectors[dimension_id].mean()),
+            "actual_sample_sd": float(score_vectors[dimension_id].std(ddof=1)),
+            "actual_minimum": float(score_vectors[dimension_id].min()),
+            "actual_maximum": float(score_vectors[dimension_id].max()),
+        }
+        for dimension_id in all_dimension_ids
+    ]
+    actual_correlations = np.corrcoef(rank_orders, rowvar=False)
+    correlation_rows = [
+        {
+            "dimension_a": ordered_distributions[left][0],
+            "dimension_b": ordered_distributions[right][0],
+            "spearman_rho": float(actual_correlations[left, right]),
+        }
+        for left in range(len(ordered_distributions))
+        for right in range(left + 1, len(ordered_distributions))
+    ]
     refs: list[dict[str, Any]] = []
+    demographics_snapshot = load_demographics_snapshot()
     condition_diagnostics: list[dict[str, Any]] = []
+    target_row = next(row for row in groups if row.get("arm_id") == "target")
+    target_dimension_id = str(target_row.get("dimension_id") or "")
+    for index in range(1, sample_size_per_condition + 1):
+        matched_subject_id = f"round{generation_round}-matched-{index:04d}"
+        refs.append({
+            "respondent_id": f"target-{matched_subject_id}",
+            "condition_id": "target",
+            "arm_id": "target",
+            "group_id": "target",
+            "matched_subject_id": matched_subject_id,
+            "active_dimension_id": target_dimension_id,
+            "score_values": {
+                score_dimension: float(values[index - 1])
+                for score_dimension, values in score_vectors.items()
+            },
+            "demographics": generate_demographics(
+                f"{seed}:{matched_subject_id}", demographics_snapshot,
+            ),
+        })
     for row in groups:
         condition_id = str(row["condition_id"])
         dimension_id = str(row.get("dimension_id") or "")
-        condition_refs = []
-        for index, value in enumerate(z_values, start=1):
-            matched_subject_id = f"matched-{index:04d}"
-            condition_refs.append({
-                "respondent_id": f"{condition_id}-{matched_subject_id}",
-                "condition_id": condition_id,
-                "arm_id": row.get("arm_id"),
-                "group_id": row.get("group_id"),
-                "matched_subject_id": matched_subject_id,
-                "active_dimension_id": dimension_id,
-                "score_values": {dimension_id: float(value)},
-            })
-        refs.extend(condition_refs)
         condition_diagnostics.append({
             "condition_id": condition_id,
             "arm_id": row.get("arm_id"),
             "group_id": row.get("group_id"),
+            "comparison_target_dimension_id": row.get(
+                "comparison_target_dimension_id"
+            ),
             "dimension_id": dimension_id,
-            "sample_size": len(condition_refs),
-            "actual_mean": float(z_values.mean()),
-            "actual_sample_sd": float(z_values.std(ddof=1)),
-            "actual_minimum": float(z_values.min()),
-            "actual_maximum": float(z_values.max()),
+            "sample_size": int(sample_size_per_condition),
+            "requested_mean": float(distributions[dimension_id][0]),
+            "requested_sd": float(distributions[dimension_id][1]),
+            "actual_mean": float(score_vectors[dimension_id].mean()),
+            "actual_sample_sd": float(score_vectors[dimension_id].std(ddof=1)),
+            "actual_minimum": float(score_vectors[dimension_id].min()),
+            "actual_maximum": float(score_vectors[dimension_id].max()),
+            "independent_profile_dimension_count": len(all_dimension_ids),
         })
     return refs, {
+        "demographics_version": DEMOGRAPHICS_VERSION,
+        "demographics_snapshot": demographics_snapshot,
         "generator_version": MATCHED_CONDITION_GENERATOR_VERSION,
         "sampling_design": "matched_facet_conditions",
+        "response_batch_design": "one_batch_per_matched_subject",
         "sample_size_per_condition": int(sample_size_per_condition),
         "condition_count": 3,
         "group_count": len(groups),
         "total_sample_size": len(refs),
+        "unique_profile_count": len(refs),
         "seed": int(seed),
         "score_distribution": {
             "family": "normal",
-            "mean": float(mean_score),
-            "sd": float(standard_deviation),
+            "mean": shared_mean,
+            "sd": shared_sd,
         },
         "conditions": condition_diagnostics,
-        "matched_score_sequence": [float(value) for value in z_values],
-        "matched_sequence_exact": True,
-        "input_correlation_filtering_authority": False,
+        "dimensions": dimension_diagnostics,
+        "generation_round": generation_round,
+        "independent_profile_dimensions": all_dimension_ids,
+        "merged_pairwise_rank_correlations": correlation_rows,
+        "merged_maximum_absolute_spearman": max(
+            (abs(row["spearman_rho"]) for row in correlation_rows),
+            default=0.0,
+        ),
+        "input_correlation_filtering_authority": True,
+        "input_correlation_max_absolute_spearman": 0.10,
     }
 
 
@@ -1041,51 +1503,144 @@ def build_matched_condition_sample_config(
     generation_diagnostics: Mapping[str, Any],
     mean_score: float = 50.0,
     standard_deviation: float = 15.0,
+    generation_round: int = 1,
     seed: int = DEFAULT_SELECTION_SEED,
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     max_retries: int = DEFAULT_MAX_RETRIES,
+    response_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Build the matched-facet configuration with one target-form retest."""
 
-    if not 1 <= int(max_concurrency) <= MAX_ALLOWED_CONCURRENCY:
-        raise ValueError(f"max_concurrency 必须是1到{MAX_ALLOWED_CONCURRENCY}之间的整数")
-    if not isinstance(max_retries, int) or isinstance(max_retries, bool) or not 0 <= max_retries <= 5:
-        raise ValueError("max_retries 必须是0到5之间的整数")
+    validate_max_concurrency(max_concurrency)
+    if not isinstance(max_retries, int) or isinstance(max_retries, bool) or not 0 <= max_retries <= 4:
+        raise ValueError("max_retries 必须是0到4之间的整数（最多5次尝试）")
+    if (
+        not isinstance(generation_round, int)
+        or isinstance(generation_round, bool)
+        or generation_round < 1
+    ):
+        raise ValueError("generation_round 必须是正整数")
+    shared_distribution = _coerce_shared_score_distribution(
+        mean_score=mean_score,
+        standard_deviation=standard_deviation,
+    )
     normalized_conditions = [deepcopy(dict(row)) for row in conditions]
+    if (
+        not isinstance(sample_size_per_condition, int)
+        or isinstance(sample_size_per_condition, bool)
+        or not MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE
+        <= sample_size_per_condition
+        <= MAX_VIRTUAL_SAMPLE_SIZE
+    ):
+        raise ValueError(
+            f"sample_size_per_condition 必须是 {MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE} 到 "
+            f"{MAX_VIRTUAL_SAMPLE_SIZE} 之间的整数"
+        )
     group_count = len(flatten_matched_condition_groups(normalized_conditions))
     if group_count < 3:
         raise ValueError("matched conditions 至少需要三个 facet group")
+    target_arm = next(
+        (
+            row
+            for row in normalized_conditions
+            if str(row.get("condition_id")) == "target"
+        ),
+        {},
+    )
+    dimension_count = len(
+        {
+            *{
+                str(row.get("dimension_id"))
+                for row in flatten_matched_condition_groups(normalized_conditions)
+                if row.get("dimension_id")
+            },
+            *(str(value) for value in target_arm.get("target_dimension_ids") or []),
+        }
+    )
+    if sample_size_per_condition < max(
+        MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
+        dimension_count + 2,
+    ):
+        raise ValueError(
+            "完整 facet 分数向量的独立性约束要求每组至少 "
+            f"{dimension_count + 2} 名虚拟被试"
+        )
+    for condition in normalized_conditions:
+        raw_condition_distribution = (
+            condition.get("score_distribution")
+            if isinstance(condition, Mapping)
+            else None
+        )
+        condition_distribution = (
+            _coerce_shared_score_distribution(raw_condition_distribution)
+            if raw_condition_distribution is not None
+            else shared_distribution
+        )
+        if (
+            condition_distribution["mean"] != shared_distribution["mean"]
+            or condition_distribution["sd"] != shared_distribution["sd"]
+        ):
+            raise ValueError("所有 facet 必须共享同一个均值和 SD")
+        condition["score_distribution"] = deepcopy(shared_distribution)
     serialized = json.dumps({
         "sampling_design": "matched_facet_conditions",
         "sample_size_per_condition": sample_size_per_condition,
         "conditions": normalized_conditions,
-        "score_distribution": {"family": "normal", "mean": mean_score, "sd": standard_deviation},
+        "score_distribution": deepcopy(shared_distribution),
+        "generation_round": generation_round,
         "seed": seed,
         "generator_version": MATCHED_CONDITION_GENERATOR_VERSION,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     profile_id = "matched-facet-" + sha256(serialized.encode("utf-8")).hexdigest()[:16]
     return {
+        **demographic_settings(generation_diagnostics, seed=seed, response_temperature=response_temperature),
         "schema_version": MATCHED_CONDITION_SCHEMA_VERSION,
         "pool_id": profile_id,
         "pool_ref": None,
         "source_file": None,
         "source_sha256": sha256(serialized.encode("utf-8")).hexdigest(),
         "available_count": MAX_VIRTUAL_SAMPLE_SIZE,
-        "sample_size": int(sample_size_per_condition) * group_count,
+        "sample_size": int(sample_size_per_condition),
         "sample_size_per_condition": int(sample_size_per_condition),
+        "unique_profile_count": int(sample_size_per_condition),
         "condition_count": 3,
         "group_count": group_count,
-        "recommended_sample_size": MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
-        "automatic_selection_minimum_sample_size": MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
+        "recommended_sample_size": max(
+            MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
+            dimension_count + 2,
+        ),
+        "automatic_selection_minimum_sample_size": max(
+            MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
+            dimension_count + 2,
+        ),
+        "minimum_profile_sample_size": max(
+            MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
+            dimension_count + 2,
+        ),
         "seed": int(seed),
-        "max_concurrency": int(max_concurrency),
+        "max_concurrency": 0,
+        "concurrency_policy": "all_at_once",
         "max_retries": int(max_retries),
         "persona_modes": [PERSONA_MODE_SCORE_PROFILE],
         "sampling_design": "matched_facet_conditions",
+        "response_batch_design": "one_batch_per_matched_subject",
         "selection_strategy": "deterministic_matched_normal_generation",
         "persona_method": "MatchedFacetConditions",
-        "score_distribution": {"family": "normal", "mean": float(mean_score), "sd": float(standard_deviation)},
+        "score_distribution": deepcopy(shared_distribution),
+        "arm_score_distributions": {
+            str(arm.get("condition_id")): deepcopy(shared_distribution)
+            for arm in normalized_conditions
+        },
+        "shared_facet_score_distribution": deepcopy(shared_distribution),
+        "generation_round": int(generation_round),
+        "reference_questionnaire_freeze_policy": (
+            "freeze_after_first_measurement"
+        ),
+        "target_dimension_ids": [
+            str(value) for value in target_arm.get("target_dimension_ids") or []
+        ],
         "conditions": normalized_conditions,
+        "score_specs": matched_score_specs(normalized_conditions),
         "score_scale": list(SCORE_SCALE),
         "generator_version": MATCHED_CONDITION_GENERATOR_VERSION,
         "prompt_version": MATCHED_CONDITION_PROMPT_VERSION,
@@ -1122,6 +1677,7 @@ def matched_condition_sample_is_current(config: object, respondents: object) -> 
         or config.get("persona_modes") != [PERSONA_MODE_SCORE_PROFILE]
         or config.get("generator_version") != MATCHED_CONDITION_GENERATOR_VERSION
         or config.get("prompt_version") != MATCHED_CONDITION_PROMPT_VERSION
+        or config.get("response_batch_design") != "one_batch_per_matched_subject"
         or config.get("response_count_per_respondent_item") != 1
         or config.get("target_form_administration_count")
         != DEFAULT_TARGET_FORM_ADMINISTRATION_COUNT
@@ -1130,41 +1686,89 @@ def matched_condition_sample_is_current(config: object, respondents: object) -> 
     ):
         return False
     n = config.get("sample_size_per_condition")
-    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+    if (
+        not isinstance(n, int)
+        or isinstance(n, bool)
+        or n < MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE
+        or n > MAX_VIRTUAL_SAMPLE_SIZE
+    ):
+        return False
+    try:
+        validate_demographics_config(config)
+        validate_score_definitions(config.get("score_specs") or [])
+        shared_distribution = _coerce_shared_score_distribution(
+            config.get("shared_facet_score_distribution")
+            or config.get("score_distribution")
+        )
+    except (TypeError, ValueError, KeyError):
         return False
     conditions = config.get("conditions")
     if not isinstance(conditions, list) or {row.get("condition_id") for row in conditions if isinstance(row, Mapping)} != set(MATCHED_CONDITION_IDS):
         return False
     groups = flatten_matched_condition_groups(conditions)
-    expected_conditions = {str(row.get("condition_id")): str(row.get("dimension_id")) for row in groups}
-    group_ids = tuple(expected_conditions)
-    if config.get("group_count") != len(group_ids) or len(respondents) != n * len(group_ids):
+    expected_dimensions = {
+        str(row.get("dimension_id")) for row in groups
+        if row.get("dimension_id")
+    }
+    target_arm = next((row for row in conditions if str(row.get("condition_id")) == "target"), {})
+    expected_dimensions.update(str(value) for value in target_arm.get("target_dimension_ids") or [])
+    if {spec.get("dimension_id") for spec in config["score_specs"]} != expected_dimensions:
         return False
-    grouped: dict[str, dict[str, float]] = {condition_id: {} for condition_id in group_ids}
+    if n < max(MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE, len(expected_dimensions) + 2):
+        return False
+    group_ids = tuple(str(row.get("condition_id")) for row in groups)
+    if config.get("group_count") != len(group_ids) or len(respondents) != n:
+        return False
+    for condition in conditions:
+        try:
+            condition_distribution = _coerce_shared_score_distribution(
+                condition.get("score_distribution")
+                if isinstance(condition, Mapping)
+                else None
+            )
+        except (TypeError, ValueError):
+            return False
+        if (
+            condition_distribution["mean"] != shared_distribution["mean"]
+            or condition_distribution["sd"] != shared_distribution["sd"]
+        ):
+            return False
     respondent_ids: set[str] = set()
+    matched_subject_ids: set[str] = set()
     for reference in respondents:
         if not isinstance(reference, Mapping):
+            return False
+        try:
+            validate_demographics(reference.get("demographics"), config["demographics_snapshot"])
+        except (TypeError, ValueError, KeyError):
             return False
         condition_id = str(reference.get("condition_id") or "")
         matched_id = str(reference.get("matched_subject_id") or "")
         respondent_id = str(reference.get("respondent_id") or "")
         values = reference.get("score_values")
-        if condition_id not in expected_conditions or not matched_id or not respondent_id or respondent_id in respondent_ids:
+        if condition_id != "target" or not matched_id or not respondent_id or respondent_id in respondent_ids:
             return False
-        if respondent_id != f"{condition_id}-{matched_id}" or not isinstance(values, Mapping) or set(values) != {expected_conditions[condition_id]}:
+        if respondent_id != f"target-{matched_id}" or matched_id in matched_subject_ids or not isinstance(values, Mapping) or set(values) != expected_dimensions:
             return False
-        value = next(iter(values.values()))
-        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) or not 0 <= float(value) <= 100:
+        normalized_values: list[float] = []
+        for value in values.values():
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or not 0 <= float(value) <= 100
+            ):
+                return False
+            normalized_values.append(float(value))
+        if not normalized_values:
             return False
-        grouped[condition_id][matched_id] = float(value)
         respondent_ids.add(respondent_id)
-    if any(len(group) != n for group in grouped.values()):
+        matched_subject_ids.add(matched_id)
+    if len(respondent_ids) != n or len(matched_subject_ids) != n:
         return False
-    reference_ids = set(grouped["target"])
-    if any(set(group) != reference_ids for group in grouped.values()):
-        return False
-    target_values = grouped["target"]
-    return all(group == target_values for group in grouped.values())
+    # Complete profiles are matched across arms, while each dimension's
+    # generated vector is intentionally independent from the others.
+    return True
 
 
 def select_virtual_respondent_refs(
@@ -1219,23 +1823,14 @@ def build_virtual_sample_config(
     """记录虚拟样本选择的可复现配置。"""
 
     summary = build_virtual_pool_summary(pool)
-    if (
-        not isinstance(max_concurrency, int)
-        or isinstance(max_concurrency, bool)
-        or max_concurrency < 1
-        or max_concurrency > MAX_ALLOWED_CONCURRENCY
-    ):
-        raise ValueError(
-            "max_concurrency 必须是 1 到 "
-            f"{MAX_ALLOWED_CONCURRENCY} 之间的整数"
-        )
+    validate_max_concurrency(max_concurrency)
     if (
         not isinstance(max_retries, int)
         or isinstance(max_retries, bool)
         or max_retries < 0
-        or max_retries > 5
+        or max_retries > 4
     ):
-        raise ValueError("max_retries 必须是 0 到 5 之间的整数")
+        raise ValueError("max_retries 必须是 0 到 4 之间的整数（最多5次尝试）")
     resolved_persona_modes = list(
         DEFAULT_PERSONA_MODES if persona_modes is None else persona_modes
     )
@@ -1264,7 +1859,8 @@ def build_virtual_sample_config(
             MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE
         ),
         "seed": seed,
-        "max_concurrency": max_concurrency,
+        "max_concurrency": 0,
+        "concurrency_policy": "all_at_once",
         "max_retries": max_retries,
         "persona_modes": resolved_persona_modes,
         "selection_strategy": (
@@ -1287,25 +1883,19 @@ def build_score_virtual_sample_config(
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY,
     max_retries: int = DEFAULT_MAX_RETRIES,
     spread_cap: float = DEFAULT_SPREAD_CAP,
+    response_temperature: float | None = None,
 ) -> dict[str, Any]:
     """Build the reproducible configuration for score-conditioned personas."""
 
-    if (
-        not isinstance(max_concurrency, int)
-        or isinstance(max_concurrency, bool)
-        or max_concurrency < 1
-        or max_concurrency > MAX_ALLOWED_CONCURRENCY
-    ):
-        raise ValueError(
-            f"max_concurrency 必须是1到{MAX_ALLOWED_CONCURRENCY}之间的整数"
-        )
+    validate_max_concurrency(max_concurrency)
+    validate_score_definitions(score_specs)
     if (
         not isinstance(max_retries, int)
         or isinstance(max_retries, bool)
         or max_retries < 0
-        or max_retries > 5
+        or max_retries > 4
     ):
-        raise ValueError("max_retries 必须是0到5之间的整数")
+        raise ValueError("max_retries 必须是0到4之间的整数（最多5次尝试）")
     if not 1 <= len(score_tiers) <= MAXIMUM_SCORE_TIER_COUNT:
         raise ValueError("score_tiers 必须包含1到3个分数档")
     resolved_non_targets = list(
@@ -1337,7 +1927,8 @@ def build_score_virtual_sample_config(
         serialized.encode("utf-8")
     ).hexdigest()[:16]
     return {
-        "schema_version": 4,
+        **demographic_settings(generation_diagnostics, seed=seed, response_temperature=response_temperature),
+        "schema_version": 5,
         "pool_id": profile_id,
         "pool_ref": None,
         "source_file": None,
@@ -1351,7 +1942,8 @@ def build_score_virtual_sample_config(
             MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE
         ),
         "seed": seed,
-        "max_concurrency": max_concurrency,
+        "max_concurrency": 0,
+        "concurrency_policy": "all_at_once",
         "max_retries": max_retries,
         "persona_modes": [PERSONA_MODE_SCORE_PROFILE],
         "selection_strategy": "deterministic_score_profile_generation",
@@ -1389,7 +1981,7 @@ def score_virtual_sample_is_current(
         len(dimension_ids) != len(specs)
         or any(not value for value in dimension_ids)
         or len(set(dimension_ids)) != len(dimension_ids)
-        or config.get("schema_version") != 4
+        or config.get("schema_version") != 5
         or config.get("persona_modes") != [PERSONA_MODE_SCORE_PROFILE]
         or config.get("prompt_version") != SCORE_PROFILE_PROMPT_VERSION
         or config.get("generator_version") != SCORE_PROFILE_GENERATOR_VERSION
@@ -1399,6 +1991,11 @@ def score_virtual_sample_is_current(
         or config.get("sample_size") != len(respondents)
         or not respondents
     ):
+        return False
+    try:
+        validate_demographics_config(config)
+        validate_score_definitions(specs)
+    except (TypeError, ValueError, KeyError):
         return False
     tiers = config.get("score_tiers")
     if not isinstance(tiers, list) or not 1 <= len(tiers) <= MAXIMUM_SCORE_TIER_COUNT:
@@ -1434,7 +2031,10 @@ def score_virtual_sample_is_current(
             reference.get("respondent_id"), str
         ):
             return False
-        tier_counts[str(reference.get("tier_id"))] += 1
+        try:
+            validate_demographics(reference.get("demographics"), config["demographics_snapshot"])
+        except (TypeError, ValueError, KeyError):
+            return False
         values = reference.get("score_values")
         if (
             not isinstance(values, Mapping)
@@ -1442,6 +2042,7 @@ def score_virtual_sample_is_current(
             or reference.get("tier_id") not in tier_ids
         ):
             return False
+        tier_counts[str(reference.get("tier_id"))] += 1
         if any(
             isinstance(value, bool)
             or not isinstance(value, (int, float))
@@ -1458,6 +2059,7 @@ def resolve_virtual_respondent_profiles(
     pool: Mapping[str, Any] | None = None,
     *,
     score_specs: Sequence[Mapping[str, Any]] | None = None,
+    demographics_snapshot: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """把 State 中的轻量引用解析为后续模型调用所需的人格档案。"""
 
@@ -1467,11 +2069,10 @@ def resolve_virtual_respondent_profiles(
         for reference in respondent_refs
     ):
         specs = [dict(spec) for spec in (score_specs or [])]
-        if all(
-            reference.get("condition_id") == "target"
-            or str(reference.get("condition_id") or "").startswith(("same_domain__", "cross_domain__"))
-            for reference in respondent_refs
-        ):
+        if demographics_snapshot is not None:
+            for reference in respondent_refs:
+                validate_demographics(reference.get("demographics"), demographics_snapshot)
+        if all(reference.get("condition_id") == "target" for reference in respondent_refs):
             profiles = []
             seen: set[str] = set()
             for reference in respondent_refs:
@@ -1481,28 +2082,31 @@ def resolve_virtual_respondent_profiles(
                 values = reference.get("score_values")
                 if not isinstance(respondent_id, str) or not respondent_id or respondent_id in seen:
                     raise ValueError("匹配 facet 虚拟被试缺少或重复 respondent_id")
-                if not (
-                    condition_id == "target"
-                    or str(condition_id or "").startswith(("same_domain__", "cross_domain__"))
-                ) or not isinstance(matched_subject_id, str) or not isinstance(values, Mapping) or len(values) != 1:
+                if condition_id != "target" or not isinstance(matched_subject_id, str) or not isinstance(values, Mapping) or not values:
                     raise ValueError(f"虚拟被试 {respondent_id} 的匹配条件档案无效")
-                dimension_id, value = next(iter(values.items()))
-                if (
-                    isinstance(value, bool)
-                    or not isinstance(value, (int, float))
-                    or not math.isfinite(float(value))
-                    or not SCORE_SCALE[0] <= float(value) <= SCORE_SCALE[1]
-                ):
-                    raise ValueError(f"虚拟被试 {respondent_id} 的 facet 分数无效")
+                normalized_values: dict[str, float] = {}
+                for dimension_id, value in values.items():
+                    if (
+                        isinstance(value, bool)
+                        or not isinstance(value, (int, float))
+                        or not math.isfinite(float(value))
+                        or not SCORE_SCALE[0] <= float(value) <= SCORE_SCALE[1]
+                    ):
+                        raise ValueError(f"虚拟被试 {respondent_id} 的 facet 分数无效")
+                    normalized_values[str(dimension_id)] = float(value)
+                active_dimension_id = str(reference.get("active_dimension_id") or next(iter(normalized_values)))
+                if active_dimension_id not in normalized_values:
+                    raise ValueError(f"虚拟被试 {respondent_id} 缺少 active facet 分数")
                 profiles.append({
                     "respondent_id": respondent_id,
                     "condition_id": condition_id,
-                    "arm_id": reference.get("arm_id") or ("target" if condition_id == "target" else str(condition_id).split("__", 1)[0]),
-                    "group_id": reference.get("group_id") or ("target" if condition_id == "target" else str(condition_id).split("__", 1)[-1]),
+                    "arm_id": reference.get("arm_id") or "target",
+                    "group_id": reference.get("group_id") or "target",
                     "matched_subject_id": matched_subject_id,
-                    "active_dimension_id": str(dimension_id),
-                    "score_values": {str(dimension_id): float(value)},
+                    "active_dimension_id": active_dimension_id,
+                    "score_values": normalized_values,
                     "score_specs": deepcopy(specs),
+                    "demographics": deepcopy(reference.get("demographics")),
                 })
                 seen.add(respondent_id)
             return profiles
@@ -1540,6 +2144,7 @@ def resolve_virtual_respondent_profiles(
                     "tier_id": reference.get("tier_id"),
                     "score_values": normalized,
                     "score_specs": deepcopy(specs),
+                    "demographics": deepcopy(reference.get("demographics")),
                 }
             )
             seen.add(respondent_id)

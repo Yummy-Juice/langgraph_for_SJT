@@ -790,6 +790,10 @@ def _selection_reason(
         target = specificity.get("target_spearman") or {}
         same_domain = specificity.get("same_domain_non_target") or {}
         cross_domain = specificity.get("cross_domain_non_target") or {}
+        item_ipip = quality.get("single_item_ipip_metrics") or {}
+        item_hedges = item_ipip.get("target_hedges_g") or {}
+        item_rho = item_ipip.get("target_ipip_spearman_rho") or {}
+        item_delta = item_ipip.get("discriminant_delta_min") or {}
         metrics = (
             f"建议={recommendation}；"
             f"分面内CITC={_metric_text(citc.get('r'))}；"
@@ -797,7 +801,13 @@ def _selection_reason(
             "同域VTS="
             f"{_metric_text(same_domain.get('specificity_margin'))}；"
             "跨域VTS="
-            f"{_metric_text(cross_domain.get('specificity_margin'))}"
+            f"{_metric_text(cross_domain.get('specificity_margin'))}；"
+            "单题目标Hedges'g="
+            f"{_metric_text(item_hedges.get('standardized_effect'))}；"
+            "单题目标IPIP rho_s="
+            f"{_metric_text(item_rho.get('rho'))}；"
+            "单题Δmin="
+            f"{_metric_text(item_delta.get('delta_min'))}"
         )
         flags = [
             str(flag)
@@ -957,7 +967,7 @@ def _psychometric_repair_entry(
                 "findings": [],
                 "repair_tasks": [],
                 "summary": (
-                    f"题目 {item_id} 未通过虚拟迭代四门槛筛查；等待基于题面与"
+                    f"题目 {item_id} 未通过虚拟迭代四项门槛筛查；等待基于题面与"
                     "构念约束的可定位诊断，若无题面证据则 defer。"
                 ),
             },

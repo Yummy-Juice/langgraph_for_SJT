@@ -42,6 +42,7 @@ from sjt_system.evaluation.simulation import (
     build_sjt_messages,
 )
 from sjt_system.runtime.output_paths import output_scope
+from sjt_system.runtime.concurrency import UnlimitedConcurrency
 from sjt_system.runtime.telemetry import run_context
 
 from .config import fingerprint
@@ -61,13 +62,13 @@ from .storage import write_csv, write_json
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MUSSEL = PROJECT_ROOT / "docs" / "mussel_zh.json"
-FORMULA_VERSION = "current-system-matched-item-defect-v1"
+FORMULA_VERSION = "current-system-matched-item-defect-v2"
 PROMPT_VERSION = "current-system-matched-item-defect-v1"
 OPTION_IDS = ("A", "B", "C", "D")
-TARGET_CITC_MINIMUM = 0.20
-TARGET_RHO_MINIMUM = 0.30
-SAME_DOMAIN_VTS_MINIMUM = 0.10
-CROSS_DOMAIN_VTS_MINIMUM = 0.20
+TARGET_CITC_MINIMUM = 0.30
+TARGET_RHO_MINIMUM = 0.40
+SAME_DOMAIN_VTS_MINIMUM = 0.20
+CROSS_DOMAIN_VTS_MINIMUM = 0.30
 
 
 @dataclass(frozen=True)
@@ -76,15 +77,15 @@ class CurrentSystemDefectConfig:
     stimuli_path: Path = DEFAULT_STIMULI
     mussel_path: Path = DEFAULT_MUSSEL
     model_id: str | None = None
-    max_concurrency: int = 30
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
     sampling_seed: int = 20260915
     output: Path | None = None
 
     def validate(self) -> None:
-        if not 1 <= self.max_concurrency <= 50:
-            raise ValueError("max_concurrency必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency必须为非负整数")
         if not 0 <= self.max_retries <= 10:
             raise ValueError("max_retries必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -209,7 +210,7 @@ async def _run_current_sjt(
         for item in respondent_items:
             if (respondent_id, str(item["item_id"])) not in existing:
                 jobs.append((respondent_id, item))
-    semaphore = asyncio.Semaphore(config.max_concurrency)
+    semaphore = UnlimitedConcurrency()
     timeout = config.timeout_seconds or get_model_request_timeout_seconds()
     lock = asyncio.Lock()
     completed = len(existing)

@@ -86,6 +86,18 @@ tests/*
 !tests/test_post_baseline_iteration_lab.py
 !tests/test_first_experiment_current_metrics.py
 !tests/test_virtual_prompt_registry.py
+!tests/test_concurrency_runtime.py
+!tests/test_item_batch_concurrency.py
+!tests/test_probe_concurrency.py
+!tests/test_simulation_concurrency.py
+!tests/test_experiment_concurrency.py
+!tests/test_tool_concurrency.py
+!tests/test_runner_concurrency.py
+!tests/test_evidence_extraction_concurrency.py
+!tests/test_knowledge_concurrency.py
+!tests/test_virtual_content_review.py
+!tests/test_virtual_content_review_workflow.py
+!tests/test_workflow_step_limits.py
 docs/*.xlsx
 docs/*.xls
 experiments/**/*.xlsx
@@ -127,3 +139,4 @@ dist/
 !docs/
 docs/*
 !docs/mussel_zh.json
+!docs/virtual_content_review_protocol.md

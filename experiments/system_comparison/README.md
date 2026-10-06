@@ -33,6 +33,11 @@ python -X utf8 -m experiments.system_comparison report --experiment experiment_d
 
 `report`只读取已有数据，不请求模型。C尚未完成时不开放独立评估，避免评估结果反馈到开发中。
 
+所有已具备输入的独立模型任务全量并发，`max_concurrency=0` 为默认；旧正数配置仍接受但不再限流。
+A与shared同时开发，B与C在shared冻结后同时启动；C最终收卷仍等待B基线，人工处置保持原有确认边界。
+独立评估中，不重叠的问卷并发；相同题面和未变题目的复用任务等待缓存完成，避免重复付费调用。
+远端的限流、超时和有限重试仍可能发生，已完成结果及失败检查点保留。
+
 ## 方法及轮次
 
 - A：无示例单次生成基线。提示词自动填入固定构念定义、高低表现、区分提醒、目标人群与题量；四个选项按目标特质高低分别计1—4分，各一次。每题和每个选项的简短设计依据单独保存；只做结构与完整性校验，不使用虚拟指标改题。
@@ -67,7 +72,7 @@ experiment_data/<实验编号>/
 
 每个问卷目录下的`evaluation/`保存独立作答、计分矩阵、整卷指标，以及：
 
-- `item_metrics.csv`、`items.json`：四项单题指标、阈值、是否可估计、通过状态、失败门槛、非目标facet及相关原值。
+- `item_metrics.csv`、`items.json`：七项单题指标、阈值、是否可估计、通过状态、失败门槛、非目标facet及相关原值。
 - `item_statistics.json`：完整单题计算结果和解释。
 - `option_statistics.csv`、`option_choice_diagnostics.json`：选项人数、比例、均值及定位证据。
 - `analysis_manifest.json`：公式版本、阈值和原始数据引用。
@@ -83,7 +88,7 @@ C各轮还保存`retained_form.json`（当时历史保留卷的完整题目版�
 
 ## 指标与数据隔离
 
-直接复用当前四门槛：target组同facet CITC、target Spearman相关、同领域VTS、跨领域VTS；VTS使用当前实现的最大**带符号**非目标相关。选项梯度保留为诊断信息，不新增资格门槛。
+直接复用当前七门槛：target组同facet CITC、target Spearman相关、同领域VTS、跨领域VTS，以及单题目标IPIP Hedges'g、单题目标IPIP Spearman rho和单题Δmin；门槛分别为`.30`、`.40`、`.30`、`.40`、`.50`、`.40`和`.30`。VTS使用当前实现的最大**带符号**非目标相关，Δmin使用最大绝对非目标IPIP相关。选项梯度保留为诊断信息，不新增第八项资格门槛。
 
 A/B/C评估时都在当前问卷内重新计算CITC；C开发32题库CITC存于development，不能替代最终16题的CITC。一个facet仅有一道题、常量分数或其他缺失情况记为不可估计，不填0。整卷新规则使用Cronbach α、ICC、目标IPIP相关、Δmin和目标Hedges’ g；旧R²、S和I_g只作为历史或诊断字段。
 
@@ -212,7 +217,7 @@ python -X utf8 -m pytest tests/test_system_comparison.py -q
 python -X utf8 -m pytest tests/test_combination_search.py -q
 ```
 
-测试用替身代替收费模型，实际运行施测保存、当前问卷计分、四门槛计算、缓存复用、检查点恢复及HTML汇总。运行数据目录被Git忽略；只对本实验源码、示例配置、README和专用测试设置追踪例外。
+测试用替身代替收费模型，实际运行施测保存、当前问卷计分、七门槛计算、缓存复用、检查点恢复及HTML汇总。运行数据目录被Git忽略；只对本实验源码、示例配置、README和专用测试设置追踪例外。
 
 ## Mussel已知选项缺陷敏感性实验
 

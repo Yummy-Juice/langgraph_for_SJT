@@ -19,6 +19,9 @@ from sjt_system.authoring.legacy_construct_resources import get_inventory
 
 REGISTRY_VERSION = "legacy-openCode-for-SJT-v6"
 DEFAULT_INVENTORY_ID = "neo_pi_r"
+# A real string is required by the requirement-agent JSON schema. It denotes
+# a cross-domain scope; concrete selected domains are stored in ``domain_ids``.
+ALL_DOMAINS_DOMAIN_ID = "all_domains"
 
 _FACET_USER_ALIASES: dict[str, tuple[str, ...]] = {
     # Legacy resource names are English for this facet even in the Chinese
@@ -370,10 +373,13 @@ def _build_inventory(inventory_id: str) -> dict[str, Any]:
                 "facets": {},
             },
         )
-        domain["facets"][facet_id] = _facet_snapshot(
-            facet_id,
-            legacy_facet,
-        )
+        facet_snapshot = _facet_snapshot(facet_id, legacy_facet)
+        # Keep the owning domain on each facet so a cross-domain selection can
+        # still be traced after the profile is flattened for generation.
+        facet_snapshot["domain_id"] = domain_id
+        facet_snapshot["domain_name"] = name_zh
+        facet_snapshot["domain_name_en"] = name_en
+        domain["facets"][facet_id] = facet_snapshot
     return {
         **metadata,
         "inventory_version": REGISTRY_VERSION,
@@ -413,10 +419,23 @@ def list_inventories() -> list[dict[str, str]]:
 def construct_selection_catalog() -> list[dict[str, Any]]:
     """Return stable IDs and labels needed by requirement clarification."""
 
-    return [
-        {
+    catalog = []
+    for inventory in _registry().values():
+        all_facets = [
+            facet
+            for domain in inventory["domains"].values()
+            for facet in domain["facets"].values()
+        ]
+        catalog.append({
             "inventory_id": inventory["inventory_id"],
             "inventory_name": inventory["inventory_name"],
+            "all_domains_selection": {
+                "domain_ids": list(inventory["domains"]),
+                "facet_ids": [
+                    str(facet["facet_id"]) for facet in all_facets
+                ],
+                "facet_count": len(all_facets),
+            },
             "domains": [
                 {
                     "domain_id": domain_id,
@@ -436,9 +455,8 @@ def construct_selection_catalog() -> list[dict[str, Any]]:
                 }
                 for domain_id, domain in inventory["domains"].items()
             ],
-        }
-        for inventory in _registry().values()
-    ]
+        })
+    return catalog
 
 
 def resolve_construct_selection(
@@ -448,17 +466,18 @@ def resolve_construct_selection(
 
     if not isinstance(selection, Mapping):
         raise ConstructResolutionError("construct_selection 必须是对象")
-    if set(selection) != {"inventory_id", "domain_id", "facet_ids"}:
+    allowed_fields = {"inventory_id", "domain_ids", "facet_ids", "domain_id"}
+    if not set(selection).issubset(allowed_fields) or not {
+        "inventory_id",
+        "facet_ids",
+    }.issubset(selection):
         raise ConstructResolutionError(
-            "construct_selection 只能包含 inventory_id、domain_id、facet_ids"
+            "construct_selection 必须包含 inventory_id、domain_ids、facet_ids"
         )
     inventory_id = selection.get("inventory_id")
-    domain_id = selection.get("domain_id")
     facet_ids = selection.get("facet_ids")
     if not isinstance(inventory_id, str) or not inventory_id:
         raise ConstructResolutionError("construct_selection.inventory_id 无效")
-    if not isinstance(domain_id, str) or not domain_id:
-        raise ConstructResolutionError("construct_selection.domain_id 无效")
     if not isinstance(facet_ids, list) or not all(
         isinstance(facet_id, str) and facet_id for facet_id in facet_ids
     ):
@@ -469,12 +488,87 @@ def resolve_construct_selection(
     inventory = _registry().get(inventory_id)
     if inventory is None:
         raise ConstructResolutionError(f"未知构念量表体系：{inventory_id}")
-    domain = inventory["domains"].get(domain_id)
-    if domain is None:
-        raise ConstructResolutionError(
-            f"量表 {inventory_id} 中不存在 domain：{domain_id}"
+
+    requested_domain_ids = selection.get("domain_ids")
+    if requested_domain_ids is None:
+        # Compatibility for pre-domain_ids checkpoints and provider output.
+        legacy_domain_id = selection.get("domain_id")
+        if not isinstance(legacy_domain_id, str) or not legacy_domain_id:
+            raise ConstructResolutionError(
+                "construct_selection.domain_ids 必须是非空字符串列表"
+            )
+        legacy_normalized = re.sub(
+            r"[^a-z0-9\u4e00-\u9fff]+",
+            "",
+            legacy_domain_id.casefold(),
         )
-    available = domain["facets"]
+        if legacy_normalized in {"alldomains", "allfacets", "全部域", "全部分面"}:
+            if facet_ids:
+                facet_domain_map = {
+                    facet_id: domain_id
+                    for domain_id, domain in inventory["domains"].items()
+                    for facet_id in domain["facets"]
+                }
+                requested_domain_ids = list(
+                    dict.fromkeys(
+                        facet_domain_map[facet_id]
+                        for facet_id in facet_ids
+                        if facet_id in facet_domain_map
+                    )
+                )
+            else:
+                requested_domain_ids = list(inventory["domains"])
+        else:
+            requested_domain_ids = [legacy_domain_id]
+    if not isinstance(requested_domain_ids, list) or not requested_domain_ids:
+        raise ConstructResolutionError(
+            "construct_selection.domain_ids 必须是非空字符串列表"
+        )
+    if not all(isinstance(item, str) and item for item in requested_domain_ids):
+        raise ConstructResolutionError(
+            "construct_selection.domain_ids 必须是字符串列表"
+        )
+    requested_domain_ids = list(dict.fromkeys(requested_domain_ids))
+    unknown_domains = [
+        domain_id
+        for domain_id in requested_domain_ids
+        if domain_id not in inventory["domains"]
+    ]
+    if unknown_domains:
+        raise ConstructResolutionError(
+            "量表 " + inventory_id + " 中不存在 domain："
+            + "、".join(unknown_domains)
+        )
+    domain_id = (
+        requested_domain_ids[0]
+        if len(requested_domain_ids) == 1
+        else ALL_DOMAINS_DOMAIN_ID
+    )
+    if domain_id == ALL_DOMAINS_DOMAIN_ID:
+        all_available = {
+            facet_id: facet
+            for domain in inventory["domains"].values()
+            for facet_id, facet in domain["facets"].items()
+        }
+        available = {
+            facet_id: facet
+            for facet_id, facet in all_available.items()
+            if facet.get("domain_id") in set(requested_domain_ids)
+        }
+        domain = {
+            "domain_id": ALL_DOMAINS_DOMAIN_ID,
+            "domain_name": "全部域",
+            "domain_name_en": "All domains",
+        }
+        valid_selection_levels = {"inventory", "facet"}
+    else:
+        domain = inventory["domains"].get(domain_id)
+        if domain is None:
+            raise ConstructResolutionError(
+                f"量表 {inventory_id} 中不存在 domain：{domain_id}"
+            )
+        available = domain["facets"]
+        valid_selection_levels = {"domain", "facet"}
     unknown = [facet_id for facet_id in facet_ids if facet_id not in available]
     if unknown:
         raise ConstructResolutionError(
@@ -485,16 +579,43 @@ def resolve_construct_selection(
         if facet_ids
         else [deepcopy(facet) for facet in available.values()]
     )
+    selection_level = (
+        "inventory"
+        if domain_id == ALL_DOMAINS_DOMAIN_ID
+        and set(requested_domain_ids) == set(inventory["domains"])
+        and (not facet_ids or len(selected_facets) == len(available))
+        else ("facet" if facet_ids else "domain")
+    )
+    if selection_level not in valid_selection_levels:
+        raise ConstructResolutionError("construct_selection 选择范围无效")
+    resolved_domain_ids = list(
+        dict.fromkeys(
+            str(facet.get("domain_id"))
+            for facet in selected_facets
+            if facet.get("domain_id")
+        )
+    )
+    if not resolved_domain_ids:
+        resolved_domain_ids = (
+            list(inventory["domains"])
+            if domain_id == ALL_DOMAINS_DOMAIN_ID
+            else [domain_id]
+        )
+    if set(requested_domain_ids) != set(resolved_domain_ids):
+        raise ConstructResolutionError(
+            "construct_selection.domain_ids 与所选 facet 的实际 domain 不一致"
+        )
     snapshot = {
         "inventory_id": inventory_id,
         "inventory_name": inventory["inventory_name"],
         "inventory_version": inventory["inventory_version"],
         "review_status": inventory["review_status"],
-        "selection_level": "facet" if facet_ids else "domain",
+        "selection_level": selection_level,
         "domain_id": domain_id,
         "domain_name": domain["domain_name"],
         "domain_name_en": domain["domain_name_en"],
         "facets": selected_facets,
+        "domain_ids": resolved_domain_ids,
         "sources": deepcopy(inventory["sources"]),
         "resolution_source": "explicit_structured_selection",
     }
@@ -511,16 +632,26 @@ def resolve_construct_selection(
 def construct_selection_from_profile(
     profile: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """Create the canonical minimal selection stored in TestSpecification."""
+    """Create the canonical selection stored in TestSpecification."""
 
+    domain_ids = list(profile.get("domain_ids") or [])
+    if not domain_ids:
+        domain_ids = list(
+            dict.fromkeys(
+                str(facet.get("domain_id"))
+                for facet in profile.get("facets") or []
+                if facet.get("domain_id")
+            )
+        )
     return {
         "inventory_id": str(profile["inventory_id"]),
-        "domain_id": str(profile["domain_id"]),
-        "facet_ids": (
-            [str(facet["facet_id"]) for facet in profile.get("facets") or []]
-            if profile.get("selection_level") == "facet"
-            else []
-        ),
+        "domain_ids": [
+            str(domain_id) for domain_id in domain_ids
+        ],
+        "facet_ids": [
+            str(facet["facet_id"]) for facet in profile.get("facets") or []
+        ] if profile.get("selection_level") in {"facet", "inventory"}
+        else [],
     }
 
 
@@ -530,10 +661,14 @@ def construct_selection_label(selection: Mapping[str, Any]) -> str:
     profile = resolve_construct_selection(selection)
     if profile["selection_level"] == "domain":
         target = profile["domain_name"]
+    elif profile["selection_level"] == "inventory":
+        target = f"全部域（{len(profile.get('facets') or [])} 个 facet）"
     else:
+        domains = "、".join(profile.get("domain_ids") or [])
+        domain_note = f"（域：{domains}）" if len(profile.get("domain_ids") or []) > 1 else ""
         target = "、".join(
             str(facet["facet_name"]) for facet in profile["facets"]
-        )
+        ) + domain_note
     return f"{profile['inventory_name']} / {target}"
 
 
@@ -649,19 +784,84 @@ def resolve_construct_profile(
             f"未知构念量表体系：{inventory_id}"
         )
 
+    all_markers = (
+        "全部facet", "所有facet", "全部分面", "所有分面",
+        "每个facet", "各个facet", "全部维度", "所有维度",
+        "每个维度", "各个维度", "allfacets", "entireinventory",
+        "wholeinventory", "alldomains",
+    )
+    inventory_markers = (
+        "neopir", "neopi", "量表", "inventory", "domains",
+    )
+    all_scope_markers = (
+        "全部facet", "所有facet", "全部分面", "所有分面",
+        "每个facet", "各个facet", "全部维度", "所有维度",
+        "每个维度", "各个维度",
+    )
+    all_inventory_request = (
+        any(token in normalized for token in all_markers)
+        and (
+            any(token in normalized for token in inventory_markers)
+            or any(token in normalized for token in all_scope_markers)
+        )
+    ) or (
+        any(token in normalized for token in ("整个", "全量"))
+        and any(token in normalized for token in inventory_markers)
+    )
+    if all_inventory_request:
+        all_facets = [
+            deepcopy(facet)
+            for domain in inventory["domains"].values()
+            for facet in domain["facets"].values()
+        ]
+        snapshot = {
+            "inventory_id": inventory_id,
+            "inventory_name": inventory["inventory_name"],
+            "inventory_version": inventory["inventory_version"],
+            "review_status": inventory["review_status"],
+            "selection_level": "inventory",
+            "domain_id": ALL_DOMAINS_DOMAIN_ID,
+            "domain_name": "全部域",
+            "domain_name_en": "All domains",
+            "domain_ids": list(inventory["domains"]),
+            "facets": all_facets,
+            "sources": deepcopy(inventory["sources"]),
+            "resolution_source": resolution_source,
+        }
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        snapshot["profile_hash"] = hashlib.sha256(encoded).hexdigest()
+        return snapshot
+
     facet_candidates = _facet_matches(inventory, normalized)
     if facet_candidates:
         unique_facets = {
             facet["facet_id"]: (domain_id, facet)
             for domain_id, facet in facet_candidates
         }
-        if len(unique_facets) != 1:
-            raise ConstructResolutionError(
-                "目标文本同时匹配多个旧版 facet；请使用旧版 facet 名称"
+        if len(unique_facets) == 1:
+            domain_id, selected_facet = next(iter(unique_facets.values()))
+            selection_level = "facet"
+            selected_facets = [deepcopy(selected_facet)]
+        else:
+            matched_domains = {
+                str(domain_id)
+                for domain_id, _facet in unique_facets.values()
+            }
+            domain_id = (
+                next(iter(matched_domains))
+                if len(matched_domains) == 1
+                else ALL_DOMAINS_DOMAIN_ID
             )
-        domain_id, selected_facet = next(iter(unique_facets.values()))
-        selection_level = "facet"
-        selected_facets = [deepcopy(selected_facet)]
+            selection_level = "facet"
+            selected_facets = [
+                deepcopy(facet)
+                for _domain_id, facet in unique_facets.values()
+            ]
     else:
         domain_candidates = list(
             dict.fromkeys(_domain_matches(inventory, normalized))
@@ -680,7 +880,22 @@ def resolve_construct_profile(
             ].values()
         ]
 
-    domain = inventory["domains"][domain_id]
+    if domain_id == ALL_DOMAINS_DOMAIN_ID:
+        domain = {
+            "domain_id": ALL_DOMAINS_DOMAIN_ID,
+            "domain_name": "全部域",
+            "domain_name_en": "All domains",
+        }
+        domain_ids = list(
+            dict.fromkeys(
+                str(facet.get("domain_id"))
+                for facet in selected_facets
+                if facet.get("domain_id")
+            )
+        )
+    else:
+        domain = inventory["domains"][domain_id]
+        domain_ids = [domain_id]
     snapshot = {
         "inventory_id": inventory_id,
         "inventory_name": inventory["inventory_name"],
@@ -691,6 +906,7 @@ def resolve_construct_profile(
         "domain_name": domain["domain_name"],
         "domain_name_en": domain["domain_name_en"],
         "facets": selected_facets,
+        "domain_ids": domain_ids,
         "sources": deepcopy(inventory["sources"]),
         "resolution_source": resolution_source,
     }

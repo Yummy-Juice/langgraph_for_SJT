@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from copy import deepcopy
 from pathlib import Path
@@ -21,7 +22,7 @@ DEFAULT_RUN_KNOWLEDGE_ROOT = PROJECT_ROOT / "outputs" / "run_knowledge"
 
 _MAX_VALIDATION_RETRIES = 2
 BLUEPRINT_SEMANTIC_RETRY_ATTEMPTS = 2
-INCREMENTAL_CANDIDATES_PER_CELL = 2
+INCREMENTAL_CANDIDATES_PER_CELL = 1
 
 
 class SituationDraft(StrictModel):
@@ -344,18 +345,17 @@ plus situation_id.
 
 Return exactly row_total unique measurement rows, ordered by construct
 coverage. row_total equals the requested final item count. Each row must
-contain exactly two candidate_references, so the program can generate two
-candidate items for the same measurement cell and retain one later. Expansion
+contain exactly one candidate_reference, so the candidate count equals the
+number of final retained items. If a candidate exhausts its failure-call
+budget, the workflow removes it and regenerates one replacement in the same
+temporary form slot. Expansion
 has prepared a situation pool larger than generation_total; select exactly
 generation_total unique situation references from it.
 Do not return generation or retention counts.
 
-Every candidate reference must cite IDs exactly as supplied. The two
-candidates in one row must use different situation references. Prefer
-different activation mechanisms when the evidence supports them; when they
-share a mechanism, their situation entries must represent substantively
-different pressure structures or competing priorities, not merely different
-locations, actors, names, or wording. Do not create or infer IDs.
+Every candidate reference must cite IDs exactly as supplied. Prefer different
+activation mechanisms when the evidence supports them. Do not create or infer
+IDs.
 
 Prioritize construct representation: cover every supplied behavior_id when the
 requested count allows, and cover multiple mechanisms within a behavior when
@@ -385,17 +385,24 @@ Reject any mechanism whose activation_mechanism:
 
 When a mechanism is rejected, do not select any of its situations.
 Prefer mechanisms whose activation_mechanism operates on the same
-behavioral dimension the evidence defines, so that both candidates in every
-row remain construct-pure.
+behavioral dimension the evidence defines, so that every generated item
+remains construct-pure.
+
+FACET QUOTAS
+
+The task input includes facet_retention_quotas. Return exactly the specified
+number of rows for every facet, including facets from different domains. Do
+not trade rows between facets even when one facet has more available
+situations than another.
 
 If blueprint_semantic_feedback is supplied in the task input, treat it as a hard
 correction to the previous proposal. Replace the cited candidate references
 and re-check global uniqueness across all rows before returning the object.
 
-If the available mechanisms cannot supply row_total rows with two unique,
-construct-pure candidate references each, return the maximum construct-pure
-subset and let the program raise an error rather than padding with out-of-
-scope mechanisms or repeating a situation.
+If the available mechanisms cannot supply row_total unique, construct-pure
+candidate references, return the maximum construct-pure subset and let the
+program raise an error rather than padding with out-of-scope mechanisms or
+repeating a situation.
 """.strip()
 
 
@@ -581,19 +588,31 @@ async def _validate_and_repair_mechanisms(
     neighbor_facets = _neighbor_facet_definitions(facet)
     for retry in range(_MAX_VALIDATION_RETRIES + 1):
         failed_mechanisms: list[tuple[int, int, str, str]] = []
-        for bi, behavior in enumerate(expansion.behavior_expansions):
-            for mi, mechanism in enumerate(behavior.mechanisms):
-                result = await _validate_one_mechanism(
+        mechanisms = [
+            (bi, mi, mechanism)
+            for bi, behavior in enumerate(expansion.behavior_expansions)
+            for mi, mechanism in enumerate(behavior.mechanisms)
+        ]
+        results = await asyncio.gather(
+            *(
+                _validate_one_mechanism(
                     mechanism.activation_mechanism,
                     facet,
                     neighbor_facets,
                 )
-                if not result.get("target_is_first"):
-                    failed_mechanisms.append((
-                        bi, mi,
-                        mechanism.activation_mechanism,
-                        result.get("reason", ""),
-                    ))
+                for _, _, mechanism in mechanisms
+            ),
+            return_exceptions=True,
+        )
+        for (bi, mi, mechanism), result in zip(mechanisms, results):
+            if isinstance(result, BaseException):
+                raise result
+            if not result.get("target_is_first"):
+                failed_mechanisms.append((
+                    bi, mi,
+                    mechanism.activation_mechanism,
+                    result.get("reason", ""),
+                ))
 
         if not failed_mechanisms:
             return expansion
@@ -705,6 +724,7 @@ async def propose_blueprint_rows(
     expansions: list[FacetExpansion],
     generation_total: int,
     retention_total: int,
+    facet_retention_quotas: Mapping[str, int],
     retry_feedback: str = "",
     agent: Any | None = None,
 ) -> BlueprintAgentOutput:
@@ -746,6 +766,10 @@ async def propose_blueprint_rows(
         "retention_total": retention_total,
         "row_total": row_total,
         "candidate_count_per_row": INCREMENTAL_CANDIDATES_PER_CELL,
+        "facet_retention_quotas": {
+            str(facet_id): int(quota)
+            for facet_id, quota in facet_retention_quotas.items()
+        },
     }
     if retry_feedback:
         input_data["blueprint_semantic_feedback"] = retry_feedback

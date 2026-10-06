@@ -33,6 +33,7 @@ from sjt_system.knowledge.behavior_evidence import (
     load_ipip_corpus,
 )
 from sjt_system.runtime.output_paths import output_scope
+from sjt_system.runtime.concurrency import UnlimitedConcurrency, gather_all
 from sjt_system.runtime.telemetry import run_context
 
 from .config import fingerprint
@@ -83,14 +84,14 @@ class MusselIPIPConfig:
     summary_pool: Path = DEFAULT_IMPORTED_SUMMARY_POOL
     ipip_path: Path = DEFAULT_CORPUS_PATH
     model_id: str | None = None
-    max_concurrency: int = 30
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
     output: Path | None = None
 
     def validate(self) -> None:
-        if not 1 <= self.max_concurrency <= 50:
-            raise ValueError("max_concurrency必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency必须为非负整数")
         if not 0 <= self.max_retries <= 10:
             raise ValueError("max_retries必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -239,7 +240,7 @@ async def _run_condition_ipip(
         for rid in subject_ids
     }
     timeout = config.timeout_seconds or get_model_request_timeout_seconds()
-    semaphore = asyncio.Semaphore(config.max_concurrency)
+    semaphore = UnlimitedConcurrency()
     lock = asyncio.Lock()
     completed = len(existing) // 10
     total = len(subject_ids) * len(scales)
@@ -649,17 +650,35 @@ async def run_mussel_ipip_reference(
     try:
         records_by_condition: dict[str, list[dict[str, Any]]] = {}
         with output_scope(output / "runtime", telemetry=output / "telemetry"), run_context(run_id):
-            for condition in CONDITION_PERSONA_MODES:
-                records_by_condition[condition] = await _run_condition_ipip(
-                    condition=condition,
-                    subject_ids=subject_ids,
-                    profiles=profiles,
-                    summaries=summaries,
-                    scales=scales,
-                    runnable=runnable,
-                    model_id=model_id,
-                    output_dir=output / condition,
-                    config=config,
+            condition_results = await asyncio.gather(
+                *(
+                    _run_condition_ipip(
+                        condition=condition,
+                        subject_ids=subject_ids,
+                        profiles=profiles,
+                        summaries=summaries,
+                        scales=scales,
+                        runnable=runnable,
+                        model_id=model_id,
+                        output_dir=output / condition,
+                        config=config,
+                    )
+                    for condition in CONDITION_PERSONA_MODES
+                ),
+                return_exceptions=True,
+            )
+            errors = [
+                (condition, result)
+                for condition, result in zip(CONDITION_PERSONA_MODES, condition_results)
+                if isinstance(result, BaseException)
+            ]
+            for condition, result in zip(CONDITION_PERSONA_MODES, condition_results):
+                if not isinstance(result, BaseException):
+                    records_by_condition[condition] = result
+            if errors:
+                condition, error = errors[0]
+                raise RuntimeError(
+                    f"Mussel IPIP有{len(errors)}个独立条件失败；首个条件{condition}：{error}"
                 )
     except Exception as exc:
         write_json(manifest_path, {**manifest, "status": "failed", "error": str(exc)})

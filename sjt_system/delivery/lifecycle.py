@@ -281,6 +281,9 @@ def run_test_review(state: PSJTState) -> dict[str, Any]:
 def run_test_rescore(state: PSJTState) -> dict[str, Any]:
     """Repair scoring keys and force a new bank-level validation cycle."""
 
+    from sjt_system.evaluation.virtual_content_review import is_enabled
+    if is_enabled(state):
+        raise ValueError("虚拟内容复审协议冻结评分键，不能自动重计分")
     review = state.get("test_review_result")
     if not isinstance(review, Mapping) or review.get("decision") != "RESCORE":
         raise ValueError("只有 RESCORE 审核结论可以触发重计分")

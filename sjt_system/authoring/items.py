@@ -14,6 +14,7 @@ from sjt_system.authoring.context import (
 )
 from sjt_system.runtime.trace import utc_timestamp
 from sjt_system.config import PSJT_OPTION_COUNT, PSJT_RESPONSE_INSTRUCTION
+from sjt_system.workflow.replacement_policy import replacement_quota_unlimited
 
 
 ITEM_AGENT_OUTPUT_FIELDS: dict[str, set[str]] = {
@@ -997,9 +998,9 @@ def next_step_after_review(state: PSJTState) -> str:
     if decision == "REJECT":
         if isinstance(state.get("active_psychometric_repair"), Mapping):
             return "abandon"
-        if int(state.get("current_item_replacement_count") or 0) < int(
-            state.get("max_item_replacement_attempts") or 2
-        ):
+        if replacement_quota_unlimited(state) or int(
+            state.get("current_item_replacement_count") or 0
+        ) < int(state.get("max_item_replacement_attempts") or 0):
             return "revise"
         return "abandon"
     return {
@@ -1088,8 +1089,18 @@ def build_review_transition_update(
 def build_accept_item_update(state: PSJTState) -> dict[str, Any]:
     """把通过审查的当前题目移入候选题库。"""
 
+    from sjt_system.evaluation.virtual_content_review import is_enabled, EVIDENCE_SCOPE
+    initial_admission = is_enabled(state) and state.get("initial_candidate_admission") is True
+    if initial_admission:
+        if int(state.get("psychometric_analysis_round") or 0) != 0 or state.get("active_psychometric_repair"):
+            raise ValueError("initial admission cannot bypass post-measurement content investigation")
+        validate_item_agent_update(
+            "generate_item", {"current_item": state.get("current_item")},
+            specification=state.get("test_specification"), blueprint_cell=state.get("current_blueprint_cell"),
+            item_specification=state.get("current_item_specification"),
+        )
     unified_review = state.get("current_item_review")
-    if not isinstance(unified_review, dict) or derive_item_review_decision(
+    if not initial_admission and (not isinstance(unified_review, dict) or derive_item_review_decision(
         unified_review,
         repair_attempted=bool(state.get("current_item_repair_attempted")),
         repair_attempt_count=int(
@@ -1100,7 +1111,7 @@ def build_accept_item_update(state: PSJTState) -> dict[str, Any]:
         ),
         rewrite_count=int(state.get("current_item_rewrite_count") or 0),
         max_rewrite_rounds=int(state.get("max_item_rewrite_rounds") or 3),
-    ) != "PASS":
+    ) != "PASS"):
         raise ValueError("只有 PASS 题目可以进入 item_pool")
 
     item_id, cell_id = get_current_item_identity(state)
@@ -1133,7 +1144,17 @@ def build_accept_item_update(state: PSJTState) -> dict[str, Any]:
         ),
         None,
     )
-    if existing_index is not None and not is_psychometric_repair:
+    lineage = state.get("item_lineage") or {}
+    item_lineage = lineage.get(item_id) if isinstance(lineage, Mapping) else None
+    is_replacement_commit = (
+        not is_psychometric_repair
+        and existing_index is not None
+        and isinstance(item_lineage, Mapping)
+        and int(item_lineage.get("replacement_number") or 0) > 0
+    )
+    if existing_index is not None and not (
+        is_psychometric_repair or is_replacement_commit
+    ):
         raise ValueError(f"item_pool 已存在题目 {item_id!r}")
 
     profile = build_item_pattern_profile(
@@ -1144,10 +1165,12 @@ def build_accept_item_update(state: PSJTState) -> dict[str, Any]:
     profiles[item_id] = profile
     context_usage = dict(state.get("context_usage", {}))
     category = profile["context_category"]
-    if not is_psychometric_repair:
+    if not is_psychometric_repair and not is_replacement_commit:
         context_usage[category] = context_usage.get(category, 0) + 1
     item_pool = [deepcopy(item) for item in state["item_pool"]]
-    if is_psychometric_repair and existing_index is not None:
+    if existing_index is not None and (
+        is_psychometric_repair or is_replacement_commit
+    ):
         item_pool[existing_index] = deepcopy(state["current_item"])
     else:
         item_pool.append(deepcopy(state["current_item"]))
@@ -1175,14 +1198,16 @@ def build_accept_item_update(state: PSJTState) -> dict[str, Any]:
         "item_history": _append_history(
             state,
             item_id,
-            _review_history(state),
+            ({"event": "initial_candidate_admitted", "item": deepcopy(state["current_item"]),
+              "content_status": "not_evaluated", "evidence_scope": EVIDENCE_SCOPE}
+             if initial_admission else _review_history(state)),
         ),
         "blueprint_progress": (
             {
                 key: dict(value)
                 for key, value in state["blueprint_progress"].items()
             }
-            if is_psychometric_repair
+            if is_psychometric_repair or is_replacement_commit
             else _increment_progress(
                 state,
                 cell_id,
@@ -1190,6 +1215,13 @@ def build_accept_item_update(state: PSJTState) -> dict[str, Any]:
             )
         ),
     }
+    if initial_admission:
+        update["initial_candidate_admission"] = False
+        update["item_content_evidence"] = {
+            **deepcopy(state.get("item_content_evidence") or {}),
+            item_id: {"status": "not_evaluated", "item_version": state["current_item"]["version"],
+                      "last_reviewed_version": None, "evidence_scope": EVIDENCE_SCOPE},
+        }
     if not is_psychometric_repair:
         return update
 

@@ -16,7 +16,8 @@ C/D=1、A/B=0，因 CIBOL 选项按"A=最低特质行为 → D=最高特质行�
 
 用法：
   python tools/run_cibol_conductance_check.py [--sample-size 100]
-      [--concurrency 20] [--max-retries 2] [--seed 7]
+      [--concurrency 0] [--max-retries 2] [--seed 7]
+      （--concurrency 仅兼容旧参数，0 或正数均为全量并发）
 """
 
 from __future__ import annotations
@@ -50,6 +51,11 @@ from sjt_system.evaluation.simulation import (
     balanced_option_order,
     build_persona_prompt,
     build_sjt_messages,
+)
+from sjt_system.runtime.concurrency import (
+    UnlimitedConcurrency,
+    gather_all,
+    validate_max_concurrency,
 )
 from sjt_system.runtime.telemetry import run_context as telemetry_run_context
 
@@ -190,7 +196,7 @@ async def _answer_cibol_group(
     refs: list[dict[str, Any]],
     items: list[dict[str, Any]],
     sjt_model: Any,
-    semaphore: asyncio.Semaphore,
+    semaphore: UnlimitedConcurrency,
     output_path: Path,
     max_retries: int,
     retry_delay_seconds: float,
@@ -588,7 +594,7 @@ async def _main(args: argparse.Namespace) -> None:
     items, metadata = load_cibol_items()
     model = get_model()
     sjt_model, _method = with_compatible_structured_output(model, SJTSelectionOutput)
-    semaphore = asyncio.Semaphore(args.concurrency)
+    semaphore = UnlimitedConcurrency()
     request_timeout_seconds = get_model_request_timeout_seconds()
     domain_ids = list(args.domains) if args.domains else CIBOL_DOMAIN_IDS
     if not domain_ids or set(domain_ids) - set(CIBOL_DOMAIN_IDS):
@@ -596,12 +602,10 @@ async def _main(args: argparse.Namespace) -> None:
 
     print(
         f"[run] {run_id} | {len(domain_ids)} 组 × {args.sample_size} 人 × "
-        f"{len(items)} 题 | 并发 {args.concurrency} | 模型 {getattr(model, 'model_name', '?')}"
+        f"{len(items)} 题 | 全量并发 | 模型 {getattr(model, 'model_name', '?')}"
     )
     profiles_by_group: dict[str, list[dict[str, Any]]] = {}
-    group_summaries = []
-    total_calls = 0
-    total_errors = 0
+    group_inputs = []
     for group_index, domain_id in enumerate(domain_ids):
         refs, _diagnostics = generate_score_respondent_refs(
             args.sample_size,
@@ -612,30 +616,59 @@ async def _main(args: argparse.Namespace) -> None:
             ref["respondent_id"] = f"{domain_id}-{ref['respondent_id']}"
             ref["respondent_index"] = index
         profiles_by_group[domain_id] = refs
+        group_inputs.append((domain_id, refs))
+
+    group_summaries: list[dict[str, Any] | None] = [None] * len(group_inputs)
+    summary_write_lock = asyncio.Lock()
+    group_locks = {
+        domain_id: asyncio.Lock() for domain_id, _refs in group_inputs
+    }
+
+    async def run_group(
+        group_index: int,
+        domain_id: str,
+        refs: list[dict[str, Any]],
+    ) -> dict[str, Any]:
         started = time.perf_counter()
-        summary = await _answer_cibol_group(
-            domain_id=domain_id,
-            refs=refs,
-            items=items,
-            sjt_model=sjt_model,
-            semaphore=semaphore,
-            output_path=response_path,
-            max_retries=args.max_retries,
-            retry_delay_seconds=1.0,
-            request_timeout_seconds=request_timeout_seconds,
-            seed=args.seed,
-            run_id=run_id,
-        )
+        # Duplicate --domains entries share respondent/item cache keys and
+        # must retain the old sequential skip-on-resume behavior.
+        async with group_locks[domain_id]:
+            summary = await _answer_cibol_group(
+                domain_id=domain_id,
+                refs=refs,
+                items=items,
+                sjt_model=sjt_model,
+                semaphore=semaphore,
+                output_path=response_path,
+                max_retries=args.max_retries,
+                retry_delay_seconds=1.0,
+                request_timeout_seconds=request_timeout_seconds,
+                seed=args.seed,
+                run_id=run_id,
+            )
         elapsed = time.perf_counter() - started
-        group_summaries.append({**summary, "elapsed_seconds": round(elapsed, 1)})
-        total_calls += summary["completed_calls"]
-        total_errors += summary["error_count"]
+        row = {**summary, "elapsed_seconds": round(elapsed, 1)}
+        group_summaries[group_index] = row
         print(
             f"[group] {domain_id}: 新增 {summary['completed_calls']} 条作答，"
             f"失败 {summary['error_count']}，耗时 {elapsed:.0f}s"
         )
-        with (output_dir / "group_summaries.json").open("w", encoding="utf-8") as handle:
-            json.dump(group_summaries, handle, ensure_ascii=False, indent=2)
+        async with summary_write_lock:
+            ready_summaries = [row for row in group_summaries if row is not None]
+            with (output_dir / "group_summaries.json").open(
+                "w", encoding="utf-8"
+            ) as handle:
+                json.dump(ready_summaries, handle, ensure_ascii=False, indent=2)
+        return row
+
+    group_summaries = await gather_all(
+        *(
+            run_group(index, domain_id, refs)
+            for index, (domain_id, refs) in enumerate(group_inputs)
+        )
+    )
+    total_calls = sum(summary["completed_calls"] for summary in group_summaries)
+    total_errors = sum(summary["error_count"] for summary in group_summaries)
 
     if total_errors:
         print(
@@ -678,12 +711,21 @@ async def _main(args: argparse.Namespace) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="CIBOL 内部传导自检（独立实验）")
     parser.add_argument("--sample-size", type=int, default=100)
-    parser.add_argument("--concurrency", type=int, default=20)
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=0,
+        help="兼容旧参数；0 或正数均为全量并发，不再限制并发数",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--output-root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--domains", nargs="*", help="domain 子集（默认全部 5 个）")
     args = parser.parse_args()
+    try:
+        validate_max_concurrency(args.concurrency)
+    except ValueError as exc:
+        parser.error(str(exc))
     with telemetry_run_context(f"cibol-conductance"):
         asyncio.run(_main(args))
 

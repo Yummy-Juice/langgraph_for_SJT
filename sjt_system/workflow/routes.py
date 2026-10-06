@@ -13,6 +13,14 @@ from sjt_system.workflow.constants import (
 )
 
 def route_after_router(state: PSJTState) -> str:
+    from sjt_system.evaluation.virtual_content_review import is_enabled
+    if not is_enabled(state) and (state.get("repair_knowledge_config") or {}).get("mode") not in {"shared", "run_only"}:
+        return "repair_knowledge_selection"
+    if state.get("scenario_repair_pause"):
+        return "scenario_repair_pause"
+    from sjt_system.evaluation.repair_knowledge import needs_review_knowledge
+    if not is_enabled(state) and needs_review_knowledge(state):
+        return "repair_knowledge_review"
     if state["status"] == "failed":
         return "end"
     if state["route"] and state["route"]["next_action"] == "finish":
@@ -35,6 +43,13 @@ def route_after_router(state: PSJTState) -> str:
                 state.get("virtual_sample_config"),
                 state.get("virtual_respondents"),
             )
+            or int(
+                (state.get("virtual_sample_config") or {}).get(
+                    "generation_round"
+                )
+                or 0
+            )
+            < int(state.get("psychometric_analysis_round") or 0) + 1
         )
     ):
         return "select_virtual_sample"
@@ -48,6 +63,9 @@ def route_after_router(state: PSJTState) -> str:
 
 
 def route_after_execute(state: PSJTState) -> str:
+    from sjt_system.evaluation.virtual_content_review import is_enabled
+    if is_enabled(state) and state.get("status") == "failed":
+        return "end"
     if state.get("skeleton_slot_failure_pending"):
         return "router"
     if state.get("pending_action") == "psychometric_repair_batch":
@@ -115,7 +133,7 @@ def route_after_commit(state: PSJTState) -> str:
         # before the next diagnosis is allowed to start.
         return "post_simulation_review"
     if action == "psychometric_repair_batch":
-        return "router"
+        return "scenario_repair_pause" if state.get("scenario_repair_pause") else "router"
 
     if action in {"generate_item", "revise_item", "regenerate_item"}:
         return "review"
@@ -141,6 +159,8 @@ def route_after_plateau_gap_decision(state: PSJTState) -> str:
 def route_after_prepare_item_review(state: PSJTState) -> str:
     """Skip a second quality review after a requested text change landed."""
 
+    if state.get("initial_candidate_admission"):
+        return "accept"
     review = state.get("current_item_review")
     if isinstance(review, Mapping) and not any(
         isinstance(finding, Mapping)

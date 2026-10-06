@@ -6,6 +6,7 @@
 PSYCHOMETRIC_REPAIR_DEFER_AFTER_ROUNDS = 3
 
 ITEM_DEVELOPMENT_ACTIONS = {
+    "generate_items_batch",
     "generate_item",
     "review_item",
     "revise_item",
@@ -26,6 +27,7 @@ PHASE_BY_ACTION = {
     "clarify_requirements": "requirements",
     "build_blueprint": "construct_blueprint",
     "generate_item": "item_development",
+    "generate_items_batch": "item_development",
     "review_item": "item_development",
     "revise_item": "item_development",
     "regenerate_item": "item_development",

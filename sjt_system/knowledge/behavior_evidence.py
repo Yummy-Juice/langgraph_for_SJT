@@ -481,6 +481,11 @@ def attach_behavior_evidence(
             facet["behavior_evidence"] = [
                 row.model_dump(mode="json") for row in bundle.evidence
             ]
+            facet["behavior_evidence_source"] = (
+                "legacy_registry_fallback"
+                if str(bundle.generated_at).startswith("legacy_registry_fallback:")
+                else "curated"
+            )
     snapshot = deepcopy(enriched)
     snapshot.pop("profile_hash", None)
     enriched["profile_hash"] = canonical_hash(snapshot)

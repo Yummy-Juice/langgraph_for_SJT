@@ -15,22 +15,28 @@ Curated Behavior Evidence
   ↓
 Behavior Expansion（按目标人群缓存）
   ↓
-Blueprint / 双向细目表（每个测量单元先生成2个候选）
+Blueprint / 双向细目表（每个测量单元生成1个候选，候选数等于最终题数）
   ↓
 Skeleton + Item Writer
   ↓
-首轮内容审查
+结构与评分键校验后入库（不做初始内容审题）
   ↓
-固定虚拟被试施测
+虚拟被试首测
   ↓
-确定性题项与测验统计
+保存全部候选的迭代指标 + 当前临时卷的整卷指标
   ↓
-异常诊断与逐题原子返修（可选）
+仅未达标且未锁定题：材料核查 → 双虚拟专家盲审 → 六角色认知访谈 → 证据诊断
+  ↓
+COSMIN边界门禁 → 最小文字返修或同槽位新ID候选 → 整批原子提交
+  ↓
+至多三轮虚拟内容复审（每轮重新作答、保存指标；未达标题再进入返修链）
   ↓
 冻结候选题库、组卷与报告
 ```
 
 正式运行由程序负责状态迁移、JSON 校验、ID/引用、题量、版本和统计计算；模型负责构念内容的生成、题目语言实现、内容审查和异常诊断。当前版本不包含 UI 重构和真实被试数据导入分析。
+
+新任务默认使用 `mte_cosmin_virtual_content_review_v1`，采用 MTE 主流程与 COSMIN 门禁的组合，只使用虚拟被试和虚拟专家。每个模型返修调用最多 3 次；永久锁定资格及平台期保留未达标题的原有路径仍然保留，数值达标状态独立记录。失败调用达到上限或题目 `defer` 时，原题都会删除并在同一蓝图槽位生成替代题，替代题进入下一轮测量；`deferred_decision` 题不得进入临时组卷。修改后不新增独立复审或重新访谈节点；后续三轮统一命名为“虚拟内容复审”。旧检查点保持其原协议，不自动改写证据。详细边界和记录字段见 [虚拟内容复审协议](docs/virtual_content_review_protocol.md)。
 
 ## 环境要求
 
@@ -109,7 +115,7 @@ BASE_URL=https://你的服务地址/v1
 常用的可选配置：
 
 ```env
-MODEL_REQUEST_TIMEOUT_SECONDS=120
+MODEL_REQUEST_TIMEOUT_SECONDS=600
 MODEL_REQUEST_MAX_ATTEMPTS=2
 STRUCTURED_OUTPUT_METHOD=plain_json
 
@@ -180,9 +186,11 @@ python -X utf8 -m experiments.system_comparison report --experiment "experiment_
 | A4 顺从 | `agreeableness_compliance` | `agreeableness_trust` | `neuroticism_angry_hostility` |
 | C5 自律 | `conscientiousness_self_discipline` | `conscientiousness_deliberation` | `neuroticism_impulsiveness` |
 
-五个完整实验可以在五个独立 `tmux` 会话中运行。每份配置建议设定不同 `seed`，并将
-`max_concurrency` 设为 `2`，使五进程总模型并发约为10；不要把每进程并发设为5后直接启动
-五个进程，否则容易触发模型服务限流或503错误。示例：
+五个完整实验可以在五个独立 `tmux` 会话中运行，每份配置使用不同 `seed`。
+模型请求采用全量异步并发：所有已具备输入的独立任务一次性派发，不再按数量分批，
+也不再用信号量或 HTTP 连接池限制活跃请求数。`max_concurrency=0` 表示此策略；
+旧配置中的正数保留兼容，但不再限制并发。多个实验同时运行时，并发量会叠加，
+远端仍可能排队或返回 429/503；已有超时、有限重试和检查点规则保持不变。示例：
 
 ```bash
 tmux new-session -d -s sjt_n4 "source env/bin/activate && python -X utf8 -m experiments.system_comparison run --config experiments/system_comparison/five_facet_configs/N4_self_consciousness.json 2>&1 | tee logs/N4_self_consciousness.log"
@@ -194,6 +202,23 @@ tmux new-session -d -s sjt_c5 "source env/bin/activate && python -X utf8 -m expe
 
 这些命令假定五份配置已放在 `experiments/system_comparison/five_facet_configs/`。
 使用 `tmux attach -t sjt_n4` 等命令进入对应会话处理可能出现的交互提示。
+
+自动开发模式会并发处理全部待开发固定槽位。每题仍依次执行骨架生成、成题、审查及
+必要返修，独立进度保存在 `outputs/item_generation/<run_id>/`，结果按原蓝图顺序合并。
+人工逐步确认模式保留确认依赖；蓝图设计、模型输出修正和返修后的重新检测也必须等待
+前一步输出。虚拟作答的首次施测、目标重测和首轮 IPIP 参照问卷可在同一波并发派发；
+首轮校标组卷完成后写入冻结引用，后续心理测量轮次沿用同一 target 被试及其 IPIP 结果，
+不再发起新的校标组卷调用。
+心理测量返修仍要求整批全部就绪才提交，失败不覆盖正式题库，其他已派发结果保留。
+单个 A/B/C 实验中，A 与共享题库开发同时启动；共享题库冻结后，B 理论组卷与 C
+开发同时启动，C 最终收卷等待 B 基线。独立评估的不同题面同时启动，相同题面或
+复用未变题目的消费者等待缓存生产者。证据抽取和知识学习也按独立条目或构念全量派发。
+
+可选的小型真实接口测试仅发送 3 次短请求、不重试，不运行研究流程：
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m tools.smoke_model_concurrency --output outputs/concurrency_smoke/manual/report.json
+```
 
 ## Behavior Evidence 数据
 
@@ -275,16 +300,43 @@ outputs/
 - `technical_report.md`：流程、版本和统计结果；
 - `virtual_respondent_report.json`：开发期虚拟施测报告。
 
-当前整卷迭代采用与 A/B/C 独立评估一致的指标口径：Cronbach's α 和虚拟重测
-ICC 均为最低 `.80` 的门槛；目标 IPIP facet 高低组的 Hedges' g 是主要优化目标；
-目标相关减最大绝对非目标相关得到的 `Δmin` 不得下降；SJT 与目标 IPIP facet 的
-Spearman 相关最多允许相对历史最佳下降 `.02`。旧的目标恢复 R²、构念选择性和 Q
-只保留为历史诊断字段，不再决定新运行中的最优卷或平台期。
+### 虚拟被试人物资料
+
+当前协议为 `schema_version=12`。每名被试的全部已配置 facet 名称、注册表
+`definition` 和固定分数均显式写入 prompt；缺少定义或人物资料时拒绝启动。
+作答模型固定使用 `temperature=1.5`，不再逐题加减分数，也不改变出题、审查、返修模型的温度。
+温度只控制作答采样随机性，尚未校准为真人个体噪声；端点拒绝温度时停止，不回退参数。
+
+`sjt_system/data/demographics/` 保存六份 `demographics-v1` JSON 候选库：年龄
+12–60 岁、男/女、覆盖六个有人定居大洲的24个国籍、6档已完成学历、38种职业或就业状态，以及8档收入规则。
+按年龄→学历→职业→收入依次抽样，性别、国籍独立抽样；人口学随机流不影响 facet 分数生成。
+未成年人固定学生；成年人的职业受年龄与学历约束，低学历成年人不强制设为学生。
+收入是个人税前月收入的人民币等值，按100元步长抽取，再应用年龄和学历系数并四舍五入到100元。
+这些资格、年龄和收入参数都是合成模拟规则，不是各国人口或收入统计。
+
+人口学资料和分数每人只生成一次，在主施测、整卷重测、IPIP参照和局部复测中保持不变。
+IPIP 等校标组卷只在第一轮施测；首轮 manifest 通过
+`frozen_reference_questionnaire_ref` 固定，后续轮次复制首轮记录并将新增 IPIP 调用数保持为 0。
+后续轮次必须沿用首轮 target cohort，若冻结 manifest 缺失、未完成或与当前 facet 不匹配，流程会停止而不会静默重测。
+样本配置冻结库快照、版本、随机种子与温度；恢复直接读取，不能重新抽样。
+批量消息只提供一次完整公共人物信息；不向被试提供计分键或题目目标标签。
+输出包含人物资料 JSON、`score_profiles.csv`、作答及计分CSV的人口学字段和温度。
+旧协议检查点及结果文件保留，但必须重新配置，不能因已完成而复用。
+覆盖旧协议检查点前，原文件会另存到检查点目录的 `legacy_virtual_protocol/`。
+
+当前整卷迭代将五项指标分别按每个选中 facet 的题目/分数计算和判定：各 facet
+Cronbach's α 与虚拟重测 ICC 都必须达到 `.80`；相对历史最优卷，每个 facet 的
+目标 IPIP 已知组 Hedges' g 必须提高超过 `.01`，各自的 `Δmin` 不得下降，
+各自与目标 IPIP facet 的 Spearman 相关最多下降 `.02`。首次建立基线时，
+g、Δmin 和相关须全部可估计，不另设绝对阈值。每个 facet 单独维护历史最佳题组和
+未改善轮数，其他 facet 未改善不阻止该 facet 更新；拼接保留的题组必须重新通过
+整卷蓝图与机制—情境去重校验。跨 facet 的均值/最小值及旧的目标恢复 R²、
+构念选择性和 Q 仅供描述，不参与判定。
 
 这些统计反映同一虚拟被试框架下的开发期表现，不等同于真实被试信效度。
 技术报告还会记录题目数量、累计 Token 和累计模型耗时。
-稳定性指标需要 target 组额外完成一次整卷重测，因此每轮会增加约
-`target组人数 × 候选题数` 次模型调用；虚拟重测ICC只作为稳定性门槛，
+稳定性指标需要 target 组额外完成一次整卷重测，完整批次每人一次调用，
+失败题目的恢复调用另计；虚拟重测ICC只作为稳定性门槛，
 这些调用计入同一轮Token与耗时。
 
 ## 恢复中断运行
@@ -324,7 +376,7 @@ STRUCTURED_OUTPUT_METHOD=plain_json
 
 ### 找不到行为证据或构念不支持
 
-检查 `knowledge_base/evidence_library/` 中是否存在对应 facet 的 curated 文件。正式运行只接受已注册且有合法证据来源的构念，不会把未知构念自动映射到相近构念。
+单 facet 正式运行仍需检查 `knowledge_base/evidence_library/` 中是否存在对应 facet 的 curated 文件。跨域多 facet 开发运行对已注册但尚未 curated 的 facet 使用带有 `legacy_registry_fallback` 标记的候选证据，以便一次性生成题目；这类题目仍属于开发期产物，不得当作 SME 审查证据或正式验证结果。未知构念不会自动映射到相近构念。
 
 ## 安全与提交前检查
 

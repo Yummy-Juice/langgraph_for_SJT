@@ -84,15 +84,15 @@ class MusselComparisonConfig:
     new_abc_result: Path | None = None
     mussel_path: Path | None = None
     model_id: str | None = None
-    max_concurrency: int = 30
+    max_concurrency: int = 0
     max_retries: int = 2
     timeout_seconds: float | None = None
     sampling_seed: int = 20260913
     output: Path | None = None
 
     def validate(self) -> None:
-        if not 1 <= self.max_concurrency <= 50:
-            raise ValueError("max_concurrency必须在1至50之间")
+        if self.max_concurrency < 0:
+            raise ValueError("max_concurrency必须为非负整数")
         if not 0 <= self.max_retries <= 10:
             raise ValueError("max_retries必须在0至10之间")
         if self.timeout_seconds is not None and self.timeout_seconds <= 0:
@@ -725,7 +725,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--new-abc-result", type=Path, default=None)
     parser.add_argument("--mussel", dest="mussel_path", type=Path, default=None)
     parser.add_argument("--model", dest="model_id", default=None)
-    parser.add_argument("--max-concurrency", type=int, default=30)
+    parser.add_argument(
+        "--max-concurrency", type=int, default=0,
+        help="all independent model calls are dispatched together; legacy concurrency ignored",
+    )
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--timeout", dest="timeout_seconds", type=float, default=None)
     parser.add_argument("--sampling-seed", type=int, default=20260913)

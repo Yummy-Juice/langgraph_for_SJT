@@ -8,6 +8,7 @@ RouteType = Literal[
     "clarify_requirements",          # 分析并补全测验需求
     "build_blueprint",               # 一次性建立程序持有的固定构念—题目细目表
     "generate_item",                 # 根据当前蓝图单元生成题
+    "generate_items_batch",
     "review_item",                   # 多专家审查当前题目
     "revise_item",                   # 定向修改当前题目
     "regenerate_item",               # 废弃当前题目并重新生成
@@ -72,6 +73,15 @@ class UserDecision(TypedDict, total=False):
     approval_source: Literal["user", "system"]
 
 
+class DemographicProfile(TypedDict):
+    age: int
+    gender: str
+    nationality: str
+    education: str
+    occupation: str
+    monthly_income_cny: int
+
+
 class VirtualRespondentRef(TypedDict):
     """工作流 State 中保存的确定性分数型虚拟被试。"""
 
@@ -80,6 +90,7 @@ class VirtualRespondentRef(TypedDict):
     matched_subject_id: str
     active_dimension_id: str
     score_values: dict[str, float]
+    demographics: DemographicProfile
 
 
 class VirtualSampleConfig(TypedDict):
@@ -96,8 +107,10 @@ class VirtualSampleConfig(TypedDict):
     condition_count: int
     recommended_sample_size: int
     automatic_selection_minimum_sample_size: int
+    minimum_profile_sample_size: NotRequired[int]
     seed: int
     max_concurrency: int
+    concurrency_policy: NotRequired[Literal["all_at_once"]]
     max_retries: int
     persona_modes: list[Literal["score_profile"]]
     selection_strategy: Literal["deterministic_matched_normal_generation"]
@@ -105,11 +118,23 @@ class VirtualSampleConfig(TypedDict):
     persona_method: str
     conditions: list[dict[str, Any]]
     score_distribution: dict[str, Any]
+    shared_facet_score_distribution: NotRequired[dict[str, Any]]
+    arm_score_distributions: NotRequired[dict[str, dict[str, Any]]]
+    group_count: NotRequired[int]
+    generation_round: NotRequired[int]
+    reference_questionnaire_freeze_policy: NotRequired[str]
+    frozen_reference_generation_round: NotRequired[int]
+    frozen_reference_questionnaire_ref: NotRequired[str]
     score_scale: list[float]
     response_count_per_respondent_item: Literal[1]
     generator_version: str
     prompt_version: str
     generation_diagnostics: dict[str, Any]
+    demographics_version: str
+    demographics_seed: int
+    demographics_snapshot: dict[str, Any]
+    response_temperature: float
+    score_specs: list[dict[str, Any]]
     ipip_neo_reference_enabled: bool
     ipip_neo_in_main_iteration: bool
     neo_ffi_in_main_iteration: NotRequired[bool]
@@ -118,8 +143,11 @@ class VirtualSampleConfig(TypedDict):
 # 3. 需求 State
 class ConstructSelection(TypedDict):
     inventory_id: str
-    domain_id: str
-    # Empty means the complete domain; otherwise these are explicit facets.
+    # The concrete domains represented by the selected facets. ``domain_ids``
+    # handles single-domain, multi-domain, and whole-inventory selections.
+    domain_ids: list[str]
+    # Empty means all facets in the selected domains; otherwise these are
+    # explicit facets.
     facet_ids: list[str]
 
 
@@ -127,6 +155,10 @@ class TestSpecification(TypedDict):
     """需求分析阶段形成的测验规格。"""
     construct_selection: ConstructSelection
     target_population: str
+    # Explicit retained-item quota for every selected facet.  A single-facet
+    # request therefore has one entry; multi-facet requests may use different
+    # counts per facet.
+    facet_item_counts: dict[str, int]
     final_item_count: int
     output_language: str
 
@@ -146,21 +178,25 @@ class RequirementInteraction(TypedDict):
     suggestions: list[RequirementSuggestion]
     questions: list[RequirementQuestion]
 
-class RequirementStateUpdate(TypedDict):
-    test_specification: TestSpecification
-    specification_sources: dict[
-        str,
-        Literal[
-            "user",
-            "inferred",
-            "system_default",
-        ],
+class RequirementStateUpdate(TypedDict, total=False):
+    # Requirement clarification may return a partial patch.  The workflow
+    # canonicalizer merges it with the previous candidate before validation.
+    test_specification: NotRequired[dict[str, Any]]
+    specification_sources: NotRequired[
+        dict[
+            str,
+            Literal[
+                "user",
+                "inferred",
+                "system_default",
+            ],
+        ]
     ]
 
-class RequirementResult(TypedDict):
-    state_update: RequirementStateUpdate
-    suggestions: list[RequirementSuggestion]
-    questions: list[RequirementQuestion]
+class RequirementResult(TypedDict, total=False):
+    state_update: NotRequired[RequirementStateUpdate]
+    suggestions: NotRequired[list[RequirementSuggestion]]
+    questions: NotRequired[list[RequirementQuestion]]
 
 
 class BehavioralAnchors(TypedDict):
@@ -211,8 +247,9 @@ class ConstructProfileReference(TypedDict):
     inventory_name: str
     inventory_version: str
     review_status: str
-    selection_level: Literal["domain", "facet"]
+    selection_level: Literal["inventory", "domain", "facet"]
     domain_id: str
+    domain_ids: list[str]
     domain_name: str
     selected_facet_ids: list[str]
     profile_hash: str
@@ -620,6 +657,7 @@ class PSJTState(TypedDict):
     skeleton_reviews: dict[str, dict[str, Any]]
     skeleton_review_history: dict[str, list[dict[str, Any]]]
     skeleton_failures: dict[str, dict[str, Any]]
+    item_generation_completed_ids: NotRequired[list[str]]
     skeleton_slot_failure_pending: bool
     # --------------------------------------------------------
     # E. 逐题生成
@@ -658,7 +696,10 @@ class PSJTState(TypedDict):
     current_skeleton_repair_required: bool
     max_item_revision_attempts: int
     max_item_rewrite_rounds: int
-    max_item_replacement_attempts: int
+    # Same-slot replacement quota is an explicit policy.  ``None`` means
+    # unlimited and is the permanent default for new and resumed runs.
+    max_item_replacement_attempts: int | None
+    replacement_quota_policy: NotRequired[str]
     # 每道题的完整版本、审题结果和修改历史
     item_history: dict[str, list[dict[str, Any]]]
     # 淘汰补题使用新ID时保留稳定的替代关系。
@@ -692,6 +733,8 @@ class PSJTState(TypedDict):
     virtual_response_data_ref: str | None
     # 新版题库增量重测时可复用的上一版完整作答 manifest
     previous_virtual_response_data_ref: str | None
+    # 首轮完成的校标组卷（如 IPIP）manifest；后续轮次只复制其结果，不重新施测。
+    frozen_reference_questionnaire_ref: str | None
     # 虚拟作答数据的摘要，例如样本量和完成率
     virtual_response_summary: dict[str, Any] | None
     # 虚拟作答实际绑定的冻结题库版本
@@ -706,7 +749,8 @@ class PSJTState(TypedDict):
     psychometric_round_result: dict[str, Any] | None
     # 每一轮临时组卷的虚拟整卷传导指标、题量、Token 与时间记录。
     psychometric_iteration_history: list[dict[str, Any]]
-    # 连续多轮整卷指标没有实质改善时的自动停止状态。
+    facet_iteration_state: NotRequired[dict[str, Any] | None]
+    # 旧协议兼容字段；固定被试协议不使用平台期停止。
     psychometric_plateau_status: NotRequired[dict[str, Any] | None]
     psychometric_plateau_patience: NotRequired[int]
     psychometric_plateau_min_delta: NotRequired[float]
@@ -741,7 +785,8 @@ class PSJTState(TypedDict):
     selection_results: dict[str, Any] | None
     # 心理测量筛选与返修记录
     psychometric_selection_history: list[dict[str, Any]]
-    # 同一题目版本首次达到 retain 后锁定其通过资格；后续指标仅监测。
+    # 同一题目版本首次通过四项迭代门槛后锁定题目级指标；后续轮次不再
+    # 重算该题的门槛指标，但仍把它放入临时组卷并重算整卷指标。
     locked_retained_item_versions: dict[str, int]
     # 历史最佳、满足蓝图的正式组合及其组合级指标。
     best_assembly_candidate: dict[str, Any] | None
@@ -759,6 +804,25 @@ class PSJTState(TypedDict):
     psychometric_repair_history: list[dict[str, Any]]
     # 最近一次并发返修批次的并发度与成功/失败摘要。
     psychometric_repair_batch_summary: NotRequired[dict[str, Any] | None]
+    scenario_repair_pause: NotRequired[dict[str, Any] | None]
+    # Each progress record persists design_stage, max_rewrites, cumulative edits,
+    # active_baseline_item and staged_design. Detailed call budgets live in its archive.
+    scenario_repair_progress: NotRequired[dict[str, Any]]
+    scenario_repair_staged: NotRequired[dict[str, Any]]
+    virtual_content_review_protocol: NotRequired[str]
+    # All new runs retry repair calls up to MAX_CALLS and replace both
+    # exhausted and deferred items in the same blueprint slot before the next
+    # measurement.  The field is retained as an audit marker for checkpoints.
+    failure_call_replenishment: NotRequired[bool]
+    # A committed same-slot replacement is allowed one follow-up measurement
+    # even after the base three-retest virtual-review budget.
+    deferred_replacement_measurement_pending: NotRequired[bool]
+    virtual_content_review_history: NotRequired[list[dict[str, Any]]]
+    virtual_content_review_stop_reason: NotRequired[str | None]
+    item_content_evidence: NotRequired[dict[str, dict[str, Any]]]
+    initial_candidate_admission: NotRequired[bool]
+    repair_knowledge_config: NotRequired[dict[str, Any] | None]
+    repair_knowledge_state: NotRequired[dict[str, Any]]
     # 已锁定正式题的最新重算指标若漂移，只记录监测警告，不撤销资格。
     psychometric_monitoring_warnings: list[dict[str, Any]]
     psychometric_repair_user_decision: Literal["start"] | None
@@ -806,8 +870,6 @@ class PSJTState(TypedDict):
     # N. 流程安全与运行记录
     # Execute 已经执行的总任务次数
     step_count: int
-    # 防止 Router–Execute 出现无限循环的最大任务次数
-    max_steps: int
     # 执行过程中发生的结构化错误
     errors: list[dict[str, Any]]
     # 结构化执行轨迹；供命令行调试器和后续可视化界面共同使用
@@ -820,10 +882,20 @@ def create_initial_state(
     target_population: str | None = None,
     target_construct: str | None = None,
     requested_item_count: int | None = None,
-    max_steps: int = 100,
+    max_steps: int | None = None,
+    repair_knowledge_mode: str | None = None,
+    repair_knowledge_namespace: str = "development",
+    virtual_content_review_protocol: str = "mte_cosmin_virtual_content_review_v1",
 ) -> PSJTState:
-    if max_steps < 1:
-        raise ValueError("max_steps must be at least 1")
+    """Create an unbounded workflow; the legacy max_steps keyword is ignored."""
+    from sjt_system.evaluation.facet_iteration import initial_iteration_state
+
+    if virtual_content_review_protocol not in {
+        "mte_cosmin_virtual_content_review_v1", "scenario_detection_first_v1",
+    }:
+        raise ValueError("unsupported virtual content review protocol")
+    if repair_knowledge_mode not in {None, "shared", "run_only"}:
+        raise ValueError("repair_knowledge_mode must be shared or run_only")
     if requested_item_count is not None and requested_item_count < 1:
         raise ValueError("requested_item_count must be at least 1")
 
@@ -858,6 +930,17 @@ def create_initial_state(
         test_specification = {
             "construct_selection": construct_selection,
             "target_population": target_population,
+            "facet_item_counts": (
+                {
+                    str(facet_id): requested_item_count
+                    for facet_id in (
+                        (construct_selection or {}).get("facet_ids") or []
+                    )
+                }
+                if construct_selection is not None
+                and len(construct_selection.get("facet_ids") or []) == 1
+                else {}
+            ),
             "final_item_count": requested_item_count,
             "output_language": DEFAULT_OUTPUT_LANGUAGE,
         }
@@ -919,7 +1002,8 @@ def create_initial_state(
         "current_skeleton_repair_required": False,
         "max_item_revision_attempts": 3,
         "max_item_rewrite_rounds": 3,
-        "max_item_replacement_attempts": 2,
+        "max_item_replacement_attempts": None,
+        "replacement_quota_policy": "unlimited",
         "item_history": {},
         "item_lineage": {},
         "item_bank_id": None,
@@ -936,15 +1020,19 @@ def create_initial_state(
         "virtual_respondents": [],
         "virtual_response_data_ref": None,
         "previous_virtual_response_data_ref": None,
+        "frozen_reference_questionnaire_ref": None,
         "virtual_response_summary": None,
         "virtual_response_item_bank_id": None,
         "virtual_response_item_bank_version": None,
         "psychometric_analysis_round": 0,
         "psychometric_round_result": None,
         "psychometric_iteration_history": [],
+        "facet_iteration_state": (initial_iteration_state()
+                                  if virtual_content_review_protocol == "mte_cosmin_virtual_content_review_v1"
+                                  else None),
         "psychometric_plateau_status": None,
         "psychometric_plateau_patience": 2,
-        "psychometric_plateau_min_delta": 0.01,
+        "psychometric_plateau_min_delta": 0.0,
         "item_statistics": {},
         "test_statistics": None,
         "factor_results": None,
@@ -968,6 +1056,18 @@ def create_initial_state(
         "max_psychometric_repair_rounds": 3,
         "psychometric_repair_history": [],
         "psychometric_repair_batch_summary": None,
+        "scenario_repair_pause": None,
+        "scenario_repair_progress": {},
+        "scenario_repair_staged": {},
+        "virtual_content_review_protocol": virtual_content_review_protocol,
+        "failure_call_replenishment": True,
+        "deferred_replacement_measurement_pending": False,
+        "virtual_content_review_history": [],
+        "virtual_content_review_stop_reason": None,
+        "item_content_evidence": {},
+        "initial_candidate_admission": False,
+        "repair_knowledge_config": {"mode": repair_knowledge_mode, "namespace": repair_knowledge_namespace} if repair_knowledge_mode else None,
+        "repair_knowledge_state": {},
         "psychometric_monitoring_warnings": [],
         "psychometric_repair_user_decision": None,
         "item_final_dispositions": {},
@@ -986,7 +1086,6 @@ def create_initial_state(
         "completion_checks": {},
         "unmet_completion_conditions": [],
         "step_count": 0,
-        "max_steps": max_steps,
         "errors": [],
         "execution_history": [],
     }

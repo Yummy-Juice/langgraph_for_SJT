@@ -25,19 +25,52 @@ from sjt_system.state import PSJTState, create_initial_state
 from sjt_system.runtime.trace import utc_timestamp
 
 
-PSYCHOMETRIC_FORMULA_VERSION = "sjt-matched-facet-virtual-screening-v11"
-MEASUREMENT_EVALUATION_VERSION = "sjt-evaluation-v12"
-OPTION_CHOICE_DIAGNOSTICS_VERSION = "matched-condition-option-choice-v3"
+PSYCHOMETRIC_FORMULA_VERSION = "sjt-complete-profile-virtual-screening-v2"
+MEASUREMENT_EVALUATION_VERSION = "sjt-evaluation-v16"
+OPTION_CHOICE_DIAGNOSTICS_VERSION = "matched-condition-option-choice-v4"
 MINIMUM_OPTION_DIAGNOSTIC_GROUP_N = 10
 DIFFICULTY_LOWER_BOUND = 0.20
 DIFFICULTY_UPPER_BOUND = 0.80
 MINIMUM_OPTION_RATE = 0.05
 CITC_MINIMUM_ACCEPTABLE = 0.30
-CITC_REVISION_THRESHOLD = 0.20
+CITC_REVISION_THRESHOLD = 0.30
 CITC_STRONG = 0.50
-TARGET_RHO_THRESHOLD = 0.30
-SAME_DOMAIN_VTS_THRESHOLD = 0.10
-CROSS_DOMAIN_VTS_THRESHOLD = 0.20
+TARGET_RHO_THRESHOLD = None
+SAME_DOMAIN_VTS_THRESHOLD = None
+CROSS_DOMAIN_VTS_THRESHOLD = None
+ITEM_TARGET_HEDGES_G_THRESHOLD = 0.50
+ITEM_TARGET_IPIP_SPEARMAN_RHO_THRESHOLD = 0.40
+ITEM_DISCRIMINANT_DELTA_MIN_THRESHOLD = 0.30
+ITEM_METRIC_FREEZE_POLICY_VERSION = "qualified-item-metrics-frozen-v3"
+
+ITEM_ITERATION_GATE_FIELDS = (
+    "citc_pass",
+    "target_hedges_g_pass",
+    "target_ipip_spearman_rho_pass",
+    "discriminant_delta_min_pass",
+)
+
+
+def _item_iteration_gate_results(metric: Mapping[str, Any]) -> dict[str, bool]:
+    """Return only the four item-level qualification gates."""
+
+    ipip_metrics = metric.get("item_ipip_metrics") or {}
+    return {
+        "citc_pass": metric.get("citc_pass") is True,
+        "target_hedges_g_pass": (
+            (ipip_metrics.get("target_hedges_g") or {}).get("passes") is True
+        ),
+        "target_ipip_spearman_rho_pass": (
+            (ipip_metrics.get("target_ipip_spearman_rho") or {}).get("passes") is True
+        ),
+        "discriminant_delta_min_pass": (
+            (ipip_metrics.get("discriminant_delta_min") or {}).get("passes") is True
+        ),
+    }
+
+
+def _item_iteration_gates_pass(metric: Mapping[str, Any]) -> bool:
+    return all(_item_iteration_gate_results(metric).values())
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -93,6 +126,26 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value.resolve())
     return value
+
+
+def _finite_values(values: Sequence[Any]) -> list[float]:
+    return [
+        float(value)
+        for value in values
+        if isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    ]
+
+
+def _finite_median(values: Sequence[Any]) -> float | None:
+    finite = _finite_values(values)
+    return float(np.median(finite)) if finite else None
+
+
+def _finite_minimum(values: Sequence[Any]) -> float | None:
+    finite = _finite_values(values)
+    return float(min(finite)) if finite else None
 
 
 def _write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
@@ -419,8 +472,9 @@ def _score_matched_sjt(
     items: Mapping[str, Mapping[str, Any]],
     expected_respondent_count: int,
     condition_ids: Sequence[str] | None = None,
+    include_facet_columns: bool = True,
 ) -> tuple[pd.DataFrame, dict[str, pd.DataFrame], dict[str, pd.Series]]:
-    """Score one response per item and validate exact matching across facet groups."""
+    """Score one response per item and validate complete-profile matching."""
 
     expected_ids = tuple(str(value) for value in (condition_ids or MATCHED_CONDITION_IDS))
     if "target" not in expected_ids or len(set(expected_ids)) != len(expected_ids):
@@ -463,6 +517,15 @@ def _score_matched_sjt(
             "selected_option_id": str(option_id),
             "score": float(scoring_key[option_id]),
             "active_score": float(record.get("active_score")) if record.get("active_score") is not None else np.nan,
+            **{field: record.get(field) for field in (
+                "age", "gender", "nationality", "education", "occupation", "monthly_income_cny",
+                "response_temperature",
+            )},
+            "score_values": {
+                str(key): float(value)
+                for key, value in (record.get("score_values") or {}).items()
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+            },
         })
     long_frame = pd.DataFrame(rows)
     if long_frame.empty:
@@ -481,6 +544,36 @@ def _score_matched_sjt(
     for condition_id in expected_ids:
         frame = long_frame[long_frame["condition_id"] == condition_id]
         wide = frame.pivot(index="matched_subject_id", columns="item_id", values="score").reindex(columns=list(item_order))
+        if include_facet_columns:
+            score_rows = frame.drop_duplicates(["matched_subject_id", "item_id"]).copy()
+            dimensions = sorted({
+                str(dimension_id)
+                for values in score_rows["score_values"]
+                if isinstance(values, Mapping)
+                for dimension_id in values
+            })
+            facet_columns: dict[str, pd.Series] = {}
+            for dimension_id in dimensions:
+                score_matrix = score_rows.assign(
+                    dimension_score=score_rows["score_values"].map(
+                        lambda values: values.get(dimension_id) if isinstance(values, Mapping) else np.nan
+                    )
+                ).pivot(index="matched_subject_id", columns="item_id", values="dimension_score")
+                # Keep an item-specific score matrix available without changing
+                # the public item columns consumed by the rest of the evaluator.
+                aligned_scores = score_matrix.reindex(
+                    index=wide.index,
+                    columns=list(item_order),
+                )
+                for item_id in item_order:
+                    facet_columns[f"__score__{dimension_id}__{item_id}"] = (
+                        aligned_scores[item_id]
+                    )
+            if facet_columns:
+                wide = pd.concat(
+                    [wide, pd.DataFrame(facet_columns, index=wide.index)],
+                    axis=1,
+                )
         if wide.isna().any().any() or len(wide) != expected_respondent_count:
             raise ValueError(f"条件 {condition_id} 的被试×题目矩阵存在缺失作答")
         condition_wide[condition_id] = wide.sort_index()
@@ -530,6 +623,379 @@ def _score_target_form_retests(
     return pd.concat(rows, ignore_index=True)
 
 
+def _unavailable_item_ipip_metrics(reason: str) -> dict[str, Any]:
+    """Return an explicit, non-passing payload for an unavailable IPIP metric."""
+
+    return {
+        "status": "unavailable",
+        "reason": reason,
+        "target_hedges_g": {
+            "standardized_effect": None,
+            "threshold": ITEM_TARGET_HEDGES_G_THRESHOLD,
+            "passes": False,
+        },
+        "target_ipip_spearman_rho": {
+            "rho": None,
+            "threshold": ITEM_TARGET_IPIP_SPEARMAN_RHO_THRESHOLD,
+            "passes": False,
+        },
+        "discriminant_delta_min": {
+            "delta_min": None,
+            "threshold": ITEM_DISCRIMINANT_DELTA_MIN_THRESHOLD,
+            "passes": False,
+        },
+        "filtering_authority": True,
+        "metric_scope": "single_item_against_ipip_reference",
+    }
+
+
+def _item_ipip_reference_metrics(
+    *,
+    item_order: Sequence[str],
+    items: Mapping[str, Mapping[str, Any]],
+    target_wide: pd.DataFrame,
+    response_manifest: Mapping[str, Any],
+    manifest_path: Path,
+) -> dict[str, dict[str, Any]]:
+    """Compute the three IPIP reference gates for every measured item.
+
+    The item outcome is the scored SJT response.  IPIP facet scores are used
+    only as the grouping/reference variables: target Hedges' g uses the
+    upper-vs-lower-third IPIP groups, target rho is ordinary Spearman rho, and
+    Delta_min is target rho minus the maximum absolute non-target rho.
+    """
+
+    unavailable_reason = "当前轮次缺少完整的 IPIP-NEO 参照分数"
+    empty = {
+        str(item_id): _unavailable_item_ipip_metrics(unavailable_reason)
+        for item_id in item_order
+    }
+    reference_meta = response_manifest.get("reference_questionnaires") or {}
+    ipip_meta = (
+        reference_meta.get("ipip_neo")
+        if isinstance(reference_meta, Mapping)
+        else None
+    )
+    if not isinstance(ipip_meta, Mapping):
+        return empty
+    raw_path = ipip_meta.get("path")
+    if not isinstance(raw_path, str) or not raw_path:
+        return empty
+    reference_path = Path(raw_path)
+    if not reference_path.is_absolute():
+        reference_path = manifest_path.parent / reference_path
+    try:
+        from sjt_system.evaluation.form_metrics import (
+            _hedges_extreme_group_effect,
+            _read_virtual_reference_scores,
+        )
+
+        reference_result = _read_virtual_reference_scores(
+            {
+                "output_files": {
+                    "ipip_neo_responses": str(reference_path.resolve()),
+                },
+                "reference_questionnaires": {
+                    "ipip_neo": dict(ipip_meta),
+                },
+            },
+            target_subject_ids=[str(value) for value in target_wide.index],
+        )
+    except Exception as exc:
+        return {
+            str(item_id): _unavailable_item_ipip_metrics(
+                f"IPIP-NEO 参照分数读取失败：{exc}"
+            )
+            for item_id in item_order
+        }
+    reference_scores = reference_result.get("scores")
+    details = reference_result.get("details") or {}
+    ipip_details = details.get("ipip_neo") if isinstance(details, Mapping) else None
+    raw_facets = ipip_details.get("facets") if isinstance(ipip_details, Mapping) else None
+    if not isinstance(reference_scores, pd.DataFrame) or not isinstance(raw_facets, list):
+        return empty
+    specs = [
+        {
+            "facet_id": str(row.get("facet_id") or ""),
+            "facet_code": str(row.get("facet_code") or ""),
+            "score_column": str(row.get("score_column") or ""),
+        }
+        for row in raw_facets
+        if isinstance(row, Mapping)
+        and row.get("facet_id")
+        and row.get("score_column")
+        and str(row.get("score_column")) in reference_scores.columns
+    ]
+    if not specs:
+        return empty
+    spec_by_id = {row["facet_id"]: row for row in specs}
+    target_fallback = str((ipip_details or {}).get("target_dimension_id") or "")
+    result: dict[str, dict[str, Any]] = {}
+    for raw_item_id in item_order:
+        item_id = str(raw_item_id)
+        item = items.get(item_id) or {}
+        target_facet_id = str(item.get("target_dimension_id") or "")
+        target_spec = spec_by_id.get(target_facet_id)
+        if target_spec is None and target_facet_id == target_fallback:
+            target_spec = next(
+                (row for row in specs if row["facet_id"] == target_fallback),
+                None,
+            )
+        if target_spec is None or item_id not in target_wide.columns:
+            result[item_id] = _unavailable_item_ipip_metrics(
+                f"题目 {item_id} 找不到匹配的 IPIP 目标 facet"
+            )
+            continue
+        item_scores = target_wide[item_id].astype(float)
+        target_scores = reference_scores[target_spec["score_column"]].reindex(
+            target_wide.index
+        )
+        target_rho = _spearman(item_scores, target_scores)
+        target_effect = _hedges_extreme_group_effect(item_scores, target_scores)
+        target_rho_value = target_rho.get("rho")
+        non_target_rows: list[dict[str, Any]] = []
+        for spec in specs:
+            if spec["facet_id"] == target_spec["facet_id"]:
+                continue
+            non_target = _spearman(
+                item_scores,
+                reference_scores[spec["score_column"]].reindex(target_wide.index),
+            )
+            rho_value = non_target.get("rho")
+            non_target_rows.append(
+                {
+                    "facet_id": spec["facet_id"],
+                    "facet_code": spec["facet_code"],
+                    "rho": rho_value,
+                    "abs_rho": abs(float(rho_value)) if rho_value is not None else None,
+                    "sample_size": non_target.get("n"),
+                }
+            )
+        estimable_non_target = [
+            row for row in non_target_rows if row.get("abs_rho") is not None
+        ]
+        maximum_abs = (
+            max(float(row["abs_rho"]) for row in estimable_non_target)
+            if estimable_non_target
+            else None
+        )
+        delta_value = (
+            float(target_rho_value) - maximum_abs
+            if target_rho_value is not None and maximum_abs is not None
+            else None
+        )
+        hedges_value = target_effect.get("standardized_effect")
+        result[item_id] = {
+            "status": (
+                "complete"
+                if hedges_value is not None
+                and target_rho_value is not None
+                and delta_value is not None
+                else "unavailable"
+            ),
+            "reference_status": reference_result.get("status"),
+            "target_facet_id": target_spec["facet_id"],
+            "target_facet_code": target_spec["facet_code"],
+            "target_hedges_g": {
+                **target_effect,
+                "threshold": ITEM_TARGET_HEDGES_G_THRESHOLD,
+                "passes": hedges_value is not None
+                and float(hedges_value) >= ITEM_TARGET_HEDGES_G_THRESHOLD,
+            },
+            "target_ipip_spearman_rho": {
+                **target_rho,
+                "threshold": ITEM_TARGET_IPIP_SPEARMAN_RHO_THRESHOLD,
+                "passes": target_rho_value is not None
+                and float(target_rho_value) >= ITEM_TARGET_IPIP_SPEARMAN_RHO_THRESHOLD,
+            },
+            "discriminant_delta_min": {
+                "target_rho": target_rho_value,
+                "maximum_absolute_non_target_rho": maximum_abs,
+                "delta_min": delta_value,
+                "non_target_correlations": non_target_rows,
+                "threshold": ITEM_DISCRIMINANT_DELTA_MIN_THRESHOLD,
+                "passes": delta_value is not None
+                and float(delta_value) >= ITEM_DISCRIMINANT_DELTA_MIN_THRESHOLD,
+            },
+            "filtering_authority": True,
+            "metric_scope": "single_item_against_ipip_reference",
+            "formula": {
+                "target_hedges_g": "IPIP target facet upper-third SJT item mean minus lower-third SJT item mean, Hedges correction",
+                "target_ipip_spearman_rho": "Spearman(SJT item score, IPIP target facet score)",
+                "discriminant_delta_min": "target_ipip_rho - MAX(ABS(non_target_ipip_rho))",
+            },
+        }
+    return result
+
+
+def _complete_profile_item_metrics(
+    *,
+    item_order: Sequence[str],
+    items: Mapping[str, Mapping[str, Any]],
+    target_wide: pd.DataFrame,
+    conditions: Sequence[Mapping[str, Any]],
+    metric_item_ids: Sequence[str] | None = None,
+    item_ipip_metrics: Mapping[str, Mapping[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Compute four item gates and retain complete-profile diagnostics."""
+
+    group_rows = flatten_matched_condition_groups(conditions)
+    facet_meta: dict[str, dict[str, Any]] = {}
+    for row in group_rows:
+        dimension_id = str(row.get("dimension_id") or "")
+        if dimension_id and dimension_id not in facet_meta:
+            facet_meta[dimension_id] = dict(row)
+    target_arm = next(
+        (dict(row) for row in conditions if str(row.get("condition_id")) == "target"),
+        {},
+    )
+    for dimension_id in target_arm.get("target_dimension_ids") or []:
+        facet_meta.setdefault(str(dimension_id), {"dimension_id": str(dimension_id)})
+    facet_columns: dict[str, list[str]] = {}
+    for item_id in item_order:
+        facet_columns.setdefault(str(items[item_id]["target_dimension_id"]), []).append(item_id)
+
+    def score_column(dimension_id: str, item_id: str) -> pd.Series:
+        column = f"__score__{dimension_id}__{item_id}"
+        if column not in target_wide:
+            raise ValueError(f"完整 facet 分数档案缺少 {dimension_id}/{item_id} 的 score_values")
+        return target_wide[column].astype(float)
+
+    def vts_group(
+        target_id: str,
+        target_rho: float | None,
+        *,
+        same_domain: bool,
+    ) -> dict[str, Any]:
+        target_domain = facet_meta.get(target_id, {}).get("domain_id")
+        rows: list[dict[str, Any]] = []
+        for dimension_id, metadata in facet_meta.items():
+            if dimension_id == target_id:
+                continue
+            is_same = metadata.get("domain_id") == target_domain
+            if is_same != same_domain:
+                continue
+            rho = _spearman(score_column(dimension_id, item_id), target_wide[item_id])
+            rows.append({
+                **metadata,
+                "dimension_id": dimension_id,
+                "condition_id": f"{('same_domain' if same_domain else 'cross_domain')}__{dimension_id}",
+                "group_id": metadata.get("group_id") or dimension_id,
+                "arm_id": "same_domain" if same_domain else "cross_domain",
+                "rho": rho.get("rho"),
+                "threshold": None,
+                "passes": None,
+                "diagnostic_only": True,
+                "filtering_authority": False,
+            })
+        estimable = [row for row in rows if row.get("rho") is not None]
+        largest = max(estimable, key=lambda row: float(row["rho"])) if estimable else None
+        max_rho = float(largest["rho"]) if largest else None
+        margin = float(target_rho) - max_rho if target_rho is not None and max_rho is not None else None
+        return {
+            "non_target_spearman": rows,
+            "max_non_target_rho": max_rho,
+            "largest_non_target_dimension_id": largest.get("dimension_id") if largest else None,
+            "largest_non_target_facet_name": largest.get("facet_name") if largest else None,
+            "largest_non_target_domain_id": largest.get("domain_id") if largest else None,
+            "largest_non_target_rho": max_rho,
+            "selected_non_target_condition_id": largest.get("condition_id") if largest else None,
+            "selected_non_target_group_id": largest.get("group_id") if largest else None,
+            "selected_non_target_facet": deepcopy(largest) if largest else None,
+            "specificity_margin": margin,
+            "margin_threshold": None,
+            "passes": None,
+            "diagnostic_only": True,
+            "filtering_authority": False,
+            "largest_non_target_facet": deepcopy(largest) if largest else None,
+        }
+
+    metrics: dict[str, dict[str, Any]] = {}
+    measured_item_ids = tuple(
+        item_order if metric_item_ids is None else metric_item_ids
+    )
+    for item_id in measured_item_ids:
+        item = items[item_id]
+        target_id = str(item["target_dimension_id"])
+        same_items = facet_columns.get(target_id, [])
+        citc = _pearson(
+            target_wide[item_id],
+            target_wide[same_items].sum(axis=1) - target_wide[item_id],
+        )
+        target_rho_result = _spearman(score_column(target_id, item_id), target_wide[item_id])
+        target_rho = target_rho_result.get("rho")
+        same = vts_group(
+            target_id,
+            target_rho,
+            same_domain=True,
+        )
+        cross = vts_group(
+            target_id,
+            target_rho,
+            same_domain=False,
+        )
+        same_rho = same.get("max_non_target_rho")
+        cross_rho = cross.get("max_non_target_rho")
+        metrics[item_id] = {
+            "facet_citc": {
+                **citc,
+                "threshold": CITC_REVISION_THRESHOLD,
+                "passes": citc.get("r") is not None and citc["r"] >= CITC_REVISION_THRESHOLD,
+                "condition_id": "target",
+                "filtering_authority": True,
+            },
+            "virtual_target_specificity": {
+                "target_dimension_id": target_id,
+                "target_spearman": target_rho_result,
+                "rho_target": target_rho_result,
+                "rho_same_domain": {
+                    "rho": same_rho,
+                    "selected_group_id": same.get("selected_non_target_group_id"),
+                    "selected_condition_id": same.get("selected_non_target_condition_id"),
+                    "groups": same.get("non_target_spearman", []),
+                },
+                "rho_cross_domain": {
+                    "rho": cross_rho,
+                    "selected_group_id": cross.get("selected_non_target_group_id"),
+                    "selected_condition_id": cross.get("selected_non_target_condition_id"),
+                    "groups": cross.get("non_target_spearman", []),
+                },
+                "correlation_scope": "complete_matched_profile",
+                "conditioning_variable": "score_values",
+                "target_rho_threshold": None,
+                "target_rho_pass": None,
+                "diagnostic_only": True,
+                "filtering_authority": False,
+                "same_domain_non_target": {**same, "arm_id": "same_domain", "filtering_authority": False},
+                "cross_domain_non_target": {**cross, "arm_id": "cross_domain", "filtering_authority": False},
+            },
+            "per_condition_metrics": {
+                "target": {
+                    "condition_id": "target",
+                    "arm_id": "target",
+                    "group_id": "target",
+                    "rho": target_rho_result,
+                    "citc": citc,
+                    "diagnostic_only": True,
+                    "filtering_authority": False,
+                }
+            },
+            "citc_pass": citc.get("r") is not None and citc["r"] >= CITC_REVISION_THRESHOLD,
+            "target_rho_pass": None,
+            "same_domain_vts_pass": None,
+            "cross_domain_vts_pass": None,
+        }
+        if isinstance(item_ipip_metrics, Mapping):
+            metrics[item_id]["item_ipip_metrics"] = deepcopy(
+                dict(item_ipip_metrics.get(item_id) or _unavailable_item_ipip_metrics("未提供IPIP参照指标"))
+            )
+        metric = metrics[item_id]
+        metric["qualification_gates"] = _item_iteration_gate_results(metric)
+        metric["passes"] = _item_iteration_gates_pass(metric)
+        metric["qualified"] = metric["passes"]
+    return metrics
+
+
 def _matched_item_metrics(
     *,
     item_order: Sequence[str],
@@ -537,8 +1003,20 @@ def _matched_item_metrics(
     condition_wide: Mapping[str, pd.DataFrame],
     condition_scores: Mapping[str, pd.Series],
     conditions: Sequence[Mapping[str, Any]],
+    metric_item_ids: Sequence[str] | None = None,
+    item_ipip_metrics: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Calculate target-arm CITC and signed MAX VTS across fixed arms."""
+    """Calculate each item's target-facet CITC and matching signed MAX VTS."""
+
+    if set(condition_wide) == {"target"}:
+        return _complete_profile_item_metrics(
+            item_order=item_order,
+            items=items,
+            target_wide=condition_wide["target"],
+            conditions=conditions,
+            metric_item_ids=metric_item_ids,
+            item_ipip_metrics=item_ipip_metrics,
+        )
 
     group_rows = flatten_matched_condition_groups(conditions)
     condition_rows = {str(row.get("condition_id")): dict(row) for row in group_rows}
@@ -551,29 +1029,59 @@ def _matched_item_metrics(
     for item_id in item_order:
         facet_columns.setdefault(str(items[item_id]["target_dimension_id"]), []).append(item_id)
     metrics: dict[str, dict[str, Any]] = {}
-    for item_id in item_order:
+    measured_item_ids = tuple(
+        item_order if metric_item_ids is None else metric_item_ids
+    )
+    for item_id in measured_item_ids:
         item = items[item_id]
         target_id = str(item["target_dimension_id"])
         same_items = facet_columns[target_id]
         citc = _pearson(target_wide[item_id], target_wide[same_items].sum(axis=1) - target_wide[item_id])
+        relevant_condition_ids = {
+            "target",
+            *(
+                condition_id
+                for condition_id, metadata in condition_rows.items()
+                if condition_id != "target"
+                and (
+                    metadata.get("comparison_target_dimension_id") in (None, target_id)
+                )
+            ),
+        }
+        def score_for(condition_id: str, dimension_id: str) -> pd.Series:
+            wide = condition_wide[condition_id]
+            column = f"__score__{dimension_id}__{item_id}"
+            if column in wide:
+                return wide[column].astype(float)
+            return condition_scores[condition_id]
+
         rhos = {
             condition_id: _spearman(
-                condition_scores[condition_id],
+                score_for(
+                    condition_id,
+                    target_id if condition_rows.get(condition_id, {}).get("arm_id") == "target" else str(condition_rows.get(condition_id, {}).get("dimension_id") or target_id),
+                ),
                 condition_wide[condition_id][item_id],
             )
             for condition_id in condition_rows
         }
         target_rho = rhos["target"].get("rho")
 
-        def vts_group(arm_id: str, threshold: float) -> dict[str, Any]:
+        def vts_group(arm_id: str) -> dict[str, Any]:
             rows = []
             for condition_id in arm_group_ids.get(arm_id, []):
                 metadata = condition_rows.get(condition_id, {})
+                if condition_id not in relevant_condition_ids:
+                    continue
                 rows.append({
                     **metadata,
                     "condition_id": condition_id,
                     "arm_id": arm_id,
                     "rho": rhos[condition_id].get("rho"),
+                    "threshold": None,
+                    "passes": None,
+                    "diagnostic_only": True,
+                    "filtering_authority": False,
                 })
             estimable = [row for row in rows if row.get("rho") is not None]
             largest = max(estimable, key=lambda row: float(row["rho"])) if estimable else None
@@ -590,17 +1098,17 @@ def _matched_item_metrics(
                 "selected_non_target_group_id": largest.get("group_id") if largest else None,
                 "selected_non_target_facet": deepcopy(largest) if largest else None,
                 "specificity_margin": margin,
-                "margin_threshold": threshold,
-                "passes": margin is not None and margin >= threshold,
+                "margin_threshold": None,
+                "passes": None,
+                "diagnostic_only": True,
+                "filtering_authority": False,
                 "largest_non_target_facet": deepcopy(largest) if largest else None,
             }
 
-        same_domain = vts_group("same_domain", SAME_DOMAIN_VTS_THRESHOLD)
-        cross_domain = vts_group("cross_domain", CROSS_DOMAIN_VTS_THRESHOLD)
+        same_domain = vts_group("same_domain")
+        cross_domain = vts_group("cross_domain")
         same_rho = same_domain.get("max_non_target_rho")
         cross_rho = cross_domain.get("max_non_target_rho")
-        same_vts = same_domain.get("specificity_margin")
-        cross_vts = cross_domain.get("specificity_margin")
         metrics[item_id] = {
             "facet_citc": {**citc, "threshold": CITC_REVISION_THRESHOLD, "passes": citc.get("r") is not None and citc["r"] >= CITC_REVISION_THRESHOLD, "condition_id": "target", "filtering_authority": True},
             "virtual_target_specificity": {
@@ -611,17 +1119,19 @@ def _matched_item_metrics(
                 "rho_cross_domain": {"rho": cross_rho, "selected_group_id": cross_domain.get("selected_non_target_group_id"), "selected_condition_id": cross_domain.get("selected_non_target_condition_id"), "groups": cross_domain.get("non_target_spearman", [])},
                 "correlation_scope": "matched_facet_condition",
                 "conditioning_variable": "condition_id",
-                "target_rho_threshold": TARGET_RHO_THRESHOLD,
-                "target_rho_pass": target_rho is not None and target_rho >= TARGET_RHO_THRESHOLD,
+                "target_rho_threshold": None,
+                "target_rho_pass": None,
+                "diagnostic_only": True,
+                "filtering_authority": False,
                 "same_domain_non_target": {
                     **same_domain,
                     "arm_id": "same_domain",
-                    "filtering_authority": True,
+                    "filtering_authority": False,
                 },
                 "cross_domain_non_target": {
                     **cross_domain,
                     "arm_id": "cross_domain",
-                    "filtering_authority": True,
+                    "filtering_authority": False,
                 },
             },
             "per_condition_metrics": {
@@ -634,19 +1144,117 @@ def _matched_item_metrics(
                         condition_wide[condition_id][item_id],
                         condition_wide[condition_id][same_items].sum(axis=1) - condition_wide[condition_id][item_id],
                     ),
-                    "filtering_authority": condition_id == "target",
+                    "diagnostic_only": True,
+                    "filtering_authority": False,
                 }
                 for condition_id in condition_rows
+                if condition_id in relevant_condition_ids
             },
             "citc_pass": citc.get("r") is not None and citc["r"] >= CITC_REVISION_THRESHOLD,
-            "target_rho_pass": target_rho is not None and target_rho >= TARGET_RHO_THRESHOLD,
-            "same_domain_vts_pass": same_vts is not None and same_vts >= SAME_DOMAIN_VTS_THRESHOLD,
-            "cross_domain_vts_pass": cross_vts is not None and cross_vts >= CROSS_DOMAIN_VTS_THRESHOLD,
+            "target_rho_pass": None,
+            "same_domain_vts_pass": None,
+            "cross_domain_vts_pass": None,
         }
+        if isinstance(item_ipip_metrics, Mapping):
+            metrics[item_id]["item_ipip_metrics"] = deepcopy(
+                dict(item_ipip_metrics.get(item_id) or _unavailable_item_ipip_metrics("未提供IPIP参照指标"))
+            )
         metric = metrics[item_id]
-        metric["passes"] = bool(metric["citc_pass"] and metric["target_rho_pass"] and metric["same_domain_vts_pass"] and metric["cross_domain_vts_pass"])
+        metric["qualification_gates"] = _item_iteration_gate_results(metric)
+        metric["passes"] = _item_iteration_gates_pass(metric)
         metric["qualified"] = metric["passes"]
     return metrics
+
+
+def _qualified_item_metric_snapshots(
+    state: Mapping[str, Any],
+    *,
+    item_order: Sequence[str],
+    items: Mapping[str, Mapping[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Return prior four-gate metrics for items that are already qualified.
+
+    A locked version is only a freeze candidate when its qualification was
+    actually established by the current iteration gates.  Plateau-retained
+    items are deliberately excluded: they remain eligible for current-round
+    measurement and are not silently converted into qualified freezes.
+    """
+
+    previous_statistics = state.get("item_statistics") or {}
+    dispositions = state.get("item_final_dispositions") or {}
+    locked_versions = state.get("locked_retained_item_versions") or {}
+    if not isinstance(previous_statistics, Mapping) or not isinstance(
+        locked_versions, Mapping
+    ):
+        return {}
+
+    snapshots: dict[str, dict[str, Any]] = {}
+    for raw_item_id in item_order:
+        item_id = str(raw_item_id)
+        item = items.get(item_id) or {}
+        version = item.get("version")
+        if locked_versions.get(item_id) != version:
+            continue
+        previous = previous_statistics.get(item_id)
+        disposition = dispositions.get(item_id)
+        disposition = disposition if isinstance(disposition, Mapping) else {}
+        if disposition.get("retention_basis") == "plateau_retained":
+            # Plateau retention is a form-level stopping decision, not current
+            # four-gate item qualification; keep measuring this item.
+            continue
+        qualification_snapshot = disposition.get("qualification_snapshot")
+        candidates = [qualification_snapshot, previous]
+        snapshot = next(
+            (
+                candidate
+                for candidate in candidates
+                if isinstance(candidate, Mapping)
+                and all(
+                    (candidate.get("qualification") or {}).get(field) is True
+                    for field in ITEM_ITERATION_GATE_FIELDS
+                )
+                and isinstance(candidate.get("virtual_screening_metrics"), Mapping)
+            ),
+            None,
+        )
+        if snapshot is None:
+            continue
+        raw_round = disposition.get("qualification_analysis_round")
+        if isinstance(raw_round, int) and not isinstance(raw_round, bool):
+            source_analysis_round = raw_round
+        else:
+            source_analysis_round = int(
+                snapshot.get("psychometric_analysis_round")
+                or state.get("psychometric_analysis_round")
+                or 0
+            )
+        snapshots[item_id] = {
+            "item_statistics": deepcopy(dict(snapshot)),
+            "virtual_metrics": deepcopy(
+                dict(snapshot.get("virtual_screening_metrics") or {})
+            ),
+            "source_analysis_round": source_analysis_round,
+        }
+    return snapshots
+
+
+def _mark_item_metric_status(
+    metric: Mapping[str, Any],
+    *,
+    frozen: bool,
+    source_analysis_round: int | None = None,
+) -> dict[str, Any]:
+    """Annotate whether a four-gate metric was measured or carried forward."""
+
+    result = deepcopy(dict(metric))
+    result["iteration_metric_freeze_policy"] = ITEM_METRIC_FREEZE_POLICY_VERSION
+    result["iteration_metric_status"] = "frozen" if frozen else "measured"
+    result["measurement_skipped"] = bool(frozen)
+    if frozen:
+        result["frozen_from_analysis_round"] = source_analysis_round
+    else:
+        result.pop("frozen_from_analysis_round", None)
+    return result
 
 
 def _target_option_gradient(
@@ -691,6 +1299,7 @@ def _matched_option_diagnostics(
     condition_scores: Mapping[str, pd.Series],
     gradients: Mapping[str, Mapping[str, Any]],
     conditions: Sequence[Mapping[str, Any]],
+    virtual_metrics: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
     condition_groups = flatten_matched_condition_groups(conditions)
     condition_metadata = {
@@ -757,8 +1366,12 @@ def _matched_option_diagnostics(
             how="inner",
             validate="one_to_one",
         ).sort_values("matched_subject_id")
+        # Matched IDs keep the paired design, while each arm now has its own
+        # independently generated facet distribution and therefore does not
+        # claim that the numeric score sequences are identical.
+        matched_subjects = bool(len(paired) == len(target) == len(comparator))
         score_sequences_matched = bool(
-            len(paired) == len(target) == len(comparator)
+            matched_subjects
             and np.allclose(
                 paired["target_facet_score"].to_numpy(dtype=float),
                 paired["comparator_facet_score"].to_numpy(dtype=float),
@@ -767,9 +1380,10 @@ def _matched_option_diagnostics(
             )
         )
         estimable = bool(
-            score_sequences_matched
+            matched_subjects
             and len(paired) >= MINIMUM_OPTION_DIAGNOSTIC_GROUP_N
             and paired["target_facet_score"].nunique(dropna=True) > 1
+            and paired["comparator_facet_score"].nunique(dropna=True) > 1
         )
         ordered_options = sorted(
             (
@@ -912,18 +1526,35 @@ def _matched_option_diagnostics(
             "reason": (
                 None
                 if estimable
-                else "匹配分数序列、样本量或分数方差不足；差异仅展示，不得用于返修推断"
+                else "匹配被试ID、样本量或分数方差不足；差异仅展示，不得用于返修推断"
             ),
             "overall": overall,
             "by_score_band": score_bands,
             "filtering_authority": False,
             "diagnostic_use": "localization_only",
+            "facet_score_profiles_independent": True,
+            "matched_subject_ids": matched_subjects,
         }
 
     diagnostics: dict[str, dict[str, Any]] = {}
     rows: list[dict[str, Any]] = []
     for item_id in item_order:
         item = items[item_id]
+        target_dimension_id = str(item.get("target_dimension_id") or "")
+        specificity = ((virtual_metrics or {}).get(item_id) or {}).get("virtual_target_specificity") or {}
+        profile_only = specificity.get("correlation_scope") == "complete_matched_profile"
+        selected_facets = {
+            arm: specificity.get(f"{arm}_non_target") or {}
+            for arm in ("same_domain", "cross_domain")
+        }
+        item_condition_ids = tuple(
+            condition_id
+            for condition_id in condition_ids
+            if condition_id == "target"
+            or condition_metadata.get(condition_id, {}).get(
+                "comparison_target_dimension_id"
+            ) in (None, target_dimension_id)
+        )
         item_diag: dict[str, Any] = {
             "version": OPTION_CHOICE_DIAGNOSTICS_VERSION,
             "filtering_authority": False,
@@ -933,20 +1564,29 @@ def _matched_option_diagnostics(
             "arm_difference_diagnostics": {
                 "filtering_authority": False,
                 "diagnostic_use": "localization_only",
+                "reason": (
+                    "完整profile仅有target条件作答；独立实验臂差异不适用，非目标选项均值按同批被试的facet分数估计"
+                    if profile_only else None
+                ),
                 "comparisons": [
                     arm_difference(item_id, item, condition_id)
-                    for condition_id in condition_ids
-                    if condition_id != "target"
+                    for condition_id in item_condition_ids
+                    if condition_id != "target" and not profile_only
                 ],
             },
         }
         all_group = sjt_long[sjt_long["item_id"] == item_id]
         condition_option_rows: dict[str, dict[str, dict[str, Any]]] = {}
-        for scope, condition_id, group in [("all", None, all_group), *[("condition", cid, sjt_long[(sjt_long["item_id"] == item_id) & (sjt_long["condition_id"] == cid)]) for cid in condition_ids]]:
+        available_conditions = (
+            ("target",) if profile_only else item_condition_ids
+        )
+        for scope, condition_id, group in [("all", None, all_group), *[("condition", cid, sjt_long[(sjt_long["item_id"] == item_id) & (sjt_long["condition_id"] == cid)]) for cid in available_conditions]]:
             counts = group["selected_option_id"].astype(str).value_counts()
             group_n = len(group)
             options = []
             metadata = condition_metadata.get(str(condition_id)) or {}
+            if profile_only and condition_id == "target":
+                metadata = {**metadata, "dimension_id": target_dimension_id, "facet_name": None}
             for option_id, score in sorted(
                 (item.get("scoring_key") or {}).items(),
                 key=lambda pair: (float(pair[1]), str(pair[0])),
@@ -955,8 +1595,13 @@ def _matched_option_diagnostics(
                 count = int(counts.get(option_id, 0))
                 selected_scores = group.loc[
                     group["selected_option_id"].astype(str) == option_id,
-                    "active_score",
+                    "score_values" if profile_only else "active_score",
                 ]
+                if profile_only:
+                    selected_scores = selected_scores.map(
+                        lambda values: values.get(target_dimension_id)
+                        if isinstance(values, Mapping) else None
+                    )
                 facet_mean, facet_standard_error = mean_and_se(selected_scores)
                 row = {
                     "option_id": option_id,
@@ -1000,18 +1645,39 @@ def _matched_option_diagnostics(
             key=lambda pair: (pair[1], pair[0]),
         ):
             target = condition_option_rows.get("target", {}).get(option_id, {})
-            same_groups = [
-                condition_option_rows.get(condition_id, {}).get(option_id, {})
-                for condition_id in condition_ids
-                if condition_metadata.get(condition_id, {}).get("arm_id") == "same_domain"
-            ]
-            cross_groups = [
-                condition_option_rows.get(condition_id, {}).get(option_id, {})
-                for condition_id in condition_ids
-                if condition_metadata.get(condition_id, {}).get("arm_id") == "cross_domain"
-            ]
-            same = next((row for row in same_groups if row), {})
-            cross = next((row for row in cross_groups if row), {})
+            group_means: dict[str, dict[str, Any]] = {}
+            groups_by_arm: dict[str, list[dict[str, Any]]] = {}
+            for arm in ("same_domain", "cross_domain"):
+                selected = selected_facets[arm]
+                selected_dimension_id = selected.get("largest_non_target_dimension_id")
+                selected_condition_id = selected.get("selected_non_target_condition_id")
+                if profile_only:
+                    matching = all_group[all_group["selected_option_id"].astype(str) == option_id]
+                    values = matching["score_values"].map(
+                        lambda scores: scores.get(selected_dimension_id)
+                        if selected_dimension_id and isinstance(scores, Mapping) else None
+                    )
+                    numeric = pd.to_numeric(values, errors="coerce").dropna()
+                    mean, standard_error = mean_and_se(numeric)
+                    group_means[arm] = {
+                        "n": int(len(numeric)),
+                        "mean_score": mean,
+                        "standard_error": standard_error,
+                    }
+                    groups_by_arm[arm] = [group_means[arm]] if selected_dimension_id else []
+                else:
+                    groups_by_arm[arm] = [
+                        condition_option_rows[condition_id].get(option_id, {})
+                        for condition_id in condition_ids
+                        if condition_metadata.get(condition_id, {}).get("arm_id") == arm
+                        and condition_id in condition_option_rows
+                    ]
+                    group_means[arm] = (
+                        condition_option_rows.get(selected_condition_id, {}).get(option_id, {})
+                        if selected_condition_id else next((row for row in groups_by_arm[arm] if row), {})
+                    )
+            same = group_means["same_domain"]
+            cross = group_means["cross_domain"]
             paired_rows.append(
                 {
                     "option_id": option_id,
@@ -1022,17 +1688,144 @@ def _matched_option_diagnostics(
                     "same_domain_n": same.get("n"),
                     "same_domain_mean_score": same.get("mean_score"),
                     "same_domain_standard_error": same.get("standard_error"),
+                    "same_domain_dimension_id": selected_facets["same_domain"].get("largest_non_target_dimension_id"),
+                    "same_domain_facet_name": selected_facets["same_domain"].get("largest_non_target_facet_name"),
+                    "same_domain_group_id": selected_facets["same_domain"].get("selected_non_target_group_id"),
                     "cross_domain_n": cross.get("n"),
                     "cross_domain_mean_score": cross.get("mean_score"),
                     "cross_domain_standard_error": cross.get("standard_error"),
-                    "same_domain_groups": same_groups,
-                    "cross_domain_groups": cross_groups,
+                    "cross_domain_dimension_id": selected_facets["cross_domain"].get("largest_non_target_dimension_id"),
+                    "cross_domain_facet_name": selected_facets["cross_domain"].get("largest_non_target_facet_name"),
+                    "cross_domain_group_id": selected_facets["cross_domain"].get("selected_non_target_group_id"),
+                    "same_domain_groups": groups_by_arm["same_domain"],
+                    "cross_domain_groups": groups_by_arm["cross_domain"],
+                    "mean_source": "same_respondent_score_values" if profile_only else "independent_condition_responses",
                     "filtering_authority": False,
                 }
             )
         item_diag["option_score_comparisons"] = paired_rows
         diagnostics[item_id] = item_diag
     return diagnostics, pd.DataFrame(rows)
+
+
+def refresh_saved_option_diagnostics(
+    state: Mapping[str, Any], *, artifact_dir: Path | None = None
+) -> dict[str, Any]:
+    """Upgrade saved complete-profile option evidence without rerunning respondents or gates."""
+
+    statistics = state.get("item_statistics") or {}
+    stale_ids = [
+        str(item_id)
+        for item_id, row in statistics.items()
+        if isinstance(row, Mapping)
+        and (row.get("quality_evaluation") or {}).get("virtual_target_specificity", {}).get(
+            "correlation_scope"
+        ) == "complete_matched_profile"
+        and (row.get("option_choice_diagnostics") or {}).get("version")
+        != OPTION_CHOICE_DIAGNOSTICS_VERSION
+    ]
+    if not stale_ids:
+        return dict(state)
+
+    manifest_path = Path(str(state.get("virtual_response_data_ref") or ""))
+    if not manifest_path.is_file():
+        raise ValueError(f"旧选项诊断需要原始虚拟作答 manifest：{manifest_path}")
+    manifest = _read_json(manifest_path)
+    if (
+        manifest.get("schema_version") != MATCHED_CONDITION_SCHEMA_VERSION
+        or manifest.get("run_id") != state.get("run_id")
+        or manifest.get("item_bank_id") != state.get("item_bank_id")
+        or manifest.get("item_bank_version") != state.get("item_bank_version")
+    ):
+        raise ValueError("旧选项诊断对应的作答批次与当前冻结题库不一致")
+    item_order, items = _prepare_item_contract(state)
+    if set(item_order) != set(statistics):
+        raise ValueError("旧选项诊断的题目集合与当前冻结题库不一致")
+    count = manifest.get("sample_size_per_condition")
+    if not isinstance(count, int) or count < 1:
+        raise ValueError("旧选项诊断缺少有效的虚拟被试样本数")
+    response_path = manifest_path.parent / "sjt_responses.jsonl"
+    if not response_path.is_file():
+        raise ValueError(f"旧选项诊断缺少原始 SJT 作答：{response_path}")
+    sjt_long, _, condition_scores = _score_matched_sjt(
+        _read_jsonl(response_path),
+        item_order=item_order,
+        items=items,
+        expected_respondent_count=count,
+        condition_ids=("target",),
+        include_facet_columns=False,
+    )
+    metrics = {
+        item_id: {
+            "virtual_target_specificity": statistics[item_id]["quality_evaluation"][
+                "virtual_target_specificity"
+            ]
+        }
+        for item_id in item_order
+    }
+    diagnostics, option_frame = _matched_option_diagnostics(
+        sjt_long=sjt_long,
+        items=items,
+        item_order=item_order,
+        condition_scores=condition_scores,
+        gradients={item_id: statistics[item_id].get("target_option_gradient") or {} for item_id in item_order},
+        conditions=manifest["conditions"],
+        virtual_metrics=metrics,
+    )
+    refreshed = dict(state)
+    refreshed["item_statistics"] = {
+        item_id: {
+            **dict(row),
+            "option_choice_diagnostics": diagnostics[item_id],
+        }
+        if item_id in stale_ids else row
+        for item_id, row in statistics.items()
+    }
+    if isinstance(state.get("test_statistics"), Mapping):
+        refreshed["test_statistics"] = {
+            **state["test_statistics"],
+            "option_choice_diagnostics_version": OPTION_CHOICE_DIAGNOSTICS_VERSION,
+        }
+    from sjt_system.evaluation.round_results import build_psychometric_round_result
+
+    refreshed["psychometric_round_result"] = build_psychometric_round_result(refreshed)
+    interaction = state.get("pending_interaction")
+    if isinstance(interaction, Mapping) and interaction.get("type") == "post_virtual_response_decision":
+        refreshed["pending_interaction"] = {
+            **interaction,
+            "round_result": refreshed["psychometric_round_result"],
+            "failing_items": refreshed["psychometric_round_result"]["pending_items"],
+            "monitoring_warnings": refreshed["psychometric_round_result"]["monitoring_warnings"],
+        }
+    if artifact_dir is not None:
+        output_dir = manifest_path.parent / "psychometrics"
+        if Path(artifact_dir).resolve() != output_dir.resolve():
+            raise ValueError("选项诊断只能刷新原虚拟作答目录中的心理测量产物")
+        option_json = output_dir / "option_choice_diagnostics.json"
+        option_csv = output_dir / "option_statistics.csv"
+        analysis_json = output_dir / "analysis_manifest.json"
+        if not all(path.is_file() for path in (option_json, option_csv, analysis_json)):
+            raise ValueError("原分析产物不完整，不能覆盖保存的选项诊断")
+        analysis_manifest = _read_json(analysis_json)
+        if (
+            analysis_manifest.get("run_id") != state.get("run_id")
+            or analysis_manifest.get("item_bank_id") != state.get("item_bank_id")
+            or analysis_manifest.get("item_bank_version") != state.get("item_bank_version")
+        ):
+            raise ValueError("分析产物的运行ID或冻结题库版本不匹配")
+        _write_csv_atomic(option_csv, option_frame)
+        _write_json_atomic(option_json, {
+            "schema_version": 3,
+            "version": OPTION_CHOICE_DIAGNOSTICS_VERSION,
+            "filtering_authority": False,
+            "items": diagnostics,
+        })
+        _write_json_atomic(analysis_json, {
+            **analysis_manifest,
+            "option_choice_diagnostics_version": OPTION_CHOICE_DIAGNOSTICS_VERSION,
+            "option_diagnostics_refreshed_from_saved_responses_at": utc_timestamp(),
+        })
+    return refreshed
 
 
 def _apply_matched_quality(
@@ -1049,17 +1842,67 @@ def _apply_matched_quality(
         specificity = metric["virtual_target_specificity"]
         same = specificity["same_domain_non_target"]
         cross = specificity["cross_domain_non_target"]
+        item_ipip = metric.get("item_ipip_metrics") or _unavailable_item_ipip_metrics(
+            "未提供IPIP参照指标"
+        )
+        hedges = item_ipip.get("target_hedges_g") or {}
+        ipip_rho = item_ipip.get("target_ipip_spearman_rho") or {}
+        delta_min = item_ipip.get("discriminant_delta_min") or {}
         failed = []
-        if not metric["citc_pass"]: failed.append("CITC")
-        if not metric["target_rho_pass"]: failed.append("目标rho")
-        if not metric["same_domain_vts_pass"]: failed.append("同域VTS")
-        if not metric["cross_domain_vts_pass"]: failed.append("跨域VTS")
+        gate_results = _item_iteration_gate_results(metric)
+        if not gate_results["citc_pass"]: failed.append("CITC")
+        if not gate_results["target_hedges_g_pass"]: failed.append("单题目标Hedges'g")
+        if not gate_results["target_ipip_spearman_rho_pass"]: failed.append("单题目标IPIP rho")
+        if not gate_results["discriminant_delta_min_pass"]: failed.append("单题Delta_min")
         qualified = bool(metric["passes"])
         item["target_option_gradient"] = _json_safe(gradients[item_id])
         item["virtual_screening_metrics"] = _json_safe(metric)
-        item["qualification"] = {"citc_pass": metric["citc_pass"], "target_rho_pass": metric["target_rho_pass"], "same_domain_vts_pass": metric["same_domain_vts_pass"], "cross_domain_vts_pass": metric["cross_domain_vts_pass"], "qualified": qualified}
-        item["quality_evaluation"] = {"version": MEASUREMENT_EVALUATION_VERSION, "quality_grade": "acceptable" if qualified else "needs_revision", "recommendation": "retain" if qualified else "revise", "facet_citc": metric["facet_citc"], "virtual_target_specificity": specificity, "per_condition_metrics": metric.get("per_condition_metrics") or {}, "diagnostic_flags": failed, "failed_gates": failed, "target_option_gradient_failed": not gradients[item_id].get("passes", False), "decision_rule": "资格仅使用目标臂CITC、三臂rho和两类VTS；每个非目标facet group单独估计并取臂内最大带符号rho；目标组选项梯度只触发返修。"}
-        rows.append({"item_id": item_id, "metric_scope": "matched_conditions", "filtering_authority": True, "correlation_method": "ordinary_spearman", "conditioning_variable": "condition_id", "quality_grade": item["quality_evaluation"]["quality_grade"], "recommendation": item["quality_evaluation"]["recommendation"], "citc_r": metric["facet_citc"].get("r"), "rho_target": specificity["rho_target"].get("rho"), "rho_same_domain": specificity["rho_same_domain"].get("rho"), "rho_cross_domain": specificity["rho_cross_domain"].get("rho"), "same_domain_max_non_target_rho": same.get("max_non_target_rho"), "cross_domain_max_non_target_rho": cross.get("max_non_target_rho"), "same_domain_group_count": len(same.get("non_target_spearman") or []), "cross_domain_group_count": len(cross.get("non_target_spearman") or []), "same_domain_vts": same.get("specificity_margin"), "cross_domain_vts": cross.get("specificity_margin"), "failed_gates": "；".join(failed), "target_option_gradient_pass": gradients[item_id].get("passes"), "target_option_gradient_estimable": gradients[item_id].get("estimable")})
+        item["qualification"] = {
+            **gate_results,
+            "target_rho_pass": None,
+            "same_domain_vts_pass": None,
+            "cross_domain_vts_pass": None,
+            "qualified": qualified,
+        }
+        item["quality_evaluation"] = {
+            "version": MEASUREMENT_EVALUATION_VERSION,
+            "quality_grade": "acceptable" if qualified else "needs_revision",
+            "recommendation": "retain" if qualified else "revise",
+            "facet_citc": metric["facet_citc"],
+            "virtual_target_specificity": specificity,
+            "single_item_ipip_metrics": item_ipip,
+            "per_condition_metrics": metric.get("per_condition_metrics") or {},
+            "qualification_gates": list(ITEM_ITERATION_GATE_FIELDS),
+            "diagnostic_flags": failed,
+            "failed_gates": failed,
+            "target_option_gradient_failed": not gradients[item_id].get("passes", False),
+            "decision_rule": "四项题项资格门槛为CITC、单题目标IPIP Hedges'g、单题目标IPIP Spearman rho和单题Delta_min；条件profile目标rho、同域/跨域VTS及非目标facet相关仅作诊断，不参与资格判定。目标组选项梯度仅作诊断辅助，不独立触发返修。",
+        }
+        rows.append({
+            "item_id": item_id,
+            "metric_scope": "matched_conditions",
+            "filtering_authority": True,
+            "correlation_method": "ordinary_spearman",
+            "conditioning_variable": "condition_id",
+            "quality_grade": item["quality_evaluation"]["quality_grade"],
+            "recommendation": item["quality_evaluation"]["recommendation"],
+            "citc_r": metric["facet_citc"].get("r"),
+            "rho_target": specificity["rho_target"].get("rho"),
+            "rho_same_domain": specificity["rho_same_domain"].get("rho"),
+            "rho_cross_domain": specificity["rho_cross_domain"].get("rho"),
+            "same_domain_max_non_target_rho": same.get("max_non_target_rho"),
+            "cross_domain_max_non_target_rho": cross.get("max_non_target_rho"),
+            "same_domain_group_count": len(same.get("non_target_spearman") or []),
+            "cross_domain_group_count": len(cross.get("non_target_spearman") or []),
+            "same_domain_vts": same.get("specificity_margin"),
+            "cross_domain_vts": cross.get("specificity_margin"),
+            "target_hedges_g": hedges.get("standardized_effect"),
+            "target_ipip_spearman_rho": ipip_rho.get("rho"),
+            "discriminant_delta_min": delta_min.get("delta_min"),
+            "failed_gates": "；".join(failed),
+            "target_option_gradient_pass": gradients[item_id].get("passes"),
+            "target_option_gradient_estimable": gradients[item_id].get("estimable"),
+        })
     return item_statistics, pd.DataFrame(rows)
 
 
@@ -1073,7 +1916,7 @@ def _run_matched_condition_analysis(
     items: Mapping[str, Mapping[str, Any]],
     expected_respondents: int,
 ) -> dict[str, Any]:
-    """Persist the active fixed-three-arm, nested-facet-group screening analysis."""
+    """Persist screening metrics from one complete profile per respondent."""
 
     if response_manifest.get("schema_version") != MATCHED_CONDITION_SCHEMA_VERSION:
         raise ValueError(f"匹配 facet 分析需要 schema_version={MATCHED_CONDITION_SCHEMA_VERSION}")
@@ -1085,15 +1928,15 @@ def _run_matched_condition_analysis(
     if "target" not in condition_ids or len(set(condition_ids)) != len(condition_ids):
         raise ValueError("作答 manifest 的 facet groups 缺少唯一 target 或存在重复 condition_id")
     expected_per_condition = response_manifest.get("sample_size_per_condition")
-    if not isinstance(expected_per_condition, int) or expected_respondents != expected_per_condition * len(condition_ids):
-        raise ValueError("facet group 作答人数与 sample_size_per_condition 不一致")
+    if not isinstance(expected_per_condition, int) or expected_respondents != expected_per_condition:
+        raise ValueError("完整 facet 被试数与 sample_size_per_condition 不一致")
     sjt_records = _read_jsonl(sjt_path)
     sjt_long, condition_wide, condition_scores = _score_matched_sjt(
         sjt_records,
         item_order=item_order,
         items=items,
         expected_respondent_count=expected_per_condition,
-        condition_ids=condition_ids,
+        condition_ids=("target",),
     )
     target_retest = response_manifest.get("target_form_retest")
     if not isinstance(target_retest, Mapping):
@@ -1122,31 +1965,97 @@ def _run_matched_condition_analysis(
         expected_respondent_count=expected_per_condition,
         administration_ids=raw_administration_ids,
     )
+    frozen_snapshots = _qualified_item_metric_snapshots(
+        state,
+        item_order=item_order,
+        items=items,
+    )
+    measured_item_ids = [
+        item_id for item_id in item_order if item_id not in frozen_snapshots
+    ]
+    item_ipip_metrics = _item_ipip_reference_metrics(
+        item_order=measured_item_ids,
+        items=items,
+        target_wide=condition_wide["target"],
+        response_manifest=response_manifest,
+        manifest_path=manifest_path,
+    )
     virtual_metrics = _matched_item_metrics(
         item_order=item_order,
         items=items,
         condition_wide=condition_wide,
         condition_scores=condition_scores,
         conditions=conditions,
+        metric_item_ids=measured_item_ids,
+        item_ipip_metrics=item_ipip_metrics,
     )
+    for item_id, snapshot in frozen_snapshots.items():
+        virtual_metrics[item_id] = _mark_item_metric_status(
+            snapshot["virtual_metrics"],
+            frozen=True,
+            source_analysis_round=snapshot.get("source_analysis_round"),
+        )
+    for item_id in measured_item_ids:
+        virtual_metrics[item_id] = _mark_item_metric_status(
+            virtual_metrics[item_id],
+            frozen=False,
+        )
     item_statistics, item_frame, _ = _item_statistics(
         sjt_long,
-        pd.concat([condition_wide[c].assign(condition_id=c) for c in condition_ids]).drop(columns=["condition_id"]),
+        condition_wide["target"].copy(),
         item_order=item_order,
         items=items,
     )
     item_statistics, _ = _enrich_item_quality(item_statistics, item_order=item_order)
+    for item_id, snapshot in frozen_snapshots.items():
+        item_statistics[item_id] = deepcopy(snapshot["item_statistics"])
+        item_statistics[item_id]["iteration_metric_freeze_policy"] = (
+            ITEM_METRIC_FREEZE_POLICY_VERSION
+        )
+        item_statistics[item_id]["iteration_metric_status"] = "frozen"
+        item_statistics[item_id]["measurement_skipped"] = True
+        item_statistics[item_id]["frozen_from_analysis_round"] = snapshot.get(
+            "source_analysis_round"
+        )
     target_long = sjt_long[sjt_long["condition_id"] == "target"]
-    gradients = {
-        item_id: _target_option_gradient(target_long=target_long, item=items[item_id], target_scores=condition_scores["target"])
-        for item_id in item_order
-    }
+    gradients = {}
+    for item_id in measured_item_ids:
+        target_dimension_id = str(items[item_id].get("target_dimension_id") or "")
+        target_score_column = f"__score__{target_dimension_id}__{item_id}"
+        target_scores = (
+            condition_wide["target"][target_score_column]
+            if target_score_column in condition_wide["target"]
+            else condition_scores["target"]
+        )
+        gradients[item_id] = _target_option_gradient(
+            target_long=target_long,
+            item=items[item_id],
+            target_scores=target_scores,
+        )
+    for item_id, snapshot in frozen_snapshots.items():
+        gradients[item_id] = deepcopy(
+            snapshot["item_statistics"].get("target_option_gradient") or {}
+        )
     item_statistics, item_quality_frame = _apply_matched_quality(
         item_statistics,
         virtual_metrics,
         gradients,
         item_order=item_order,
     )
+    for item_id, snapshot in frozen_snapshots.items():
+        frozen_statistics = deepcopy(snapshot["item_statistics"])
+        frozen_statistics["virtual_screening_metrics"] = deepcopy(
+            virtual_metrics[item_id]
+        )
+        frozen_statistics["iteration_metric_freeze_policy"] = (
+            ITEM_METRIC_FREEZE_POLICY_VERSION
+        )
+        frozen_statistics["iteration_metric_status"] = "frozen"
+        frozen_statistics["measurement_skipped"] = True
+        frozen_statistics["frozen_from_analysis_round"] = snapshot.get(
+            "source_analysis_round"
+        )
+        item_statistics[item_id] = frozen_statistics
     option_diagnostics, option_frame = _matched_option_diagnostics(
         sjt_long=sjt_long,
         items=items,
@@ -1154,19 +2063,22 @@ def _run_matched_condition_analysis(
         condition_scores=condition_scores,
         gradients=gradients,
         conditions=conditions,
+        virtual_metrics=virtual_metrics,
     )
     for item_id in item_order:
+        if item_id in frozen_snapshots:
+            continue
         item_statistics[item_id]["option_choice_diagnostics"] = option_diagnostics[item_id]
     target_wide = condition_wide["target"]
-    scale_statistics = _scale_statistics(target_wide, items)
+    scale_statistics = _scale_statistics(target_wide.loc[:, list(item_order)], items)
     analysis_round = int(state.get("psychometric_analysis_round") or 0) + 1
     respondent_rows = []
-    for condition_id in condition_ids:
+    for condition_id in ("target",):
         frame = condition_wide[condition_id]
         scores = condition_scores[condition_id]
         for matched_subject_id in frame.index:
             group = next((entry for entry in condition_groups if entry.get("condition_id") == condition_id), {})
-            row = {"respondent_id": f"{condition_id}-{matched_subject_id}", "condition_id": condition_id, "arm_id": group.get("arm_id"), "group_id": group.get("group_id"), "matched_subject_id": matched_subject_id, "active_score": float(scores.loc[matched_subject_id]), "sjt_total_score": float(frame.loc[matched_subject_id].mean())}
+            row = {"respondent_id": f"{condition_id}-{matched_subject_id}", "condition_id": condition_id, "arm_id": group.get("arm_id"), "group_id": group.get("group_id"), "matched_subject_id": matched_subject_id, "active_score": float(scores.loc[matched_subject_id]), "sjt_total_score": float(frame.loc[matched_subject_id, list(item_order)].mean())}
             respondent_rows.append(row)
     respondent_scores = pd.DataFrame(respondent_rows)
     target_rhos = [virtual_metrics[item_id]["virtual_target_specificity"]["rho_target"].get("rho") for item_id in item_order]
@@ -1177,13 +2089,46 @@ def _run_matched_condition_analysis(
         "evidence_scope": "exploratory_virtual_matched_facet_screening",
         "psychometric_analysis_round": analysis_round,
         "sampling_design": "matched_facet_conditions",
+        "response_batch_design": "one_batch_per_matched_subject",
         "condition_ids": list(condition_ids),
         "arm_ids": list(MATCHED_CONDITION_IDS),
         "group_count": len(condition_ids),
         "sample_size_per_condition": expected_per_condition,
         "item_metrics": virtual_metrics,
-        "summary": {"median_target_rho": float(np.nanmedian(target_rhos)) if any(value is not None for value in target_rhos) else None, "median_citc": float(np.nanmedian(citcs)) if any(value is not None for value in citcs) else None, "minimum_same_domain_vts": min((value for value in same_vts if value is not None), default=None), "minimum_cross_domain_vts": min((value for value in cross_vts if value is not None), default=None)},
-        "interpretation": "固定三个顶层臂复用完全匹配的分数序列；每个facet group单独计算普通Spearman，臂级VTS取非目标组最大带符号rho，CITC过滤权仅属于target臂。",
+        "item_metric_freeze_policy": ITEM_METRIC_FREEZE_POLICY_VERSION,
+        "frozen_item_ids": list(frozen_snapshots),
+        "measured_item_ids": list(measured_item_ids),
+        "item_metric_measurement_skipped_count": len(frozen_snapshots),
+        "summary": {
+            "median_target_rho": float(np.nanmedian(target_rhos)) if any(value is not None for value in target_rhos) else None,
+            "median_citc": float(np.nanmedian(citcs)) if any(value is not None for value in citcs) else None,
+            "minimum_same_domain_vts": min((value for value in same_vts if value is not None), default=None),
+            "minimum_cross_domain_vts": min((value for value in cross_vts if value is not None), default=None),
+            "median_item_target_hedges_g": _finite_median(
+                [
+                    ((virtual_metrics.get(item_id) or {}).get("item_ipip_metrics") or {})
+                    .get("target_hedges_g", {}).get("standardized_effect")
+                    for item_id in item_order
+                ]
+            ),
+            "median_item_target_ipip_spearman_rho": _finite_median(
+                [
+                    ((virtual_metrics.get(item_id) or {}).get("item_ipip_metrics") or {})
+                    .get("target_ipip_spearman_rho", {}).get("rho")
+                    for item_id in item_order
+                ]
+            ),
+            "minimum_item_discriminant_delta_min": _finite_minimum(
+                [
+                    ((virtual_metrics.get(item_id) or {}).get("item_ipip_metrics") or {})
+                    .get("discriminant_delta_min", {}).get("delta_min")
+                    for item_id in item_order
+                ]
+            ),
+            "frozen_item_count": len(frozen_snapshots),
+            "measured_item_count": len(measured_item_ids),
+        },
+        "interpretation": "每名虚拟被试一次完成全部题目；CITC和三项单题IPIP指标构成题项级开发筛查门槛。条件profile目标rho、同域/跨域VTS及其非目标facet组相关继续计算并仅作诊断，不替代真人效度。",
     })
     recommendation_counts = {"retain": 0, "revise": 0, "remove": 0}
     for item in item_statistics.values():
@@ -1196,8 +2141,8 @@ def _run_matched_condition_analysis(
         "overall_status": "development_ready" if qualified_count == len(item_order) else "development_ready_with_revision",
         "item_recommendation_counts": recommendation_counts,
         "reliability": {"overall_grade": "exploratory_virtual_screening", "cronbach_alpha": scale_statistics.get("cronbach_alpha"), "median_target_citc": validity_statistics["summary"]["median_citc"]},
-        "validity": {"overall_grade": "exploratory_virtual_screening", "virtual_target_specificity": validity_statistics["summary"], "conditioning": {"variable": "condition_id", "method": "matched_facet_arms", "filtering_authority": True}},
-        "interpretation": "四项资格门槛使用目标臂CITC、三臂rho和两类VTS；非目标facet group独立估计并取臂内最大带符号rho，目标组选项梯度仅为返修触发器。",
+        "validity": {"overall_grade": "exploratory_virtual_screening", "virtual_target_specificity": validity_statistics["summary"], "conditioning": {"variable": "score_values", "method": "complete_profile_diagnostics", "filtering_authority": False}},
+        "interpretation": "四项题项资格门槛为CITC、单题目标IPIP Hedges' g、目标IPIP rho和Delta_min；条件profile目标rho、同域/跨域VTS及非目标facet相关仅作诊断，目标组选项梯度仅作诊断辅助，不独立触发返修。",
     })
     output_dir = manifest_path.parent / "psychometrics"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1236,13 +2181,32 @@ def _run_matched_condition_analysis(
         neo_reference = reference_questionnaires.get("neo_ffi")
         if isinstance(neo_reference, Mapping) and isinstance(neo_reference.get("path"), str) and Path(neo_reference["path"]).is_file():
             output_files["neo_ffi_responses"] = str(Path(neo_reference["path"]).resolve())
-    analysis_manifest = {"schema_version": MATCHED_CONDITION_SCHEMA_VERSION, "status": "completed", "formula_version": PSYCHOMETRIC_FORMULA_VERSION, "evaluation_version": MEASUREMENT_EVALUATION_VERSION, "psychometric_analysis_round": analysis_round, "run_id": state["run_id"], "item_bank_id": state["item_bank_id"], "item_bank_version": state["item_bank_version"], "item_bank_fingerprint": state.get("item_bank_fingerprint"), "sample_size": expected_respondents, "sample_size_per_condition": expected_per_condition, "condition_count": 3, "group_count": len(condition_ids), "condition_ids": list(condition_ids), "arm_ids": list(MATCHED_CONDITION_IDS), "sampling_design": "matched_facet_conditions", "conditions": deepcopy(conditions), "persona_mode": PERSONA_MODE_SCORE_PROFILE, "prompt_version": response_manifest.get("prompt_version"), "score_prompt_version": response_manifest.get("score_prompt_version"), "generator_version": response_manifest.get("generator_version"), "virtual_sample_config": deepcopy(response_manifest.get("virtual_sample_config") or {}), "item_count": len(item_order), "qualified_item_count": qualified_count, "qualification_rate": qualified_count / len(item_order), "criteria": {"iteration_gates": {"facet_citc_minimum": CITC_REVISION_THRESHOLD, "target_rho_minimum": TARGET_RHO_THRESHOLD, "same_domain_vts_minimum": SAME_DOMAIN_VTS_THRESHOLD, "cross_domain_vts_minimum": CROSS_DOMAIN_VTS_THRESHOLD, "condition_method": "fixed_three_arms_nested_facet_groups", "filtering_authority": True}, "target_option_gradient": {"filtering_authority": False, "repair_trigger": True}}, "formulas": {"facet_citc": "Pearson(target arm item, target arm same-facet remaining score sum)", "rho_target": "Spearman(Y_target, z_target)", "rho_group": "Spearman(Y_group, z_group), one group per non-target facet", "same_domain_vts": "rho_target - MAX(signed rho of same-domain facet groups)", "cross_domain_vts": "rho_target - MAX(signed rho of cross-domain facet groups)", "target_form_retest": "same target persona and item set under a second balanced option order; used only by whole-form stability"}, "input_files": {"response_manifest": {"path": str(manifest_path.resolve()), "sha256": _file_sha256(manifest_path)}, "sjt_responses": {"path": str(sjt_path.resolve()), "sha256": _file_sha256(sjt_path)}, "target_form_retest_responses": {"path": str(target_retest_path.resolve()), "sha256": _file_sha256(target_retest_path)}, "score_profiles": {"path": str(Path(response_manifest["score_profiles_path"]).resolve()), "sha256": _file_sha256(Path(response_manifest["score_profiles_path"]))}, "option_orders": {"path": str(Path(option_order_path).resolve()), "sha256": _file_sha256(Path(option_order_path))}}, "output_files": output_files, "completed_at": utc_timestamp()}
+    analysis_manifest = {"schema_version": MATCHED_CONDITION_SCHEMA_VERSION, "status": "completed", "formula_version": PSYCHOMETRIC_FORMULA_VERSION, "evaluation_version": MEASUREMENT_EVALUATION_VERSION, "psychometric_analysis_round": analysis_round, "run_id": state["run_id"], "item_bank_id": state["item_bank_id"], "item_bank_version": state["item_bank_version"], "item_bank_fingerprint": state.get("item_bank_fingerprint"), "sample_size": expected_respondents, "sample_size_per_condition": expected_per_condition, "condition_count": 3, "group_count": len(condition_ids), "condition_ids": list(condition_ids), "arm_ids": list(MATCHED_CONDITION_IDS), "sampling_design": "matched_facet_conditions", "response_batch_design": "one_batch_per_matched_subject", "conditions": deepcopy(conditions), "persona_mode": PERSONA_MODE_SCORE_PROFILE, "prompt_version": response_manifest.get("prompt_version"), "score_prompt_version": response_manifest.get("score_prompt_version"), "generator_version": response_manifest.get("generator_version"), "virtual_sample_config": deepcopy(response_manifest.get("virtual_sample_config") or {}), "item_count": len(item_order), "qualified_item_count": qualified_count, "qualification_rate": qualified_count / len(item_order), "item_metric_freeze_policy": ITEM_METRIC_FREEZE_POLICY_VERSION, "frozen_item_ids": list(frozen_snapshots), "measured_item_ids": list(measured_item_ids), "item_metric_measurement_skipped_count": len(frozen_snapshots), "criteria": {"iteration_gates": {"facet_citc_minimum": CITC_REVISION_THRESHOLD, "condition_method": "single_complete_profile", "filtering_authority": True}, "conditional_profile_diagnostics": {"target_rho_threshold": None, "same_domain_vts_threshold": None, "cross_domain_vts_threshold": None, "filtering_authority": False}, "target_option_gradient": {"filtering_authority": False, "repair_trigger": True}}, "formulas": {"facet_citc": "Pearson(item score, same-facet other-item score sum)", "rho_target": "Spearman(item score, target facet score_values)", "rho_same_domain": "Spearman(item score, each same-domain non-target facet score_values)", "rho_cross_domain": "Spearman(item score, each cross-domain non-target facet score_values)", "same_domain_vts": "rho_target - MAX(signed rho of same-domain non-target facets)", "cross_domain_vts": "rho_target - MAX(signed rho of cross-domain non-target facets)", "target_form_retest": "same target persona and item set under a second balanced option order; used only by whole-form stability"}, "input_files": {"response_manifest": {"path": str(manifest_path.resolve()), "sha256": _file_sha256(manifest_path)}, "sjt_responses": {"path": str(sjt_path.resolve()), "sha256": _file_sha256(sjt_path)}, "target_form_retest_responses": {"path": str(target_retest_path.resolve()), "sha256": _file_sha256(target_retest_path)}, "score_profiles": {"path": str(Path(response_manifest["score_profiles_path"]).resolve()), "sha256": _file_sha256(Path(response_manifest["score_profiles_path"]))}, "option_orders": {"path": str(Path(option_order_path).resolve()), "sha256": _file_sha256(Path(option_order_path))}}, "output_files": output_files, "completed_at": utc_timestamp()}
+    analysis_manifest["criteria"]["iteration_gates"].update(
+        {
+            "item_target_hedges_g_minimum": ITEM_TARGET_HEDGES_G_THRESHOLD,
+            "item_target_ipip_spearman_rho_minimum": ITEM_TARGET_IPIP_SPEARMAN_RHO_THRESHOLD,
+            "item_discriminant_delta_minimum": ITEM_DISCRIMINANT_DELTA_MIN_THRESHOLD,
+            "gate_fields": list(ITEM_ITERATION_GATE_FIELDS),
+            "gate_count": len(ITEM_ITERATION_GATE_FIELDS),
+        }
+    )
+    analysis_manifest["criteria"]["target_option_gradient"].update(
+        {"diagnostic_only": True, "repair_trigger": False}
+    )
+    analysis_manifest["formulas"].update(
+        {
+            "item_target_hedges_g": "IPIP target facet upper-third SJT item mean minus lower-third SJT item mean with Hedges correction",
+            "item_target_ipip_spearman_rho": "Spearman(SJT item score, IPIP target facet score)",
+            "item_discriminant_delta_min": "target_ipip_rho - MAX(ABS(non_target_ipip_rho))",
+        }
+    )
     _write_json_atomic(analysis_path, analysis_manifest)
-    test_statistics = {**scale_statistics, "sampling_design": "matched_facet_conditions", "condition_count": 3, "group_count": len(condition_ids), "condition_ids": list(condition_ids), "arm_ids": list(MATCHED_CONDITION_IDS), "sample_size_per_condition": expected_per_condition, "qualified_item_count": qualified_count, "qualification_rate": qualified_count / len(item_order), "qualification_criteria": analysis_manifest["criteria"], "virtual_screening_metrics": validity_statistics, "measurement_evaluation": measurement_evaluation, "reference_questionnaires": _json_safe(reference_questionnaires), "output_files": output_files, "formula_version": PSYCHOMETRIC_FORMULA_VERSION, "evaluation_version": MEASUREMENT_EVALUATION_VERSION, "psychometric_analysis_round": analysis_round, "option_choice_diagnostics_version": OPTION_CHOICE_DIAGNOSTICS_VERSION}
+    test_statistics = {**scale_statistics, "sampling_design": "matched_facet_conditions", "response_batch_design": "one_batch_per_matched_subject", "condition_count": 3, "group_count": len(condition_ids), "condition_ids": list(condition_ids), "arm_ids": list(MATCHED_CONDITION_IDS), "sample_size_per_condition": expected_per_condition, "qualified_item_count": qualified_count, "qualification_rate": qualified_count / len(item_order), "item_metric_freeze_policy": ITEM_METRIC_FREEZE_POLICY_VERSION, "frozen_item_ids": list(frozen_snapshots), "measured_item_ids": list(measured_item_ids), "item_metric_measurement_skipped_count": len(frozen_snapshots), "qualification_criteria": analysis_manifest["criteria"], "virtual_screening_metrics": validity_statistics, "measurement_evaluation": measurement_evaluation, "reference_questionnaires": _json_safe(reference_questionnaires), "output_files": output_files, "formula_version": PSYCHOMETRIC_FORMULA_VERSION, "evaluation_version": MEASUREMENT_EVALUATION_VERSION, "psychometric_analysis_round": analysis_round, "option_choice_diagnostics_version": OPTION_CHOICE_DIAGNOSTICS_VERSION}
     state_update = {"item_statistics": item_statistics, "test_statistics": _json_safe(test_statistics), "psychometric_analysis_round": analysis_round, "virtual_analysis_reconfiguration_reason": None}
     from sjt_system.evaluation.round_results import build_psychometric_round_result
     state_update["psychometric_round_result"] = build_psychometric_round_result({**state, **state_update})
-    return {"state_update": state_update, "summary": f"已完成固定三臂、多 facet group 匹配分析：每组{expected_per_condition}人、共{len(condition_ids)}组、{len(item_order)}道题，保留{qualified_count}题，待返修{recommendation_counts['revise']}题。"}
+    return {"state_update": state_update, "summary": f"已完成完整 facet 被试矩阵分析：{expected_per_condition}名被试各一次性回答全部{len(item_order)}道题；本轮实测题目级指标{len(measured_item_ids)}题、冻结过关指标{len(frozen_snapshots)}题。保留{qualified_count}题，待返修{recommendation_counts['revise']}题；临时组卷仍纳入当前候选并重算整卷指标。"}
 
 
 def _option_frequency_group(
@@ -1395,10 +2359,8 @@ def _enrich_item_quality(
             discrimination_rating = "insufficient_evidence"
         elif citc < 0:
             discrimination_rating = "poor"
-        elif citc < CITC_REVISION_THRESHOLD:
-            discrimination_rating = "weak"
         elif citc < CITC_MINIMUM_ACCEPTABLE:
-            discrimination_rating = "acceptable_with_warning"
+            discrimination_rating = "weak"
         elif citc >= CITC_STRONG:
             discrimination_rating = "strong"
         else:
@@ -1569,7 +2531,14 @@ def evaluate_single_item_candidate(
         item_order=item_order,
         items=items,
         expected_respondent_count=expected_per_condition,
-        condition_ids=condition_ids,
+        condition_ids=("target",),
+    )
+    item_ipip_metrics = _item_ipip_reference_metrics(
+        item_order=item_order,
+        items=items,
+        target_wide=condition_wide["target"],
+        response_manifest=manifest,
+        manifest_path=manifest_path,
     )
     virtual_metrics = _matched_item_metrics(
         item_order=item_order,
@@ -1577,13 +2546,11 @@ def evaluate_single_item_candidate(
         condition_wide=condition_wide,
         condition_scores=condition_scores,
         conditions=conditions,
+        item_ipip_metrics=item_ipip_metrics,
     )
     item_statistics, _, _ = _item_statistics(
         sjt_long,
-        pd.concat(
-            [condition_wide[condition_id].assign(condition_id=condition_id)
-             for condition_id in condition_ids]
-        ).drop(columns=["condition_id"]),
+        condition_wide["target"].copy(),
         item_order=item_order,
         items=items,
     )
@@ -1596,7 +2563,12 @@ def evaluate_single_item_candidate(
         current_item_id: _target_option_gradient(
             target_long=target_long,
             item=items[current_item_id],
-            target_scores=condition_scores["target"],
+            target_scores=(
+                condition_wide["target"].get(
+                    f"__score__{items[current_item_id].get('target_dimension_id')}__{current_item_id}",
+                    condition_scores["target"],
+                )
+            ),
         )
         for current_item_id in item_order
     }
@@ -1647,7 +2619,7 @@ def run_psychometric_analysis(
         )
     raise ValueError(
         "旧 tier/重复作答/条件残差化虚拟作答结果已失效；"
-        f"请使用 schema_version={MATCHED_CONDITION_SCHEMA_VERSION} 的固定三臂、多 facet group 匹配协议重新作答"
+        f"请使用 schema_version={MATCHED_CONDITION_SCHEMA_VERSION} 的完整 facet profile、每人一次批次协议重新作答"
     )
 
 def run_saved_psychometric_analysis(

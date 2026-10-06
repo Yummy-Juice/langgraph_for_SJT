@@ -247,7 +247,7 @@ class LiveLLMRepairEngine:
     ) -> dict[str, Any]:
         from sjt_system.workflow.executor import _ainvoke_model
 
-        timeout = float(getattr(self.config, "request_timeout_seconds", 300.0))
+        timeout = float(getattr(self.config, "request_timeout_seconds", 600.0))
         result = await _ainvoke_model(
             agent,
             {"input_data": input_data},
@@ -480,7 +480,7 @@ class LiveLLMRepairEngine:
         simulation = await run_virtual_response_simulation(
             local_state,
             output_root=self.output_dir / "live_virtual_responses",
-            request_timeout_seconds=float(getattr(self.config, "request_timeout_seconds", 300.0)),
+            request_timeout_seconds=float(getattr(self.config, "request_timeout_seconds", 600.0)),
         )
         state_update = simulation.get("state_update") or {}
         manifest_path_value = state_update.get("virtual_response_data_ref")

@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from sjt_system.runtime.concurrency import gather_all
+
 
 SCHEMA_VERSION = 1
 TERMINAL_STATUSES = {"complete", "infeasible", "technical_failure"}
@@ -70,9 +72,9 @@ class LabConfig:
     max_model_retries: int = 2
     max_replacements_per_slot: int = 2
     max_repair_rounds: int = 3
-    max_concurrency: int = 8
+    max_concurrency: int = 0
     engine_mode: str = "offline"
-    request_timeout_seconds: float = 300.0
+    request_timeout_seconds: float = 600.0
     model_id: str | None = None
 
     @classmethod
@@ -86,7 +88,7 @@ class LabConfig:
                     value = int(value)
                 except (TypeError, ValueError):
                     value = default
-                value = max(1, value)
+                value = max(0 if name == "max_concurrency" else 1, value)
             elif name == "min_delta":
                 try:
                     value = float(value)
@@ -800,21 +802,72 @@ class PostBaselineIterationLab:
                 return result
         return await self._generate_replacement(root_id, cell_id)
 
+    def _unused_reserves_for_slot(self, root_id: str, cell_id: str) -> list[str]:
+        if bool(self.engine._plan(root_id).get("disable_reserve", False)):
+            return []
+        return [
+            reserve_id
+            for reserve_id in self.reserve_ids
+            if reserve_id not in self.state["used_reserve_ids"]
+            and str(self.items[reserve_id].get("blueprint_cell_id")) == str(cell_id)
+        ]
+
     async def _run_repair_round(self, round_number: int) -> dict[str, Any]:
         current = list(self.state["current_item_ids"])
         pending = [item_id for item_id in current if not _item_passed(self.items[item_id])]
         self._event("repair_round_started", round=round_number, pending_item_ids=pending)
         repair_results: list[dict[str, Any]] = []
         if pending:
-            semaphore = asyncio.Semaphore(self.config.max_concurrency)
-
-            async def run_limited(item_id: str) -> dict[str, Any]:
-                async with semaphore:
-                    return await self._repair_one(item_id)
-
-            repair_results = await asyncio.gather(*(run_limited(item_id) for item_id in pending))
+            repair_results = await gather_all(
+                *(self._repair_one(item_id) for item_id in pending)
+            )
         changed_ids: list[str] = []
         unresolved: list[dict[str, Any]] = []
+        slots_to_resolve: list[tuple[int, str, str]] = []
+        for result in repair_results:
+            item_id = result["item_id"]
+            if result.get("selected_item_id"):
+                continue
+            if result.get("outcome") == "technical_failure":
+                continue
+            cell_id = self.items[item_id]["blueprint_cell_id"]
+            slots_to_resolve.append((len(slots_to_resolve), item_id, cell_id))
+
+        reserve_consumers: dict[str, list[int]] = {}
+        for result_index, item_id, cell_id in slots_to_resolve:
+            if self._unused_reserves_for_slot(item_id, cell_id):
+                reserve_consumers.setdefault(str(cell_id), []).append(result_index)
+
+        shared_reserve_groups = {
+            cell_id: indexes
+            for cell_id, indexes in reserve_consumers.items()
+            if len(indexes) > 1
+        }
+        grouped_indexes = {
+            result_index
+            for indexes in shared_reserve_groups.values()
+            for result_index in indexes
+        }
+        slot_results: dict[int, dict[str, Any]] = {}
+
+        async def resolve_one(result_index: int, item_id: str, cell_id: str) -> None:
+            slot_results[result_index] = await self._resolve_failed_slot(item_id, cell_id)
+
+        async def resolve_group(indexes: list[int]) -> None:
+            for result_index in indexes:
+                _, item_id, cell_id = slots_to_resolve[result_index]
+                await resolve_one(result_index, item_id, cell_id)
+
+        resolution_jobs = [resolve_group(indexes) for indexes in shared_reserve_groups.values()]
+        resolution_jobs.extend(
+            resolve_one(result_index, item_id, cell_id)
+            for result_index, item_id, cell_id in slots_to_resolve
+            if result_index not in grouped_indexes
+        )
+        if resolution_jobs:
+            await gather_all(*resolution_jobs)
+
+        slot_result_index = 0
         for result in repair_results:
             item_id = result["item_id"]
             if result.get("selected_item_id"):
@@ -824,7 +877,8 @@ class PostBaselineIterationLab:
                 unresolved.append({"item_id": item_id, "cell_id": self.items[item_id]["blueprint_cell_id"], "status": "technical_failure", "reason": result.get("reason")})
                 continue
             cell_id = self.items[item_id]["blueprint_cell_id"]
-            replacement = await self._resolve_failed_slot(item_id, cell_id)
+            replacement = slot_results[slot_result_index]
+            slot_result_index += 1
             if replacement.get("status") == "ok":
                 replacement_item = replacement["item"]
                 changed_ids.append(replacement_item["item_id"])

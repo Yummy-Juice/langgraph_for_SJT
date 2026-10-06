@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "database_version": "demographics-v1",
+  "synthetic": true,
+  "kind": "education",
+  "entries": [
+    { "id": "primary", "label": "小学", "rank": 0, "minimum_age": 12 },
+    { "id": "lower_secondary", "label": "初中", "rank": 1, "minimum_age": 15 },
+    { "id": "upper_secondary", "label": "高中", "rank": 2, "minimum_age": 18 },
+    { "id": "bachelor", "label": "本科", "rank": 3, "minimum_age": 22 },
+    { "id": "master", "label": "硕士", "rank": 4, "minimum_age": 24 },
+    { "id": "doctorate", "label": "博士", "rank": 5, "minimum_age": 27 }
+  ]
+}

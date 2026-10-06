@@ -137,6 +137,9 @@ def _abc_item_summaries(rows, items_by_form, c_final):
                 "target_rho",
                 "same_domain_vts",
                 "cross_domain_vts",
+                "target_hedges_g",
+                "target_ipip_spearman_rho",
+                "discriminant_delta_min",
             ):
                 mean, middle = _finite_summary(item_rows, column)
                 summary[f"{column}_mean"] = mean
@@ -441,7 +444,7 @@ def write_report(store):
         ("target_rho_mean", "target_rho_median", "目标ρ", False),
         ("same_domain_vts_mean", "same_domain_vts_median", "同域VTS", False),
         ("cross_domain_vts_mean", "cross_domain_vts_median", "跨域VTS", False),
-        ("qualification_rate", None, "四门槛通过率", True),
+        ("qualification_rate", None, "七项门槛通过率", True),
     ):
         html.append(_abc_chart(abc_item_rows, mean_column, label, median_column, bounded))
     html += [
@@ -454,12 +457,14 @@ def write_report(store):
                                     ("cumulative_tokens", "C新增累计Token（不含共享开发与独立评估）", False),
                                     ("cumulative_wall_seconds", "C新增累计运行秒数（含人工等待）", False)):
         html.append(_chart(iteration_rows, column, label, bounded))
-    html += ['<h2>每道题的四项指标</h2>',
+    html += ['<h2>每道题的七项指标</h2>',
              _table(item_rows, [("method", "方法"), ("round", "轮次"), ("item_id", "题号"), ("item_version", "版本"),
                                 ("citc", "CITC"), ("target_rho", "目标ρ"), ("same_domain_vts", "同域VTS"),
-                                ("cross_domain_vts", "跨域VTS"), ("qualified", "四门槛通过"), ("failed_gates", "未通过门槛")]),
+                                ("cross_domain_vts", "跨域VTS"), ("target_hedges_g", "单题Hedges'g"),
+                                ("target_ipip_spearman_rho", "单题IPIP rho_s"), ("discriminant_delta_min", "单题Δmin"),
+                                ("qualified", "七项门槛通过"), ("failed_gates", "未通过门槛")]),
              '<p>各轮evaluation/item_metrics.csv包含阈值、可估计状态与非目标相关；option_statistics.csv记录选项人数及比例。</p>',
-             '<details><summary>指标口径与含义</summary><p>CITC：目标条件中单题分数与同facet其余题总分的Pearson相关；单题目标ρ和VTS仍按原单题规则计算。</p>',
+             '<details><summary>指标口径与含义</summary><p>CITC：目标条件中单题分数与同facet其余题总分的Pearson相关；单题目标ρ、VTS及新增的IPIP Hedges\' g、目标IPIP Spearman rho和Δmin共同构成七项单题门槛。</p>',
              '<p>整卷Cronbach α用于内部一致性门槛；ICC衡量同一虚拟人格重复施测时的整卷总分一致性。目标IPIP相关是聚合效度；Δmin=目标IPIP相关−四个非目标IPIP相关绝对值中的最大值，用于区分效度保护；目标Hedges’ g是IPIP目标facet高低组的已知组效度效应量。</p>',
              '<p>新流程要求α≥0.80、ICC≥0.80；组卷主要提高目标Hedges’ g，且目标IPIP相关最多下降0.02、Δmin不得下降。旧版虚拟综合指标仅保留在历史数据中，不参与新流程选卷。</p></details>',
              '<h2>方法端到端开发成本</h2><p>B/C分别计入共享题库及理论组卷成本；真实账单应求和下方阶段表，不能将B/C端到端费用相加。</p>',

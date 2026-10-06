@@ -19,6 +19,8 @@ from sjt_system.delivery.lifecycle import (
     psychometric_results_are_current,
 )
 from sjt_system.runtime.trace import utc_timestamp
+from sjt_system.evaluation.virtual_content_review import MAX_MEASUREMENTS, PROTOCOL, is_enabled
+from sjt_system.workflow.replacement_policy import replacement_quota_limit
 from sjt_system.state import PSJTState
 
 
@@ -30,7 +32,7 @@ def _fixed_blueprint_gap_failure(
     """Stop only when a valid automatic same-cell replenishment is impossible."""
 
     message = (
-        f"{reason}。系统已达到同槽位自动补题上限，不能降低单题质量门槛"
+        f"{reason}。系统不能降低单题质量门槛"
         "或把未通过题目伪装成合格题。"
     )
     return {
@@ -75,6 +77,8 @@ def _prepare_automatic_blueprint_gap_replenishment(
     """
 
     if not retention_gaps:
+        return None
+    if is_enabled(state):
         return None
     blueprint = deepcopy(state.get("blueprint") or {})
     cells = blueprint.get("cells") or []
@@ -125,8 +129,8 @@ def _prepare_automatic_blueprint_gap_replenishment(
         ),
         default=0,
     ) + 1
-    max_replacements = int(state.get("max_item_replacement_attempts") or 2)
-    if gap_number > max_replacements:
+    replacement_limit = replacement_quota_limit(state)
+    if replacement_limit is not None and gap_number > replacement_limit:
         return None
     specification_id = f"{prefix}{gap_number}"
     if specification_id in existing_ids:
@@ -294,10 +298,12 @@ def _has_batchable_psychometric_repairs(state: Mapping[str, Any]) -> bool:
         if not isinstance(entry, Mapping):
             continue
         advice = entry.get("atomic_repair_advice")
+        if is_enabled(state) and isinstance(advice, Mapping) and advice.get("protocol") == PROTOCOL and advice.get("decision") == "investigate":
+            return True
         if (
             isinstance(advice, Mapping)
             and advice.get("decision") == "repair"
-            and advice.get("repair_tasks")
+            and (advice.get("protocol") == "scenario_detection_first_v1" or advice.get("repair_tasks"))
         ):
             return True
     return False
@@ -418,35 +424,30 @@ def _blueprint_review_allows_item_generation(state: Mapping[str, Any]) -> bool:
 
 async def router_node(state: PSJTState) -> dict:
     """读取 State 并选择下一项任务。"""
-    started_at = perf_counter()
-    if state["step_count"] >= state["max_steps"]:
-        message = "测试达到最大执行步数，流程已停止"
+    from sjt_system.evaluation.facet_iteration import is_enabled as fixed_iteration_enabled
+    if fixed_iteration_enabled(state) and state["facet_iteration_state"].get("status") == "paused":
         return {
-            "status": "failed",
-            "errors": [
-                *state["errors"],
-                {
-                    "action": None,
-                    "message": message,
-                },
-            ],
-            "execution_history": [
-                *state["execution_history"],
-                {
-                    "event_id": f'{state["run_id"]}:{state["step_count"]}:router:failed',
-                    "run_id": state["run_id"],
-                    "step": state["step_count"],
-                    "node": "router",
-                    "action": "stop",
-                    "event_type": "failed",
-                    "reason": message,
-                    "recorded_at": utc_timestamp(),
-                    "duration_ms": round((perf_counter() - started_at) * 1000),
-                    "error": message,
-                },
-            ],
+            "status": "stopped",
+            "route": {"next_action": "finish", "reason": state["facet_iteration_state"]["paused_reason"]},
         }
-
+    virtual_review = is_enabled(state)
+    if not virtual_review and (state.get("repair_knowledge_config") or {}).get("mode") not in {"shared", "run_only"}:
+        return {"route": {"next_action": "clarify_requirements", "reason": "先选择返修知识复用范围"}}
+    if state.get("scenario_repair_pause"):
+        return {"route": {"next_action": "psychometric_repair_batch", "reason": "情境检测暂停，自动恢复或升级设计后继续"}}
+    from sjt_system.evaluation.repair_knowledge import needs_review_knowledge
+    if not virtual_review and needs_review_knowledge(state):
+        return {"route": {"next_action": "select_items", "reason": "完整审题后先归纳机制知识并冻结快照"}}
+    legacy_repair = _next_psychometric_repair(state)
+    if (legacy_repair is not None
+            and (legacy_repair.get("atomic_repair_advice") or {}).get("protocol") not in {"scenario_detection_first_v1", PROTOCOL}
+            and legacy_repair.get("diagnosis_status") != "repair_rounds_exhausted"):
+        return {
+            "route": {"next_action": "select_items", "reason": "未执行的旧返修建议按情境检测协议重新规划"},
+            "psychometric_repair_confirmation": None,
+            "active_psychometric_repair": None,
+        }
+    started_at = perf_counter()
     psychometrics_complete_before_route = psychometric_results_are_current(
         state
     )
@@ -455,12 +456,23 @@ async def router_node(state: PSJTState) -> dict:
         if isinstance(state.get("selection_results"), Mapping)
         else None
     )
+    if virtual_review and selection_status in {"virtual_review_complete", "awaiting_sme_review", "awaiting_plateau_gap", "fixed_blueprint_gap"}:
+        return {
+            "status": "stopped",
+            "route": {"next_action": "finish", "reason": "虚拟内容复审已收束；保留未达标题和蓝图缺口，不进入真人审查或追加预算。"},
+            "virtual_content_review_stop_reason": state.get("virtual_content_review_stop_reason") or "unresolved_blueprint_gap",
+        }
     test_review_before_route = state.get("test_review_result")
     test_review_decision_before_route = (
         test_review_before_route.get("decision")
         if isinstance(test_review_before_route, Mapping)
         else None
     )
+    if virtual_review and test_review_decision_before_route in {"RESCORE", "SUPPLEMENT"}:
+        return {
+            "status": "stopped", "virtual_content_review_stop_reason": "frozen_design_or_coverage_error",
+            "route": {"next_action": "finish", "reason": "交付结构检查未通过；保留评分键及固定蓝图，不自动重计分或补题。"},
+        }
     final_outputs_exist = (
         isinstance(state.get("final_test"), Mapping)
         and bool(state.get("item_database_ref"))
@@ -543,6 +555,14 @@ async def router_node(state: PSJTState) -> dict:
             "target_item_id": None,
             "target_blueprint_cell_id": None,
         }
+    elif virtual_review and pending_psychometric_repair is not None:
+        if (pending_psychometric_repair.get("atomic_repair_advice") or {}).get("protocol") != PROTOCOL:
+            raise ValueError("新协议不能静默执行旧返修意见；应从当前测量重新建立证据队列")
+        raw_decision = {
+            "next_action": "psychometric_repair_batch",
+            "reason": "当轮指标已保存，仅对未达标且未锁定题目执行虚拟审题、访谈和证据支持的返修",
+            "target_item_id": None, "target_blueprint_cell_id": None,
+        }
     elif (
         isinstance(state.get("active_psychometric_repair"), Mapping)
         and state["active_psychometric_repair"].get("manual_edit_pending_review")
@@ -584,7 +604,7 @@ async def router_node(state: PSJTState) -> dict:
                 else "revise_item"
             ),
             "reason": (
-                "当前批次诊断已确认，启动并发单题修改—复测闭环"
+                "当前批次已确认，启动情境检测与候选暂存，全部就绪后统一施测"
                 if _has_batchable_psychometric_repairs(state)
                 else "用户已确认当前单题诊断，进入原子修改"
             ),
@@ -1038,6 +1058,11 @@ async def router_node(state: PSJTState) -> dict:
                         "target_dimension_id": selected_cell["facet_id"],
                     }
                 route_update["current_item_specification"] = item_specification
+    if decision["next_action"] == "generate_item" and state.get("item_development_mode") == "automatic":
+        decision["next_action"] = "generate_items_batch"
+        decision["reason"] = "All pending fixed slots develop concurrently"
+        decision["target_item_id"] = None
+        decision["target_blueprint_cell_id"] = None
     if (
         decision["next_action"] == "simulate_responses"
         and selected_cell is None
@@ -1098,6 +1123,18 @@ async def router_node(state: PSJTState) -> dict:
                 "target_item_id": None,
                 "target_blueprint_cell_id": None,
             }
+    if (
+        virtual_review
+        and not fixed_iteration_enabled(state)
+        and decision["next_action"] == "simulate_responses"
+        and int(state.get("psychometric_analysis_round") or 0) >= MAX_MEASUREMENTS
+        and not state.get("deferred_replacement_measurement_pending")
+    ):
+        return {
+            "status": "stopped",
+            "virtual_content_review_stop_reason": "three_content_review_rounds_completed_without_deferred_items",
+            "route": {"next_action": "finish", "reason": "首测及三轮虚拟内容复审已完成，且当前没有待测同槽位替代题"},
+        }
     is_finished = decision["next_action"] == "finish"
     if is_finished:
         route_update["current_phase"] = "completed"

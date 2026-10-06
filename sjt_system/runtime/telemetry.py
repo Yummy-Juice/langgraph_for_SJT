@@ -233,7 +233,13 @@ def read_ledger(
     if path is None:
         path = ledger_path()
     records: list[dict[str, Any]] = []
-    with Path(path).open("r", encoding="utf-8") as handle:
+    try:
+        handle = Path(path).open("r", encoding="utf-8")
+    except FileNotFoundError:
+        # Telemetry is observation-only; a run without completed callbacks must
+        # still be analyzable even when no per-session ledger was created.
+        return records
+    with handle:
         for line in handle:
             if not line.strip():
                 continue

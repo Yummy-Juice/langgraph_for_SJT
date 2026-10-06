@@ -22,10 +22,11 @@ from sjt_system.evaluation.respondents import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_SELECTION_SEED,
     MAX_VIRTUAL_SAMPLE_SIZE,
-    MAX_ALLOWED_CONCURRENCY,
+    MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
     MAXIMUM_SCORE_TIER_COUNT,
     PERSONA_MODE_SCORE_PROFILE,
     build_score_dimension_catalog,
+    build_automatic_matched_conditions,
     build_matched_condition_sample_config,
     build_virtual_sample_recommendations,
     generate_matched_condition_respondent_refs,
@@ -33,6 +34,7 @@ from sjt_system.evaluation.respondents import (
     MATCHED_CONDITION_IDS,
     matched_condition_sample_is_current,
 )
+from sjt_system.runtime.concurrency import validate_max_concurrency
 from sjt_system.evaluation.round_results import (
     build_psychometric_round_result,
 )
@@ -63,6 +65,10 @@ def approval_node(state: PSJTState) -> dict:
     is_requirement_action = (
         state.get("pending_action") == "clarify_requirements"
     )
+    from sjt_system.evaluation.virtual_content_review import is_enabled
+    virtual_item_action = is_enabled(state) and state.get("pending_action") in {
+        "generate_item", "generate_items_batch", "revise_item", "regenerate_item", "review_item", "psychometric_repair_batch",
+    }
     requirement_errors = (
         validate_requirement_confirmation(
             pending_update.get("test_specification"),
@@ -109,7 +115,7 @@ def approval_node(state: PSJTState) -> dict:
         "available_decisions": (
             requirement_decisions
             if is_requirement_action
-            else ["approve", "edit", "regenerate", "stop"]
+            else ["approve", "stop"] if virtual_item_action else ["approve", "edit", "regenerate", "stop"]
         ),
     }
     if is_requirement_action:
@@ -120,6 +126,8 @@ def approval_node(state: PSJTState) -> dict:
         raw_decision = interrupt(payload)
         try:
             decision = normalize_user_decision(raw_decision, pending_update)
+            if virtual_item_action and decision["decision"] not in {"approve", "stop"}:
+                raise ValueError("虚拟开发协议不接收真人改题或真人审题证据")
             if is_requirement_action:
                 if decision["decision"] not in {
                     "answer",
@@ -225,7 +233,7 @@ def item_development_mode_selection_node(state: PSJTState) -> dict:
             ),
         }
 
-    return {
+    update = {
         "item_development_mode": mode,
         "execution_history": [
             *state["execution_history"],
@@ -249,6 +257,20 @@ def item_development_mode_selection_node(state: PSJTState) -> dict:
             },
         ],
     }
+    current_route = state.get("route")
+    if (
+        mode == "automatic"
+        and isinstance(current_route, Mapping)
+        and current_route.get("next_action") == "generate_item"
+    ):
+        update["route"] = {
+            **dict(current_route),
+            "next_action": "generate_items_batch",
+            "reason": "Automatic development fans out all pending fixed slots",
+            "target_item_id": None,
+            "target_blueprint_cell_id": None,
+        }
+    return update
 
 
 def virtual_sample_selection_node(state: PSJTState) -> dict:
@@ -256,9 +278,6 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
 
     current_config = state.get("virtual_sample_config")
     current_respondents = state.get("virtual_respondents") or []
-    if matched_condition_sample_is_current(current_config, current_respondents):
-        return {}
-
     source_items = state.get("frozen_item_bank") or state.get("item_pool") or []
     target_dimension_ids = list(
         dict.fromkeys(
@@ -269,11 +288,77 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
     )
     if not target_dimension_ids:
         raise ValueError("配置分数型虚拟被试前缺少题目目标维度")
+    desired_generation_round = int(state.get("psychometric_analysis_round") or 0) + 1
+    saved_target_ids = (
+        set(str(value) for value in current_config.get("target_dimension_ids") or [])
+        if isinstance(current_config, Mapping)
+        else set()
+    )
+    setup_matches_current_items = (
+        matched_condition_sample_is_current(current_config, current_respondents)
+        and saved_target_ids == set(target_dimension_ids)
+    )
+    from sjt_system.evaluation.facet_iteration import is_enabled as fixed_iteration_enabled
+    if fixed_iteration_enabled(state) and state["facet_iteration_state"].get("completed_rounds"):
+        if not setup_matches_current_items or not current_respondents or not state.get("frozen_reference_questionnaire_ref"):
+            raise ValueError("The first-round cohort or frozen IPIP reference is missing; resampling is forbidden")
+    if setup_matches_current_items and int(
+        current_config.get("generation_round") or 0
+    ) >= desired_generation_round:
+        return {}
+
+    # The criterion battery is a first-administration measurement.  Keep the
+    # approved target cohort stable in later SJT repair rounds so the frozen
+    # criterion records remain keyed to the same respondents.
+    frozen_reference_ref = (
+        state.get("frozen_reference_questionnaire_ref")
+        or state.get("previous_virtual_response_data_ref")
+        or state.get("virtual_response_data_ref")
+    )
+    if (
+        isinstance(frozen_reference_ref, str)
+        and frozen_reference_ref
+        and setup_matches_current_items
+        and current_respondents
+        and isinstance(current_config, Mapping)
+    ):
+        frozen_config = deepcopy(dict(current_config))
+        frozen_config["generation_round"] = desired_generation_round
+        frozen_config["reference_questionnaire_freeze_policy"] = (
+            "freeze_after_first_measurement"
+        )
+        frozen_config["frozen_reference_generation_round"] = 1
+        frozen_config["frozen_reference_questionnaire_ref"] = (
+            frozen_reference_ref
+        )
+        return {
+            "virtual_sample_config": frozen_config,
+            "virtual_sample_reconfiguration_reason": None,
+            "virtual_respondents": deepcopy(current_respondents),
+            "execution_history": [
+                *state["execution_history"],
+                {
+                    "event_id": (
+                        f'{state["run_id"]}:{state["step_count"]}:'
+                        "virtual_sample_selection:frozen_reference_cohort"
+                    ),
+                    "run_id": state["run_id"],
+                    "step": state["step_count"],
+                    "node": "virtual_sample_selection",
+                    "action": "reuse_frozen_reference_cohort",
+                    "event_type": "completed",
+                    "recorded_at": utc_timestamp(),
+                    "reason": (
+                        "沿用首轮校标组卷的 target 被试及其人口学/分数配置；"
+                        "后续只施测已提交的新版本及其重测；未改题作答与校标结果复用冻结来源。"
+                    ),
+                    "reference_manifest": frozen_reference_ref,
+                },
+            ],
+        }
+
     dimension_catalog = build_score_dimension_catalog(
         construct_selection_catalog()
-    )
-    recommendations = build_virtual_sample_recommendations(
-        MAX_VIRTUAL_SAMPLE_SIZE
     )
     target_set = set(target_dimension_ids)
     display_catalog = [
@@ -281,6 +366,14 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
         for row in dimension_catalog
         if row.get("level") == "facet"
     ]
+    minimum_sample_size = max(
+        MINIMUM_AUTOMATIC_SELECTION_SAMPLE_SIZE,
+        len(display_catalog) + 2,
+    )
+    recommendations = build_virtual_sample_recommendations(
+        MAX_VIRTUAL_SAMPLE_SIZE,
+        minimum_sample_size=minimum_sample_size,
+    )
     payload = {
         "type": "virtual_sample_selection",
         "pool": {
@@ -288,18 +381,26 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
             "source": "deterministic_score_profile_generation",
         },
         "recommendations": recommendations,
-        "recommended_sample_size": next(
-            option["sample_size"]
-            for option in recommendations
-            if option["recommended"]
+        "recommended_sample_size": max(
+            minimum_sample_size,
+            next(
+                option["sample_size"]
+                for option in recommendations
+                if option["recommended"]
+            ),
         ),
+        "minimum_sample_size": minimum_sample_size,
         "default_seed": DEFAULT_SELECTION_SEED,
-        "default_max_concurrency": DEFAULT_MAX_CONCURRENCY,
-        "max_allowed_concurrency": MAX_ALLOWED_CONCURRENCY,
+        "concurrency_policy": "all_at_once",
         "default_max_retries": DEFAULT_MAX_RETRIES,
         "sampling_design": "matched_facet_conditions",
         "default_score_mean": 50.0,
         "default_score_sd": 15.0,
+        "shared_score_distribution": {
+            "family": "normal",
+            "mean": 50.0,
+            "sd": 15.0,
+        },
         "score_scale": [0.0, 100.0],
         "target_dimension_ids": target_dimension_ids,
         "dimension_catalog": display_catalog,
@@ -309,23 +410,48 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
                 if state.get("virtual_sample_reconfiguration_reason")
                 else ""
             )
-            + "固定三个顶层臂：target、same_domain、cross_domain；每个非目标臂可配置多个facet group。"
-            "每个facet group独立生成一组匹配条件并共享同一正态分数向量，只在提示中提供当前group facet。"
-            "每组人数相同，主施测中每名被试对每题只回答一次；target组额外完成一次整卷重测以估计虚拟作答稳定性。"
-            "VTS在同域/跨域臂内取最大带符号rho；target被试同步完成目标facet对应的10题IPIP-NEO参照问卷。"
+            + "固定三个顶层臂：target、same_domain、cross_domain；每名虚拟被试同时携带全部30个facet分数。"
+            "所有facet只设置一次共同的正态分布均值和SD；每个facet使用独立分数向量，避免输入维度产生错误相关。"
+            "每个目标 facet 都自动包含其同维度另外5个 facet 和跨维度另外24个 facet，统计按目标 facet 分开计算。"
+            "样本量指完整 facet 被试数；主施测中每名被试一次性回答本轮全部候选题，target组额外完成一次整卷重测以估计虚拟作答稳定性。"
+            "VTS在同域/跨域臂内取最大带符号rho；target被试首轮同步完成出题阶段选定的每个facet对应的10题IPIP-NEO参照问卷，并在一次调用中完成全部所选题目，后续轮次沿用首轮冻结结果。"
         ),
     }
 
+    approved_selection = None
+    approval_source = "user"
+    if setup_matches_current_items:
+        score_distribution = (
+            current_config.get("shared_facet_score_distribution")
+            or current_config.get("score_distribution")
+            or {}
+        )
+        approved_selection = {
+            "sample_size_per_condition": current_config.get(
+                "sample_size_per_condition"
+            ),
+            "seed": current_config.get("seed", DEFAULT_SELECTION_SEED),
+            "max_concurrency": current_config.get(
+                "max_concurrency",
+                DEFAULT_MAX_CONCURRENCY,
+            ),
+            "max_retries": current_config.get("max_retries", DEFAULT_MAX_RETRIES),
+            "score_distribution": deepcopy(dict(score_distribution)),
+        }
+        approval_source = "reused_user_approved_setup"
+
     while True:
-        raw_selection = interrupt(payload)
+        raw_selection = (
+            approved_selection
+            if approved_selection is not None
+            else interrupt(payload)
+        )
         try:
             if not isinstance(raw_selection, Mapping):
                 raise ValueError("虚拟样本选择必须是对象")
             sample_size = raw_selection.get("sample_size_per_condition")
             seed = raw_selection.get("seed", DEFAULT_SELECTION_SEED)
-            score_distribution = raw_selection.get("score_distribution") or {}
-            mean_score = score_distribution.get("mean", 50.0)
-            standard_deviation = score_distribution.get("sd", 15.0)
+            generation_round = desired_generation_round
             max_concurrency = raw_selection.get(
                 "max_concurrency",
                 DEFAULT_MAX_CONCURRENCY,
@@ -334,9 +460,15 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
                 "max_retries",
                 DEFAULT_MAX_RETRIES,
             )
-            raw_conditions = raw_selection.get("conditions")
             if isinstance(sample_size, str) and sample_size.isdigit():
                 sample_size = int(sample_size)
+            if (
+                not isinstance(sample_size, int)
+                or sample_size < minimum_sample_size
+            ):
+                raise ValueError(
+                    f"完整 facet 独立性约束要求本轮人数至少为 {minimum_sample_size}"
+                )
             if isinstance(seed, str) and seed.lstrip("-").isdigit():
                 seed = int(seed)
             if (
@@ -344,35 +476,68 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
                 and max_concurrency.isdigit()
             ):
                 max_concurrency = int(max_concurrency)
+            validate_max_concurrency(max_concurrency)
+            max_concurrency = 0
             if isinstance(max_retries, str) and max_retries.isdigit():
                 max_retries = int(max_retries)
-            if not isinstance(target_dimension_ids, list) or len(target_dimension_ids) != 1:
-                raise ValueError("当前三臂协议要求本轮题库只包含一个目标 facet")
+            # The item bank is the sole source of target facets.  Each target
+            # facet receives its own same/cross comparison groups; no manual
+            # target-facet selection is needed or accepted for this protocol.
+            ordered_target_ids = list(target_dimension_ids)
+            score_distribution = raw_selection.get("score_distribution")
+            if not isinstance(score_distribution, Mapping):
+                score_distribution = {
+                    "family": "normal",
+                    "mean": raw_selection.get("mean_score", 50.0),
+                    "sd": raw_selection.get("standard_deviation", 15.0),
+                }
+            try:
+                shared_mean = float(score_distribution.get("mean", 50.0))
+                shared_sd = float(score_distribution.get("sd", 15.0))
+            except (TypeError, ValueError) as exc:
+                raise ValueError("共同 facet 分布必须提供数值 mean/sd") from exc
+            conditions = build_automatic_matched_conditions(
+                dimension_catalog,
+                target_dimension_id=ordered_target_ids,
+                mean_score=shared_mean,
+                standard_deviation=shared_sd,
+            )
             conditions = normalize_matched_conditions(
-                raw_conditions,
+                conditions,
                 dimension_catalog=dimension_catalog,
-                target_dimension_id=target_dimension_ids[0],
+                target_dimension_id=ordered_target_ids,
+                shared_score_distribution=score_distribution,
             )
             selected, generation_diagnostics = generate_matched_condition_respondent_refs(
                 sample_size,
                 conditions,
-                mean_score=float(mean_score),
-                standard_deviation=float(standard_deviation),
+                generation_round=generation_round,
                 seed=seed,
             )
             config = build_matched_condition_sample_config(
                 sample_size,
                 conditions=conditions,
                 generation_diagnostics=generation_diagnostics,
-                mean_score=float(mean_score),
-                standard_deviation=float(standard_deviation),
+                mean_score=shared_mean,
+                standard_deviation=shared_sd,
+                generation_round=generation_round,
                 seed=seed,
                 max_concurrency=max_concurrency,
                 max_retries=max_retries,
             )
+            if setup_matches_current_items and isinstance(current_config, Mapping):
+                for field in (
+                    "model_id",
+                    "ipip_neo_reference_enabled",
+                    "ipip_neo_in_main_iteration",
+                ):
+                    if field in current_config:
+                        config[field] = deepcopy(current_config[field])
             break
         except (TypeError, ValueError) as exc:
             payload = {**payload, "validation_error": str(exc)}
+            approved_selection = None
+            approval_source = "user"
 
     return {
         "virtual_sample_config": config,
@@ -392,11 +557,11 @@ def virtual_sample_selection_node(state: PSJTState) -> dict:
                 "event_type": "completed",
                 "recorded_at": utc_timestamp(),
                 "reason": (
-                    f"用户配置固定三臂、{config.get('group_count')} 个匹配 facet group，每组 {sample_size} 名被试；"
-                    f"均值 {float(mean_score):g}、SD {float(standard_deviation):g}、随机种子 {seed}"
-                    f"；最大并发 {max_concurrency}"
+                    f"按 {len(ordered_target_ids)} 个目标 facet 生成完整 facet 分数档案（元数据含 {config.get('group_count')} 个比较 group），共 {sample_size} 名被试；每名被试主施测只调用一次并回答全部题目；"
+                    f"所有facet共享均值 {shared_mean:g}/SD {shared_sd:g}，生成批次 {generation_round}、随机种子 {seed}"
+                    "；模型请求全量并发"
                 ),
-                "approval_source": "user",
+                "approval_source": approval_source,
             },
         ],
     }
@@ -553,6 +718,38 @@ def _dequeue_psychometric_item(state: Mapping[str, Any], item_id: str) -> dict[s
     }
 
 
+def repair_knowledge_selection_node(state: PSJTState) -> dict:
+    from sjt_system.evaluation.repair_knowledge import config_for_mode
+    selected = (state.get("repair_knowledge_config") or {}).get("mode")
+    payload = {"type": "repair_knowledge_selection", "available_modes": ["shared", "run_only"]}
+    while selected not in payload["available_modes"]:
+        response = interrupt(payload)
+        selected = response.get("mode") if isinstance(response, Mapping) else None
+        if selected not in payload["available_modes"]:
+            payload["validation_error"] = "请选择共享历史知识或仅本任务积累。"
+    return {"repair_knowledge_config": config_for_mode(state, selected)}
+
+
+def scenario_repair_pause_node(state: PSJTState) -> dict:
+    """Migrate a legacy pause once; exhausted automatic recovery saves and exits."""
+    pause = state.get("scenario_repair_pause") or {}
+    from sjt_system.evaluation.virtual_content_review import is_enabled
+    if is_enabled(state):
+        return {"status": "stopped"}
+    from sjt_system.evaluation.scenario_detection import PROTOCOL
+    pending = {row.get("item_id") for row in
+               [*(state.get("items_to_revise") or []), *(state.get("items_to_regenerate") or [])]
+               if isinstance(row, Mapping)}
+    legacy_detection = any(key in pending and isinstance(row, Mapping) and row.get("protocol") == PROTOCOL
+                           and row.get("detection_protocol") is None
+                           for key, row in (state.get("scenario_repair_progress") or {}).items())
+    if pause.get("detection_protocol") is None and not pause.get("knowledge_pending") and legacy_detection:
+        return {"scenario_repair_pause": None, "status": "running"}
+    if pause.get("recovery_version") != 2:
+        return {"scenario_repair_pause": None, "status": "running"}
+    return {"status": "stopped"}
+
+
 def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
     """Apply a psychometric repair or automatically replenish an exhausted item.
 
@@ -566,8 +763,21 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
     if not isinstance(pending, Mapping) or pending.get("status") != "pending":
         raise ValueError("当前没有等待确认的单题心理测量返修建议")
     advice = pending.get("atomic_repair_advice") or {}
+    from sjt_system.evaluation.virtual_content_review import is_enabled
+    if is_enabled(state):
+        return {"psychometric_repair_confirmation": None, "selection_results": None}
     evidence = pending.get("diagnosis_evidence") or {}
     item = evidence.get("current_item") or {}
+    if advice.get("protocol") == "scenario_detection_first_v1":
+        return {
+            "psychometric_repair_confirmation": {
+                **deepcopy(dict(pending)), "status": "approved",
+                "decision": "approve", "approval_source": "system_default",
+            },
+        }
+    if pending.get("diagnosis_status") != "repair_rounds_exhausted":
+        # Unexecuted legacy advice, including defer, must be replanned.
+        return {"psychometric_repair_confirmation": None, "selection_results": None}
     if advice.get("decision") == "repair":
         # Repair diagnoses are already user-visible in the round result. The
         # default action is now to apply the complete validated task set; do
@@ -671,29 +881,17 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
             ]
         ),
         "instruction": (
-            "repair：确认后按原子任务自动返修；defer：人工修改、保留待SME审核、"
-            "淘汰补题或暂停保存。每道 defer 题必须单独处置。"
+            "repair：确认后按原子任务自动返修；defer：删除当前题并在同一蓝图槽位"
+            "自动生成替代题，替代题进入下一轮测量。"
         ),
     }
 
     automatic_replenish = advice.get("decision") == "defer"
 
     def _has_replacement_capacity() -> bool:
-        lineage = state.get("item_lineage") or {}
-        root_id = str(
-            (lineage.get(str(item.get("item_id"))) or {}).get("root_item_id")
-            or item.get("item_id")
-        )
-        replacement_count = sum(
-            1
-            for value in lineage.values()
-            if isinstance(value, Mapping)
-            and value.get("root_item_id") == root_id
-            and isinstance(value.get("replacement_number"), int)
-        )
-        return replacement_count < int(
-            state.get("max_item_replacement_attempts") or 2
-        )
+        from sjt_system.workflow.replacement_policy import replacement_capacity_available
+
+        return replacement_capacity_available(state, str(item.get("item_id") or ""))
 
     edited_item = None
     if automatic_replenish:
@@ -704,8 +902,7 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
             message = (
                 f"题目 {item_id} 的 defer 诊断已自动转为补题，"
                 f"已完成 {pending.get('completed_repair_rounds', 0)} 轮返修，"
-                "且同一蓝图槽位已达到自动补题上限；"
-                "系统无法在不降低质量门槛的前提下完成该槽位。"
+                "但替代题未能在不降低质量门槛的前提下完成该槽位。"
             )
             return {
                 "status": "failed",
@@ -757,7 +954,7 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
                 payload = {
                     **payload,
                     "validation_error": (
-                        "该蓝图槽位已达到补题次数上限，请选择人工修改或待SME审核"
+                        "该蓝图槽位的替代题尚未通过安全校验，请选择人工修改或待SME审核"
                     ),
                 }
                 continue
@@ -908,7 +1105,6 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
     replacement_cell = None
     for cell in blueprint.get("cells") or []:
         if isinstance(cell, dict) and cell.get("cell_id") == cell_id:
-            cell["planned_generation_count"] = int(cell.get("planned_generation_count") or 0) + 1
             replacement_cell = deepcopy(cell)
             break
     else:
@@ -919,18 +1115,24 @@ def psychometric_repair_confirmation_node(state: PSJTState) -> dict:
     )
     if source_spec is None:
         raise ValueError("淘汰补题找不到原题目规格")
-    blueprint.setdefault("slots", []).append(
-        {
-            "specification_id": replacement_id,
-            "blueprint_cell_id": cell_id,
-            "candidate_reference": {
-                "mechanism_id": source_spec.get("mechanism_id")
-                or replacement_cell.get("mechanism_id"),
-                "situation_id": source_spec.get("situation_id")
-                or replacement_cell.get("situation_id"),
-            },
-        }
-    )
+    replacement_slot = {
+        "specification_id": replacement_id,
+        "blueprint_cell_id": cell_id,
+        "candidate_reference": {
+            "mechanism_id": source_spec.get("mechanism_id")
+            or replacement_cell.get("mechanism_id"),
+            "situation_id": source_spec.get("situation_id")
+            or replacement_cell.get("situation_id"),
+        },
+    }
+    slot_replaced = False
+    for index, slot in enumerate(blueprint.get("slots") or []):
+        if isinstance(slot, Mapping) and str(slot.get("specification_id")) == item_id:
+            blueprint["slots"][index] = replacement_slot
+            slot_replaced = True
+            break
+    if not slot_replaced:
+        raise ValueError("淘汰补题找不到原题蓝图槽位")
     source_skeleton = (state.get("item_skeletons") or {}).get(item_id)
     source_skeleton_review = (state.get("skeleton_reviews") or {}).get(item_id)
     if not isinstance(source_skeleton, Mapping):
@@ -1191,6 +1393,7 @@ def automatic_approval_node(state: PSJTState) -> dict:
     if (
         not is_automatic_item_action
         and not is_automatic_deterministic_action
+        and action != "psychometric_repair_batch"
     ):
         raise ValueError(
             "自动审批仅适用于自动模式下的闭环动作"

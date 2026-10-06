@@ -1,14 +1,14 @@
 """Whole-test metrics for provisional iteration forms.
 
-The item-level screening gates remain the authority for repairing individual
-items.  This module evaluates the provisional form assembled at each
-development round so the workflow can show whether the complete test is
-improving, even while some items are still under treatment.
+This module recomputes facet-form metrics from the merged per-item records.
+The fixed-cohort controller uses these metrics alongside item gates to decide
+which facets need evidence-supported local investigation.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -20,15 +20,15 @@ from scipy import stats
 
 
 PLATEAU_DEFAULT_PATIENCE = 2
-PLATEAU_DEFAULT_MIN_DELTA = 0.01
+PLATEAU_DEFAULT_MIN_DELTA = 0.0
 TARGET_RECOVERY_DEFAULT_FOLDS = 5
 TARGET_RECOVERY_RIDGE_PENALTY = 1.0
 FORM_EFFECT_EXTREME_FRACTION = 1.0 / 3.0
-VIRTUAL_FORM_ICC_DEFAULT_MINIMUM = 0.80
-FORM_ALPHA_DEFAULT_MINIMUM = 0.80
-FORM_CONVERGENT_NONINFERIORITY_TOLERANCE = 0.02
+VIRTUAL_FORM_ICC_DEFAULT_MINIMUM = 0.70
+FORM_ALPHA_DEFAULT_MINIMUM = 0.70
+FORM_CONVERGENT_NONINFERIORITY_TOLERANCE = 0.0
 FORM_QUALITY_EPSILON = 1e-12
-CURRENT_FORM_METRIC_FRAMEWORK = "virtual_form_response_transmission_v3"
+CURRENT_FORM_METRIC_FRAMEWORK = "virtual_form_response_transmission_v4"
 
 
 def _number(value: Any) -> float | None:
@@ -702,19 +702,25 @@ def whole_form_objective_improves(
     min_delta: float = PLATEAU_DEFAULT_MIN_DELTA,
     convergent_tolerance: float = FORM_CONVERGENT_NONINFERIORITY_TOLERANCE,
 ) -> bool:
-    """Return whether a current v3 form can replace an eligible incumbent.
-
-    Target known-groups Hedges' g is the only improving objective.  The
-    convergent target correlation and the minimum discriminant gap are
-    non-inferiority protections, not additional scalarized objectives.
-    """
+    """Require every facet to pass reliability and all three strict improvements."""
 
     current = form_quality_summary(current_metrics or {})
     incumbent = form_quality_summary(incumbent_metrics or {})
+    if current.get("objective_source") == "ipip_facet_gates_v4":
+        if incumbent_metrics is None or incumbent.get("objective_source") != "ipip_facet_gates_v4":
+            return bool(current.get("eligible_for_best_so_far"))
+        comparisons = facet_form_gate_comparison(
+            current_metrics or {}, incumbent_metrics,
+            min_delta=min_delta, convergent_tolerance=convergent_tolerance,
+        )
+        return bool(current.get("status") == "complete" and comparisons
+                    and all(row["passed"] for row in comparisons))
     if not current.get("eligible_for_best_so_far"):
         return False
     if not incumbent.get("eligible_for_best_so_far"):
         return True
+    if current.get("objective_source") != incumbent.get("objective_source"):
+        return False
     current_g = _number(current.get("objective_primary"))
     incumbent_g = _number(incumbent.get("objective_primary"))
     current_delta = _number(current.get("objective_secondary"))
@@ -733,11 +739,59 @@ def whole_form_objective_improves(
         )
     ):
         return False
-    if current_g <= incumbent_g + float(min_delta):
+    if current_g <= incumbent_g + FORM_QUALITY_EPSILON:
         return False
-    if current_delta < incumbent_delta - FORM_QUALITY_EPSILON:
+    if current_delta <= incumbent_delta + FORM_QUALITY_EPSILON:
         return False
-    return current_rho >= incumbent_rho - float(convergent_tolerance)
+    return current_rho > incumbent_rho + FORM_QUALITY_EPSILON
+
+
+def facet_form_gate_comparison(
+    current_metrics: Mapping[str, Any],
+    incumbent_metrics: Mapping[str, Any],
+    *,
+    min_delta: float = PLATEAU_DEFAULT_MIN_DELTA,
+    convergent_tolerance: float = FORM_CONVERGENT_NONINFERIORITY_TOLERANCE,
+) -> list[dict[str, Any]]:
+    """Compare all three relative gates independently for every selected facet."""
+
+    current_rows = current_metrics.get("facet_metrics") or []
+    incumbent_rows = incumbent_metrics.get("facet_metrics") or []
+    if not isinstance(current_rows, list) or not isinstance(incumbent_rows, list):
+        return []
+    current = {
+        str(row.get("sjt_facet_id")): row
+        for row in current_rows if isinstance(row, Mapping) and row.get("sjt_facet_id")
+    }
+    incumbent = {
+        str(row.get("sjt_facet_id")): row
+        for row in incumbent_rows if isinstance(row, Mapping) and row.get("sjt_facet_id")
+    }
+    if not current or len(current) != len(current_rows) or set(current) != set(incumbent) or len(incumbent) != len(incumbent_rows):
+        return []
+    comparisons = []
+    for facet_id, row in current.items():
+        previous = incumbent[facet_id]
+        g, old_g = _number(row.get("target_hedges_g")), _number(previous.get("target_hedges_g"))
+        rho, old_rho = _number(row.get("target_spearman_rho")), _number(previous.get("target_spearman_rho"))
+        delta, old_delta = _number(row.get("discriminant_delta_min")), _number(previous.get("discriminant_delta_min"))
+        g_pass = g is not None and old_g is not None and g > old_g + FORM_QUALITY_EPSILON
+        rho_pass = rho is not None and old_rho is not None and rho > old_rho + FORM_QUALITY_EPSILON
+        delta_pass = delta is not None and old_delta is not None and delta > old_delta + FORM_QUALITY_EPSILON
+        alpha = _number(row.get("cronbach_alpha"))
+        icc = _number(row.get("virtual_test_retest_icc"))
+        alpha_pass = alpha is not None and alpha >= FORM_ALPHA_DEFAULT_MINIMUM
+        icc_pass = icc is not None and icc >= VIRTUAL_FORM_ICC_DEFAULT_MINIMUM
+        comparisons.append({
+            "sjt_facet_id": facet_id,
+            "alpha_gate": {"observed": alpha, "minimum": FORM_ALPHA_DEFAULT_MINIMUM, "passed": alpha_pass},
+            "stability_gate": {"observed": icc, "minimum": VIRTUAL_FORM_ICC_DEFAULT_MINIMUM, "passed": icc_pass},
+            "hedges_g_improvement_gate": {"observed": g, "incumbent": old_g, "min_delta": FORM_QUALITY_EPSILON, "passed": g_pass},
+            "target_rho_improvement_gate": {"observed": rho, "incumbent": old_rho, "min_delta": FORM_QUALITY_EPSILON, "passed": rho_pass},
+            "discriminant_delta_improvement_gate": {"observed": delta, "incumbent": old_delta, "min_delta": FORM_QUALITY_EPSILON, "passed": delta_pass},
+            "passed": bool(alpha_pass and icc_pass and g_pass and rho_pass and delta_pass),
+        })
+    return comparisons
 
 
 def form_quality_summary(
@@ -745,13 +799,10 @@ def form_quality_summary(
     *,
     stability_minimum: float = VIRTUAL_FORM_ICC_DEFAULT_MINIMUM,
 ) -> dict[str, Any]:
-    """Extract the current whole-form objective and its ICC gate.
+    """Extract five required metrics and reliability eligibility per facet.
 
-    Current v3 runs use target-facet known-groups Hedges' g as the primary
-    objective, with the minimum discriminant correlation gap and target-facet
-    Spearman rho as non-inferiority protections. Cronbach alpha and virtual
-    test-retest ICC are gates. Historical metric frameworks remain readable but
-    are not mixed into a v3 optimization trajectory.
+    Relative validity gates need a completed-round baseline and are evaluated
+    separately. Historical metric frameworks remain readable, not comparable.
     """
 
     if (
@@ -786,10 +837,74 @@ def form_quality_summary(
         form_metrics.get("metric_framework")
         == "virtual_form_response_transmission_v2"
     )
+    current_framework_v4 = form_metrics.get("metric_framework") == CURRENT_FORM_METRIC_FRAMEWORK
     current_framework_v3 = (
         form_metrics.get("metric_framework")
-        == CURRENT_FORM_METRIC_FRAMEWORK
+        == "virtual_form_response_transmission_v3"
     )
+
+    if current_framework_v4:
+        raw_rows = form_metrics.get("facet_metrics") or []
+        selected_ids = form_metrics.get("selected_facet_ids") or []
+        rows = []
+        if isinstance(raw_rows, list):
+            for raw in raw_rows:
+                if not isinstance(raw, Mapping):
+                    continue
+                alpha = _number(raw.get("cronbach_alpha"))
+                facet_icc = _number(raw.get("virtual_test_retest_icc"))
+                g = _number(raw.get("target_hedges_g"))
+                rho = _number(raw.get("target_spearman_rho"))
+                delta = _number(raw.get("discriminant_delta_min"))
+                complete = all(value is not None for value in (alpha, facet_icc, g, rho, delta))
+                alpha_pass = alpha is not None and alpha >= FORM_ALPHA_DEFAULT_MINIMUM
+                icc_pass = facet_icc is not None and facet_icc >= float(stability_minimum)
+                rows.append({
+                    "sjt_facet_id": raw.get("sjt_facet_id"), "item_count": raw.get("item_count"),
+                    "cronbach_alpha": alpha, "virtual_test_retest_icc": facet_icc,
+                    "target_hedges_g": g, "target_spearman_rho": rho,
+                    "discriminant_delta_min": delta,
+                    "status": "complete" if complete else "unavailable",
+                    "alpha_gate": {"minimum": FORM_ALPHA_DEFAULT_MINIMUM, "observed": alpha, "passed": alpha_pass},
+                    "stability_gate": {"minimum": float(stability_minimum), "observed": facet_icc, "passed": icc_pass},
+                    "relative_g_rho_delta_gates": "pending_baseline",
+                    "eligible_for_best_so_far": bool(complete and alpha_pass and icc_pass),
+                })
+        identifiers = [str(row.get("sjt_facet_id") or "") for row in rows]
+        all_facets_present = bool(
+            isinstance(selected_ids, list) and selected_ids
+            and len(identifiers) == len(selected_ids)
+            and len(set(identifiers)) == len(identifiers)
+            and set(identifiers) == {str(value) for value in selected_ids}
+        )
+        complete = bool(
+            form_metrics.get("status") == "complete"
+            and all_facets_present
+            and all(row["status"] == "complete" for row in rows)
+        )
+        eligible = complete and all(row["eligible_for_best_so_far"] for row in rows)
+        # Aggregate figures remain for older display consumers; no v4 gate uses them.
+        gs = [row["target_hedges_g"] for row in rows]
+        rhos = [row["target_spearman_rho"] for row in rows]
+        deltas = [row["discriminant_delta_min"] for row in rows]
+        return {
+            "status": "complete" if complete else "unavailable",
+            "objective_source": "ipip_facet_gates_v4",
+            "objective_primary": float(np.mean(gs)) if complete else None,
+            "objective_secondary": min(deltas) if complete else None,
+            "objective_tertiary": float(np.mean(rhos)) if complete else None,
+            "candidate_form_quality": float(np.mean(gs)) if complete else None,
+            "objective_primary_name": "diagnostic_mean_facet_hedges_g",
+            "objective_secondary_name": "diagnostic_min_facet_delta",
+            "objective_tertiary_name": "diagnostic_mean_facet_rho",
+            "facet_metrics": rows,
+            "alpha_gate": {"metric": "each_facet_cronbach_alpha", "minimum": FORM_ALPHA_DEFAULT_MINIMUM, "passed": bool(complete and all(row["alpha_gate"]["passed"] for row in rows))},
+            "stability_gate": {"metric": "each_facet_virtual_test_retest_icc", "minimum": float(stability_minimum), "passed": bool(complete and all(row["stability_gate"]["passed"] for row in rows))},
+            "eligible_for_best_so_far": bool(eligible),
+            "aggregation": "none_for_decisions; diagnostic_aggregates_only",
+            "formula": "各facet分别要求α和ICC≥.70；相对上一完成轮，各facet的g、rho、Δ分别严格上升，数值容差1e-12",
+            "interpretation": "全部facet各自满足五项指标的门槛；虚拟开发证据不等于真人信效度。",
+        }
 
     if current_framework_v3:
         discriminant = validity.get("discriminant_validity") or {}
@@ -972,6 +1087,165 @@ def form_quality_summary(
     }
 
 
+def _assess_facet_form_plateau(
+    history: Sequence[Mapping[str, Any]],
+    *,
+    patience: int,
+    min_delta: float,
+) -> dict[str, Any]:
+    """Keep an independent eligible incumbent and patience counter per facet."""
+
+    ordered = sorted(
+        (entry for entry in history if isinstance(entry, Mapping)),
+        key=lambda entry: int(entry.get("analysis_round") or 0),
+    )
+    current_entries = [
+        entry for entry in ordered
+        if (entry.get("form_metrics") or {}).get("metric_framework") == CURRENT_FORM_METRIC_FRAMEWORK
+    ]
+    selected_facets = list(
+        (current_entries[-1].get("form_metrics") or {}).get("selected_facet_ids") or []
+    )
+    facet_ids = [str(value) for value in selected_facets]
+    valid_facets = bool(facet_ids and len(facet_ids) == len(set(facet_ids)))
+    best_by_facet: dict[str, dict[str, Any]] = {}
+    trajectory: list[dict[str, Any]] = []
+    usable_rounds = 0
+    reached_round: int | None = None
+
+    for entry in ordered:
+        round_number = int(entry.get("analysis_round") or 0)
+        metrics = entry.get("form_metrics") or {}
+        quality = form_quality_summary(metrics)
+        complete_form = entry.get("form_status") in (None, "complete")
+        same_framework = quality.get("objective_source") == "ipip_facet_gates_v4"
+        same_facets = bool(
+            valid_facets
+            and len(metrics.get("selected_facet_ids") or []) == len(facet_ids)
+            and set(metrics.get("selected_facet_ids") or []) == set(facet_ids)
+        )
+        eligible_this_round = False
+        accepted_facets: list[str] = []
+        comparisons: list[dict[str, Any]] = []
+        raw_facets = {
+            str(row.get("sjt_facet_id")): row
+            for row in metrics.get("facet_metrics") or []
+            if isinstance(row, Mapping) and row.get("sjt_facet_id")
+        }
+        quality_facets = {
+            str(row.get("sjt_facet_id")): row
+            for row in quality.get("facet_metrics") or []
+        }
+        if complete_form and same_framework and same_facets:
+            for facet_id in facet_ids:
+                current_row = quality_facets.get(facet_id) or {}
+                raw_row = raw_facets.get(facet_id) or {}
+                eligible = bool(current_row.get("eligible_for_best_so_far"))
+                eligible_this_round = eligible_this_round or eligible
+                previous = best_by_facet.get(facet_id)
+                comparison = (
+                    facet_form_gate_comparison(
+                        {"facet_metrics": [raw_row]},
+                        {"facet_metrics": [previous["metrics"]]},
+                        min_delta=min_delta,
+                    )[0]
+                    if previous is not None and raw_row.get("sjt_facet_id")
+                    else {
+                        "sjt_facet_id": facet_id,
+                        "alpha_gate": current_row.get("alpha_gate") or {},
+                        "stability_gate": current_row.get("stability_gate") or {},
+                        "hedges_g_improvement_gate": {"passed": None},
+                        "target_rho_improvement_gate": {"passed": None},
+                        "discriminant_delta_improvement_gate": {"passed": None},
+                        "baseline": True,
+                        "passed": eligible,
+                    }
+                )
+                comparison["eligible"] = eligible
+                accepted = eligible and (previous is None or comparison["passed"])
+                comparison["accepted_as_best"] = accepted
+                comparisons.append(comparison)
+                if accepted:
+                    accepted_facets.append(facet_id)
+                    best_by_facet[facet_id] = {
+                        "analysis_round": round_number,
+                        "metrics": dict(raw_row),
+                        "selected_item_ids": list(raw_row.get("selected_item_ids") or []),
+                        "non_improving_rounds": 0,
+                    }
+                elif previous is not None and current_row.get("status") == "complete":
+                    previous["non_improving_rounds"] += 1
+            if eligible_this_round:
+                usable_rounds += 1
+            if (
+                facet_ids and all(facet_id in best_by_facet for facet_id in facet_ids)
+                and all(best_by_facet[facet_id]["non_improving_rounds"] >= patience for facet_id in facet_ids)
+                and reached_round is None
+            ):
+                reached_round = round_number
+        best_rounds = {row["analysis_round"] for row in best_by_facet.values()}
+        trajectory.append({
+            "analysis_round": round_number,
+            "objective_source": quality.get("objective_source"),
+            "candidate_form_quality": quality.get("candidate_form_quality"),
+            "objective_primary": quality.get("objective_primary"),
+            "objective_secondary": quality.get("objective_secondary"),
+            "objective_tertiary": quality.get("objective_tertiary"),
+            "facet_metrics": quality.get("facet_metrics") or [],
+            "facet_gate_comparison": comparisons,
+            "accepted_facets": accepted_facets,
+            "accepted_as_best": bool(accepted_facets),
+            "eligible_for_best_so_far": eligible_this_round,
+            "best_by_facet": deepcopy(best_by_facet),
+            "best_round": next(iter(best_rounds)) if len(best_rounds) == 1 and len(best_by_facet) == len(facet_ids) else None,
+            "best_so_far_form_quality": None,
+            "non_improving_rounds": min(
+                (row["non_improving_rounds"] for row in best_by_facet.values()),
+                default=0,
+            ) if len(best_by_facet) == len(facet_ids) else 0,
+        })
+
+    current = trajectory[-1] if trajectory else {}
+    missing_baselines = [facet_id for facet_id in facet_ids if facet_id not in best_by_facet]
+    status = (
+        "insufficient_data" if not valid_facets or missing_baselines
+        else "reached" if reached_round is not None
+        else "monitoring"
+    )
+    best_rounds = {row["analysis_round"] for row in best_by_facet.values()}
+    return {
+        "status": status,
+        "reached": reached_round is not None,
+        "patience": patience,
+        "min_delta": float(min_delta),
+        "usable_rounds": usable_rounds,
+        "non_improving_rounds": current.get("non_improving_rounds", 0),
+        "best_round": next(iter(best_rounds)) if len(best_rounds) == 1 and len(best_by_facet) == len(facet_ids) else None,
+        "best_by_facet": deepcopy(best_by_facet),
+        "missing_facet_baselines": missing_baselines,
+        "plateau_round": reached_round,
+        "current_round": current.get("analysis_round"),
+        "best_form_quality": None,
+        "current_candidate_form_quality": current.get("candidate_form_quality"),
+        "current_objective_secondary": current.get("objective_secondary"),
+        "objective_source": "ipip_facet_gates_v4",
+        "best_metrics": {"facet_metrics": [dict(row["metrics"]) for row in best_by_facet.values()]},
+        "current_metrics": current.get("facet_metrics") or [],
+        "metric_names": ["each_facet_alpha", "each_facet_ICC", "each_facet_Hedges_g", "each_facet_target_rho", "each_facet_delta_min"],
+        "stability_gate_metric": "each_facet_virtual_test_retest_icc",
+        "trajectory": trajectory,
+        "reason": (
+            "尚无有效的facet分组信息"
+            if not valid_facets
+            else "尚未为全部facet建立合格历史基线：" + ", ".join(missing_baselines)
+            if missing_baselines
+            else "所有facet均连续达到未改善轮数门槛"
+            if reached_round is not None
+            else "按facet分别跟踪历史最优与平台期"
+        ),
+    }
+
+
 def assess_form_plateau(
     history: Sequence[Mapping[str, Any]],
     *,
@@ -980,11 +1254,9 @@ def assess_form_plateau(
 ) -> dict[str, Any]:
     """Detect a plateau in the retained IPIP-based whole-form objective.
 
-    A complete, blueprint-valid round enters the comparison only after its
-    alpha and ICC gates pass.  Current v3 rounds require target Hedges' g to
-    improve, while delta_min must not fall and target rho may fall by at most
-    0.02. Legacy rounds are supported for reading old checkpoints, but are
-    never mixed with current v3 rounds.
+    This compatibility helper is not a stopping rule for fixed-cohort rounds.
+    Eligible forms require alpha and ICC gates plus strict g, rho and delta
+    increases. Legacy metric frameworks are never mixed with current forms.
     """
 
     if not isinstance(patience, int) or isinstance(patience, bool) or patience < 1:
@@ -1009,23 +1281,13 @@ def assess_form_plateau(
         for entry in history
         if isinstance(entry, Mapping)
     ]
-    preferred_source = (
-        "ipip_human_style_v3"
-        if any(
-            summary.get("objective_source") == "ipip_human_style_v3"
-            and summary.get("status") == "complete"
-            for summary in summaries
-        )
-        else (
-            "ipip_human_style"
-            if any(
-                summary.get("objective_source") == "ipip_human_style"
-                and summary.get("status") == "complete"
-                for summary in summaries
-            )
-            else None
-        )
-    )
+    preferred_source = None
+    for source in ("ipip_facet_gates_v4", "ipip_human_style_v3", "ipip_human_style"):
+        if any(summary.get("objective_source") == source for summary in summaries):
+            preferred_source = source
+            break
+    if preferred_source == "ipip_facet_gates_v4":
+        return _assess_facet_form_plateau(history, patience=patience, min_delta=min_delta)
     if preferred_source is None:
         preferred_source = next(
             (
@@ -1058,9 +1320,14 @@ def assess_form_plateau(
             and quality is not None
         )
         accepted = False
+        facet_comparison = (
+            facet_form_gate_comparison(entry.get("form_metrics") or {}, best_form_metrics, min_delta=min_delta)
+            if preferred_source == "ipip_facet_gates_v4" and best_form_metrics is not None
+            else []
+        )
         if eligible:
             usable_rounds += 1
-            if preferred_source == "ipip_human_style_v3":
+            if preferred_source in {"ipip_human_style_v3", "ipip_facet_gates_v4"}:
                 accepted = best_form_metrics is None or whole_form_objective_improves(
                     entry.get("form_metrics") or {},
                     best_form_metrics,
@@ -1104,10 +1371,14 @@ def assess_form_plateau(
                 "accepted_as_best": accepted,
                 "eligible_for_best_so_far": eligible,
                 "stability_gate": dict(summary.get("stability_gate") or {}),
+                "facet_gate_comparison": facet_comparison,
+                "facet_metrics": summary.get("facet_metrics") or [],
                 "non_improving_rounds": non_improving,
             }
         )
-    if preferred_source == "ipip_human_style_v3":
+    if preferred_source == "ipip_facet_gates_v4":
+        metric_names = ["each_facet_alpha", "each_facet_ICC", "each_facet_Hedges_g", "each_facet_target_rho", "each_facet_delta_min"]
+    elif preferred_source == "ipip_human_style_v3":
         metric_names = [
             "IPIP_target_known_groups_hedges_g",
             "IPIP_discriminant_delta_min",
@@ -1148,11 +1419,11 @@ def assess_form_plateau(
         "best_metrics": best_summary,
         "current_metrics": current_summary,
         "metric_names": metric_names,
-        "stability_gate_metric": "virtual_test_retest_icc",
+        "stability_gate_metric": "each_facet_virtual_test_retest_icc" if preferred_source == "ipip_facet_gates_v4" else "virtual_test_retest_icc",
         "trajectory": trajectory,
     }
     if not usable_rounds:
-        base["reason"] = "尚无通过 ICC 稳定性门槛的完整整卷轮次"
+        base["reason"] = "尚无五项指标完整且各facet的α和ICC均达标的轮次" if preferred_source == "ipip_facet_gates_v4" else "尚无通过 ICC 稳定性门槛的完整整卷轮次"
         return base
 
     base.update(
@@ -1163,7 +1434,9 @@ def assess_form_plateau(
             "best_round": best_round,
             "plateau_round": reached_round,
             "reason": (
-                f"连续 {non_improving} 轮候选整卷未使历史最优目标Hedges_g提高至少 {float(min_delta):.3f}"
+                f"连续 {non_improving} 轮候选卷未使各facet的Hedges_g均提高超过 {float(min_delta):.3f} 且满足各facet的其他门槛"
+                if preferred_source == "ipip_facet_gates_v4" and reached_round is not None
+                else f"连续 {non_improving} 轮候选整卷未使历史最优目标Hedges_g提高至少 {float(min_delta):.3f}"
                 if reached_round is not None
                 else "继续观察后续整卷轮次"
             ),
@@ -1244,35 +1517,41 @@ def build_provisional_form_metrics(
         if facet_id:
             facet_item_ids.setdefault(facet_id, []).append(item_id)
 
-    # 1) Virtual whole-form reliability: repeat the same target personas and
-    # calculate absolute-agreement ICC on complete-form scores.
-    administration_scores = {"1": form_score}
+    # 1) Reliability is computed independently on the items of each facet.
     target_retests = metric_context.get("target_retest_scores")
-    if isinstance(target_retests, Mapping):
-        for administration_id, matrix in target_retests.items():
-            if not isinstance(matrix, pd.DataFrame) or any(
-                item_id not in matrix.columns for item_id in item_ids
-            ):
-                continue
-            administration_scores[str(administration_id)] = matrix[
-                item_ids
-            ].dropna(axis=0, how="any").mean(axis=1)
-    stability_frame = pd.concat(administration_scores, axis=1, join="inner")
-    stability_icc = _icc_absolute_agreement_single(stability_frame)
+    facet_reliabilities = []
+    for facet_id, facet_ids in facet_item_ids.items():
+        facet_matrix = target_scores[facet_ids].dropna(axis=0, how="any")
+        facet_administrations = {"1": facet_matrix.mean(axis=1)}
+        if isinstance(target_retests, Mapping):
+            for administration_id, matrix in target_retests.items():
+                if not isinstance(matrix, pd.DataFrame) or any(
+                    item_id not in matrix.columns for item_id in facet_ids
+                ):
+                    continue
+                facet_administrations[str(administration_id)] = (
+                    matrix[facet_ids].dropna(axis=0, how="any").mean(axis=1)
+                )
+        repeated = pd.concat(facet_administrations, axis=1, join="inner")
+        facet_alpha = _cronbach_alpha(facet_matrix)
+        facet_icc = _icc_absolute_agreement_single(repeated)
+        facet_reliabilities.append({
+            "sjt_facet_id": facet_id,
+            "item_count": len(facet_ids),
+            "cronbach_alpha": facet_alpha,
+            "virtual_test_retest_icc": facet_icc,
+            "alpha_sample_size": int(len(facet_matrix)),
+            "retest_sample_size": int(len(repeated)),
+            "administration_count": int(repeated.shape[1]),
+            "administration_ids": list(repeated.columns),
+            "status": "complete" if facet_alpha is not None and facet_icc is not None else "unavailable",
+        })
     stability = {
-        "status": "complete" if stability_icc is not None else "unavailable",
-        "virtual_test_retest_icc": stability_icc,
-        "method": "ICC(A,1)_absolute_agreement_single_measure",
-        "sample_size": int(len(stability_frame)),
-        "administration_count": int(stability_frame.shape[1]),
-        "administration_ids": list(stability_frame.columns),
-        "interpretation": (
-            "同一 target 虚拟人格重复完成整套测验时的总分绝对一致性；"
-            "不是人类样本信度。"
-        ),
+        "status": "complete" if facet_reliabilities and all(row["status"] == "complete" for row in facet_reliabilities) else "unavailable",
+        "facet_results": facet_reliabilities,
+        "method": "per_facet_Cronbach_alpha_and_ICC(A,1)_absolute_agreement_single_measure",
+        "interpretation": "每个facet内部一致性和同一虚拟人格重测总分绝对一致性；不是人类样本信度。",
     }
-    if stability_icc is None:
-        stability["reason"] = "缺少至少两次完整 target 整卷施测或总分无变异"
 
     # 2) Target recovery: held-out prediction from the complete response
     # pattern, not an average of item-level target correlations.
@@ -1372,9 +1651,7 @@ def build_provisional_form_metrics(
         ),
     }
 
-    # Human-style quantities remain descriptive diagnostics only.  They are
-    # retained for backward-compatible reports but are not iteration targets.
-    alpha = _cronbach_alpha(target_matrix)
+    # Retain whole-form recovery and isolation only as descriptive diagnostics.
     target_aligned = pd.concat(
         [form_score.rename("form_score"), target_active.rename("active_score")],
         axis=1,
@@ -1395,10 +1672,11 @@ def build_provisional_form_metrics(
     ipip_isolation_results: list[dict[str, Any]] = []
     neo_rho = None
     sjt_facet_scores = {
-        facet_id: target_matrix[facet_ids].mean(axis=1)
+        facet_id: target_scores[facet_ids].dropna(axis=0, how="any").mean(axis=1)
         for facet_id, facet_ids in facet_item_ids.items()
         if facet_ids
     }
+    ipip_columns: list[dict[str, Any]] = []
     if isinstance(reference_scores, pd.DataFrame):
         reference_details = reference_result.get("details") or {}
         ipip_details = (
@@ -1413,7 +1691,6 @@ def build_provisional_form_metrics(
         )
         if not isinstance(ipip_facets, list):
             ipip_facets = []
-        ipip_columns: list[dict[str, Any]] = []
         for raw_facet in ipip_facets:
             if not isinstance(raw_facet, Mapping):
                 continue
@@ -1693,17 +1970,30 @@ def build_provisional_form_metrics(
         else None
     )
 
+    selected_facet_ids = {
+        str(facet_id)
+        for facet_id in facet_item_ids
+        if str(facet_id)
+    }
+    reference_facet_ids = {
+        str(spec.get("facet_id") or "")
+        for spec in ipip_columns
+        if str(spec.get("facet_id") or "")
+    }
     ipip_reference_complete = bool(
         isinstance(reference_result, Mapping)
         and reference_result.get("status") == "complete"
-        and len(ipip_columns) == 5
+        and selected_facet_ids
+        and len(ipip_columns) == len(selected_facet_ids)
+        and len(reference_facet_ids) == len(selected_facet_ids)
+        and reference_facet_ids == selected_facet_ids
         and len(
             {
                 str(spec.get("facet_code") or "")
                 for spec in ipip_columns
             }
         )
-        == 5
+        == len(selected_facet_ids)
         and len(ipip_facet_rhos) == len(facet_item_ids)
         and all(
             row.get("spearman_rho") is not None
@@ -1718,17 +2008,39 @@ def build_provisional_form_metrics(
         and target_hedges_g is not None
         and discriminant_delta_min is not None
     )
-    # R² and matched-condition selectivity remain diagnostic quantities.  The
-    # current whole-form objective is based on the complete IPIP external
-    # reference instead of those virtual-transmission measures.
-    complete = all(
-        value is not None
-        for value in (
-            stability_icc,
-            ipip_rho if ipip_reference_complete else None,
-            target_hedges_g if ipip_reference_complete else None,
-            discriminant_delta_min if ipip_reference_complete else None,
-        )
+    reliability_by_facet = {
+        row["sjt_facet_id"]: row for row in facet_reliabilities
+    }
+    rho_by_facet = {row["sjt_facet_id"]: row for row in ipip_facet_rhos}
+    g_by_facet = {row["sjt_facet_id"]: row for row in ipip_isolation_by_sjt}
+    delta_by_facet = {row["sjt_facet_id"]: row for row in ipip_discriminant_by_sjt}
+    facet_metrics = []
+    for facet_id, facet_ids in facet_item_ids.items():
+        reliability_row = reliability_by_facet.get(facet_id, {})
+        target_effect = g_by_facet.get(facet_id, {}).get("target_effect") or {}
+        facet_metrics.append({
+            "sjt_facet_id": facet_id,
+            "item_count": len(facet_ids),
+            "selected_item_ids": list(facet_ids),
+            "cronbach_alpha": reliability_row.get("cronbach_alpha"),
+            "virtual_test_retest_icc": reliability_row.get("virtual_test_retest_icc"),
+            "target_hedges_g": target_effect.get("standardized_effect"),
+            "target_spearman_rho": rho_by_facet.get(facet_id, {}).get("spearman_rho"),
+            "discriminant_delta_min": delta_by_facet.get(facet_id, {}).get("delta_min"),
+            "alpha_sample_size": reliability_row.get("alpha_sample_size"),
+            "retest_sample_size": reliability_row.get("retest_sample_size"),
+            "ipip_sample_size": rho_by_facet.get(facet_id, {}).get("sample_size"),
+        })
+    # R², aggregate g/rho/delta, and matched-condition selectivity remain
+    # diagnostic only; all eligibility checks use the individual facet rows.
+    complete = bool(
+        facet_metrics and len(facet_item_ids) == len(facet_metrics)
+        and ipip_reference_complete
+        and all(all(_number(row.get(key)) is not None for key in (
+            "cronbach_alpha", "virtual_test_retest_icc", "target_hedges_g",
+            "target_spearman_rho", "discriminant_delta_min",
+        )) for row in facet_metrics)
+        and sum(len(ids) for ids in facet_item_ids.values()) == len(item_ids)
     )
     result = {
         "status": "complete" if complete else "partial",
@@ -1736,11 +2048,9 @@ def build_provisional_form_metrics(
         "item_count": len(item_ids),
         "sample_size": int(len(target_matrix)),
         "metric_framework": CURRENT_FORM_METRIC_FRAMEWORK,
-        "reliability": {
-            **stability,
-            "cronbach_alpha": alpha,
-            "cronbach_alpha_role": "whole_form_reliability_gate",
-        },
+        "selected_facet_ids": list(facet_item_ids),
+        "facet_metrics": facet_metrics,
+        "reliability": stability,
         "validity": {
             "target_recovery": recovery,
             "construct_selectivity": construct_selectivity,
@@ -1767,12 +2077,18 @@ def build_provisional_form_metrics(
                     )
                 ),
                 "spearman_rho": reference_rho,
+                "spearman_rho_by_facet": {
+                    str(row.get("sjt_facet_id")): row.get("spearman_rho")
+                    for row in ipip_facet_rhos
+                    if row.get("sjt_facet_id")
+                },
                 "facet_results": ipip_facet_rhos,
                 "cross_facet_spearman_matrix": ipip_spearman_matrix,
+                "facet_count": len(ipip_facet_rhos),
                 "sample_size": (
                     ipip_sample_size if ipip_rho is not None else None
                 ),
-                "aggregation": "mean_of_target_facet_rhos",
+                "aggregation": "per_selected_facet; mean retained as compatibility summary",
                 "role": "whole_form_iteration_secondary_objective",
             },
             "ipip_known_groups_isolation": {
@@ -1804,7 +2120,7 @@ def build_provisional_form_metrics(
                 "delta_min": discriminant_delta_min,
                 "facet_results": ipip_discriminant_by_sjt,
                 "formula": "target_rho - MAX(ABS(non_target_rho))",
-                "role": "whole_form_noninferiority_constraint",
+                "role": "whole_form_strict_improvement_objective",
             },
             "known_groups_validity": {
                 "status": (
@@ -1847,22 +2163,25 @@ def build_provisional_form_metrics(
             },
         },
         "iteration_objectives": [
-            "validity.known_groups_validity.target_hedges_g",
+            "facet_metrics[*].target_hedges_g",
+            "facet_metrics[*].target_spearman_rho",
+            "facet_metrics[*].discriminant_delta_min",
         ],
         "iteration_components": [
-            "validity.known_groups_validity.target_hedges_g",
-            "validity.discriminant_validity.delta_min",
-            "validity.convergent_validity.spearman_rho",
+            "facet_metrics[*].target_hedges_g",
+            "facet_metrics[*].discriminant_delta_min",
+            "facet_metrics[*].target_spearman_rho",
         ],
         "iteration_constraints": [
-            "reliability.cronbach_alpha >= 0.80",
-            "optimization.stability_gate",
-            "validity.discriminant_validity.delta_min_non_decrease",
-            "validity.convergent_validity.spearman_rho_noninferiority",
+            "each_facet.cronbach_alpha >= 0.70",
+            "each_facet.virtual_test_retest_icc >= 0.70",
+            "each_facet.target_hedges_g_improvement > 1e-12",
+            "each_facet.discriminant_delta_min_improvement > 1e-12",
+            "each_facet.target_spearman_rho_improvement > 1e-12",
         ],
         "interpretation": (
-            "目标IPIP facet已知组Hedges_g为整卷主目标，Δmin和目标facet "
-            "Spearman rho为保护条件，Cronbach alpha和虚拟重测ICC为门槛；"
+            "各facet分别检查目标IPIP已知组Hedges_g、Δmin、Spearman rho、"
+            "Cronbach alpha和虚拟重测ICC；"
             "不能替代真人信效度验证。"
         ),
     }
@@ -1958,9 +2277,10 @@ def batch_provisional_form_quality(
     recovery_proxy = target_rho * np.abs(target_rho)
 
     # New whole-form objective: evaluate each candidate form against the
-    # complete IPIP five-facet reference using the same facet-level formulas as
-    # the full evaluator.  This keeps the exhaustive search fast without
-    # reverting to the old virtual-transmission Q as a ranking proxy.
+    # Complete IPIP reference for the facets represented by this candidate
+    # form, using the same facet-level formulas as the full evaluator. This
+    # keeps the exhaustive search fast without reverting to the old
+    # virtual-transmission Q as a ranking proxy.
     ipip_target_rho: np.ndarray | None = None
     ipip_target_hedges_g: np.ndarray | None = None
     ipip_discriminant_delta_min: np.ndarray | None = None
@@ -1998,10 +2318,17 @@ def batch_provisional_form_quality(
         and row.get("facet_id")
         and row.get("facet_code")
     ]
+    selected_reference_facet_ids = {
+        str(item_facet_ids.get(item_id) or "")
+        for item_id in candidate_ids
+        if item_facet_ids.get(item_id)
+    }
     if (
-        len(ipip_specs) != 5
-        or len({spec["facet_code"] for spec in ipip_specs}) != 5
-        or len({spec["facet_id"] for spec in ipip_specs}) != 5
+        not selected_reference_facet_ids
+        or len(ipip_specs) != len(selected_reference_facet_ids)
+        or len({spec["facet_code"] for spec in ipip_specs}) != len(selected_reference_facet_ids)
+        or len({spec["facet_id"] for spec in ipip_specs}) != len(selected_reference_facet_ids)
+        or {spec["facet_id"] for spec in ipip_specs} != selected_reference_facet_ids
         or any(
         spec["score_column"] not in reference_scores.columns
         for spec in ipip_specs
@@ -2067,6 +2394,9 @@ def batch_provisional_form_quality(
     target_hedges_rows: list[np.ndarray] = []
     discriminant_delta_rows: list[np.ndarray] = []
     isolation_rows: list[np.ndarray] = []
+    facet_alpha_proxies: list[np.ndarray] = []
+    facet_selections: list[tuple[np.ndarray, list[int]]] = []
+    facet_proxy_values: dict[str, dict[str, np.ndarray]] = {}
     for facet_id in candidate_facet_ids:
         facet_indices = [
             id_to_index[item_id]
@@ -2075,9 +2405,22 @@ def batch_provisional_form_quality(
         ]
         if not facet_indices:
             return None
+        facet_selection = selection[:, facet_indices]
+        selected_count = facet_selection.sum(axis=1)
+        if np.any(selected_count < 2):
+            return None
+        facet_selections.append((facet_selection, facet_indices))
+        facet_items = item_scores[:, facet_indices]
+        item_variances = facet_items.var(axis=0, ddof=1)
+        facet_totals = facet_selection @ facet_items.T
+        total_variances = facet_totals.var(axis=1, ddof=1)
+        alpha_proxy = np.divide(
+            selected_count * (1.0 - (facet_selection @ item_variances) / np.where(total_variances > 0, total_variances, np.nan)),
+            selected_count - 1.0,
+        )
+        facet_alpha_proxies.append(alpha_proxy)
         facet_scores = (
-            selection[:, facet_indices] @ item_scores[:, facet_indices].T
-            / float(len(facet_indices))
+            facet_totals / selected_count[:, None]
         )
         matching = next(
             (spec for spec in ipip_specs if spec["facet_id"] == facet_id),
@@ -2125,8 +2468,14 @@ def batch_provisional_form_quality(
             return None
         maximum_leakage = np.max(np.vstack(non_target_effects), axis=0)
         isolation_rows.append(target_effect - maximum_leakage)
-    ipip_target_rho = np.mean(np.vstack(target_rho_rows), axis=0)
-    ipip_target_hedges_g = np.mean(np.vstack(target_hedges_rows), axis=0)
+        facet_proxy_values[facet_id] = {
+            "cronbach_alpha": alpha_proxy,
+            "target_hedges_g": target_effect,
+            "target_spearman_rho": target_rho_row,
+            "discriminant_delta_min": discriminant_delta_rows[-1],
+        }
+    ipip_target_rho = np.min(np.vstack(target_rho_rows), axis=0)
+    ipip_target_hedges_g = np.min(np.vstack(target_hedges_rows), axis=0)
     ipip_discriminant_delta_min = np.min(
         np.vstack(discriminant_delta_rows), axis=0
     )
@@ -2226,6 +2575,9 @@ def batch_provisional_form_quality(
         )
 
     stability_proxies: list[np.ndarray] = []
+    facet_stability_proxies: dict[str, list[np.ndarray]] = {
+        facet_id: [] for facet_id in candidate_facet_ids
+    }
     for matrix in target_retests.values():
         if not isinstance(matrix, pd.DataFrame) or any(
             item_id not in matrix.columns for item_id in candidate_ids
@@ -2236,10 +2588,20 @@ def batch_provisional_form_quality(
         ].to_numpy(dtype=float)
         if not np.isfinite(repeated_items).all():
             return None
-        repeated_forms = selection @ repeated_items.T / float(item_count)
-        stability_proxies.append(concordance(form_scores, repeated_forms))
+        for facet_id, (facet_selection, facet_indices) in zip(candidate_facet_ids, facet_selections):
+            selected_count = facet_selection.sum(axis=1)
+            primary = (facet_selection @ item_scores[:, facet_indices].T) / selected_count[:, None]
+            repeated = (facet_selection @ repeated_items[:, facet_indices].T) / selected_count[:, None]
+            proxy = concordance(primary, repeated)
+            stability_proxies.append(proxy)
+            facet_stability_proxies[facet_id].append(proxy)
     stability_proxy = np.min(np.vstack(stability_proxies), axis=0)
+    for facet_id, proxies in facet_stability_proxies.items():
+        facet_proxy_values[facet_id]["virtual_test_retest_icc_proxy"] = np.min(
+            np.vstack(proxies), axis=0
+        )
     values = {
+        "alpha_proxy": np.min(np.vstack(facet_alpha_proxies), axis=0),
         "ipip_target_facet_spearman_rho": ipip_target_rho,
         "ipip_target_known_groups_hedges_g": ipip_target_hedges_g,
         "ipip_discriminant_delta_min": ipip_discriminant_delta_min,
@@ -2252,4 +2614,10 @@ def batch_provisional_form_quality(
     }
     if any(not np.isfinite(array).all() for array in values.values()):
         return None
-    return values
+    if any(
+        not np.isfinite(array).all()
+        for facet in facet_proxy_values.values()
+        for array in facet.values()
+    ):
+        return None
+    return {**values, "facet_metrics_proxy": facet_proxy_values}

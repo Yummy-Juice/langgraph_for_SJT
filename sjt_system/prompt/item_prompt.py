@@ -27,6 +27,10 @@ will deterministically add those fields and vary the presentation order.
 Scenario rules:
 - Turn the abstract situation_type and social_context into one ordinary,
   plausible event for the target population. Address the respondent as “你”.
+- The scenario field may contain only the situation narrative needed to
+  understand the event and decision opportunity. Do not add a title, question,
+  response instruction, options, scoring, explanation, construct label, or
+  commentary to the scenario.
 - Keep stakes at the supplied level. Clearly instantiate activation_mechanism
   and preserve core_tension without naming the construct or desired response.
 - Include at least one directly observable cue that activates the target facet;
@@ -47,7 +51,7 @@ Scenario rules:
 - Add only details needed to understand the choice. Do not add another pressure,
   unequal resources, mandatory legal/ethical answers, or guaranteed outcomes.
 - Avoid scenario_constraints and avoid_scenario_patterns. In Simplified
-  Chinese, normally use 30–50 characters.
+  Chinese, normally use 30–50 characters and never exceed 100 characters.
 
 Strategy rules:
 - Return exactly four strategies, uniquely covering low, medium_low,
@@ -84,12 +88,8 @@ Strategy rules:
   knowledge, effort quantity, social skill, help-seeking, or outcome quality.
 - Avoid option constraints, forbidden prior patterns, questionnaire wording,
   construct labels, and degree-adverb-only distinctions. In Simplified Chinese,
-  normally use 15–25 characters per strategy.
-- Option length must be consistent: all four options must be within 20% of
-  each other in character count. A 30-character option alongside a 15-character
-  option is a failure. If one option requires more words to express a complex
-  action, simplify it or expand the others to match. The longest and shortest
-  options must not differ by more than 5 characters in Simplified Chinese.
+  normally use 15–25 characters per strategy and never exceed 25 characters
+  per strategy.
 
 Before returning, hide behavioral_level and verify that all four actions remain
 credible and similarly attractive. When validation_feedback is present, fix
@@ -201,12 +201,17 @@ obvious best/worst answer. Do not merely add degree adverbs.
 - Every option must remain a feasible action available to the respondent in
   the supplied situation.
 - Option length consistency: choose wording for the named option that remains
-  comparable to the untouched options. Never edit an untargeted option merely
-  to equalize length.
+  comparable to the untouched options. In Simplified Chinese, a rewritten
+  option should normally use 15–25 characters and must not exceed 25
+  characters. Never edit an untargeted option merely to equalize length.
 - If the scenario itself is being repaired, preserve weak-situation design:
   retain a genuine conflict among partly reasonable demands and remove any
   explicit rule, authority, punishment, or extreme consequence that makes one
-  answer mandatory.
+  answer mandatory. In Simplified Chinese, a rewritten scenario should normally
+  use 30–50 characters and must not exceed 100 characters. The scenario field
+  may contain only the situation narrative needed to understand the event and
+  decision opportunity; do not add a title, question, response instruction,
+  options, scoring, explanation, construct label, or commentary.
 
 Return only ItemRepairResult. state_update must contain exactly:
 {{
